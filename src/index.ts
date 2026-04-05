@@ -271,6 +271,7 @@ const objectActor = actor({
 		},
 
 		pushChanges: (c, changesBase64: string) => {
+			initDisk(); // ensure changes dir exists on this instance
 			const parts = changesBase64.split(",").filter(Boolean);
 			for (const b64 of parts) {
 				const bytes = Buffer.from(b64, "base64");
