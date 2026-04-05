@@ -94,6 +94,63 @@ glon> /ttt history a3f8
 Each hash is the SHA-256 of the protobuf bytes. Tamper-evident.
 Replayable. The `.pb` files on disk ARE the game.
 
+## Demo: Chat Between Two Instances
+
+Chat rooms are regular objects. Messages are blocks — pure content,
+with authorship derived from the Change that created them (not stored
+on the block). Two Glon instances sync the chat over HTTP.
+
+```
+# Terminal 1: start server A
+GLON_DATA=~/.glon-a npm run dev
+
+# Terminal 2: start server B (auto-assigns port 6421)
+GLON_DATA=~/.glon-b npm run dev
+```
+
+On server A:
+
+```
+glon> /chat new general
+Chat room: 4dfaa1ce-...
+
+glon> /chat send 4dfaa Hey, anyone on server B?
+sent ce0d1313
+
+glon> /remote push localhost:6421 4dfaa
+Pushed 4 change(s) to localhost:6421
+```
+
+On server B:
+
+```
+GLON_ENDPOINT=http://localhost:6421 npm run client
+
+glon> /chat read 4dfaa
+  # general
+
+  00:13  local  Hey, anyone on server B?
+
+glon> /chat send 4dfaa Hello from server B!
+sent 0c1a7fcc
+```
+
+Back on server A:
+
+```
+glon> /remote pull localhost:6421 4dfaa
+Pulled 1 change(s) from localhost:6421
+
+glon> /chat read 4dfaa
+  # general
+
+  00:13  local  Hey, anyone on server B?
+  00:13  local  Hello from server B!
+```
+
+Both instances end up with the same content-addressed `.pb` files on
+disk — identical SHA-256 hashes. Same protobuf bytes. Same DAG.
+
 ## The Protocol
 
 Three layers:
@@ -128,6 +185,8 @@ The SQLite index is a cache.
 | `/send <from> <to> <action>` | IPC between objects |
 | `/inbox <id>` / `/outbox <id>` | Message queues |
 | `/ttt new\|board\|move\|history` | Tic-Tac-Toe |
+| `/chat new\|send\|read\|reply\|react` | Chat |
+| `/remote pull\|push <endpoint> <id>` | Cross-instance sync |
 | `/info` / `/disk` / `/help` | System info |
 
 ## Project Structure
@@ -146,7 +205,8 @@ glon/
     bootstrap.ts              seed source files as objects
     client.ts                 CLI shell
     programs/
-      tictactoe.ts            first program on the OS
+      tictactoe.ts            tic-tac-toe game
+      chat.ts                 chat / messaging
   package.json
   tsconfig.json
 ```
