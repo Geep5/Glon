@@ -14,6 +14,7 @@ import { diskStats, readChangeByHex, listChangeFiles } from "./disk.js";
 import { hexEncode } from "./crypto.js";
 import { stringVal, intVal, floatVal, boolVal, displayValue } from "./proto.js";
 import type { Value, Change } from "./proto.js";
+import { readBoard, computeMove, renderBoard, renderMoveHistory, newGameFields } from "./programs/tictactoe.js";
 
 const ENDPOINT = process.env.GLON_ENDPOINT ?? "http://localhost:6420";
 
@@ -436,6 +437,106 @@ async function cmdSync(args: string[]): Promise<void> {
 	console.log(green("  Sync complete."));
 }
 
+// ── Tic-Tac-Toe commands ───────────────────────────────────────────
+
+async function cmdTtt(args: string[]): Promise<void> {
+	const sub = args[0];
+	const rest = args.slice(1);
+
+	switch (sub) {
+		case "new": {
+			const name = rest.join(" ") || "tic-tac-toe";
+			const fields = newGameFields();
+			fields["name"] = stringVal(name);
+			const fieldsJson = JSON.stringify(fields);
+			const id = await store.create("game", fieldsJson);
+			console.log(green("New game: ") + bold(id));
+			console.log(dim("  Use /ttt board " + id.slice(0, 8) + " to see the board"));
+			console.log(dim("  Use /ttt move " + id.slice(0, 8) + " <0-8> to play"));
+			break;
+		}
+
+		case "board": {
+			const raw = rest[0];
+			if (!raw) { console.log(red("Usage: /ttt board <id>")); break; }
+			const id = await resolveId(raw);
+			if (!id) { console.log(red("Not found: ") + raw); break; }
+			const state = await store.get(id);
+			if (!state) { console.log(red("Not found")); break; }
+			const board = readBoard(state.fields as Record<string, any>);
+			console.log(renderBoard(board));
+			break;
+		}
+
+		case "move": {
+			const raw = rest[0];
+			const posStr = rest[1];
+			if (!raw || posStr === undefined) {
+				console.log(red("Usage: /ttt move <id> <position 0-8>"));
+				break;
+			}
+			const id = await resolveId(raw);
+			if (!id) { console.log(red("Not found: ") + raw); break; }
+			const pos = parseInt(posStr, 10);
+			if (isNaN(pos)) { console.log(red("Position must be 0-8")); break; }
+
+			// Read current state from the actor.
+			const state = await store.get(id);
+			if (!state) { console.log(red("Not found")); break; }
+			const board = readBoard(state.fields as Record<string, any>);
+
+			// Validate and compute the move.
+			const result = computeMove(board, pos);
+			if (!result.ok) {
+				console.log(red("  " + result.error));
+				break;
+			}
+
+			// Apply: set each field as a change on the object actor.
+			const actor = client.objectActor.getOrCreate([id]);
+			for (const [key, value] of Object.entries(result.fields)) {
+				await actor.setField(key, JSON.stringify(value));
+			}
+
+			// Re-read and render.
+			const updated = await store.get(id);
+			if (updated) {
+				const newBoard = readBoard(updated.fields as Record<string, any>);
+				console.log(renderBoard(newBoard));
+			}
+			break;
+		}
+
+		case "history": {
+			const raw = rest[0];
+			if (!raw) { console.log(red("Usage: /ttt history <id>")); break; }
+			const id = await resolveId(raw);
+			if (!id) { console.log(red("Not found: ") + raw); break; }
+			console.log(renderMoveHistory(id));
+			break;
+		}
+
+		default:
+			console.log([
+				bold("  Tic-Tac-Toe"),
+				`    ${cyan("/ttt new")} ${dim("[name]")}           start a new game`,
+				`    ${cyan("/ttt board")} ${dim("<id>")}            show the board`,
+				`    ${cyan("/ttt move")} ${dim("<id> <0-8>")}      make a move`,
+				`    ${cyan("/ttt history")} ${dim("<id>")}          move-by-move replay`,
+				"",
+				`  ${dim("Positions:")}`,
+				`    ${dim("0")}|${dim("1")}|${dim("2")}`,
+				`    ${dim("-+-+-")}`,
+				`    ${dim("3")}|${dim("4")}|${dim("5")}`,
+				`    ${dim("-+-+-")}`,
+				`    ${dim("6")}|${dim("7")}|${dim("8")}`,
+				"",
+				`  ${dim("Every move is a content-addressed Change in the DAG.")}`,
+				`  ${dim("Use /history <id> to see the full change log.")}`,
+			].join("\n"));
+	}
+}
+
 function cmdHelp(): void {
 	const cmds = [
 		["/create <type> [name]", "Create a new object"],
@@ -452,6 +553,7 @@ function cmdHelp(): void {
 		["/heads <id>", "Show DAG head change IDs"],
 		["/changes <id>", "List all change IDs for an object"],
 		["/sync <idA> <idB>", "Sync DAG state between two objects"],
+		["/ttt new|board|move|history", "Tic-Tac-Toe (try /ttt for help)"],
 		["/info", "Store summary"],
 		["/disk", "Disk usage stats"],
 		["/help", "This help"],
@@ -490,6 +592,7 @@ async function dispatch(line: string): Promise<boolean> {
 			case "/heads": await cmdHeads(args); break;
 			case "/changes": await cmdChanges(args); break;
 			case "/sync": await cmdSync(args); break;
+			case "/ttt": await cmdTtt(args); break;
 			case "/info": await cmdInfo(); break;
 			case "/disk": cmdDisk(); break;
 			case "/help": cmdHelp(); break;
