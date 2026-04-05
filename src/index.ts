@@ -11,7 +11,7 @@
 import { actor, event, setup } from "rivetkit";
 import { db } from "rivetkit/db";
 import type { Change, Operation, Value, ObjectRef, Block } from "./proto.js";
-import { encodeChange, decodeChange, stringVal, displayValue } from "./proto.js";
+import { encodeChange, encodeChangeForHashing, decodeChange, stringVal, displayValue } from "./proto.js";
 import { sha256, hexEncode, hexDecode, generateObjectId } from "./crypto.js";
 import {
 	createChange,
@@ -206,6 +206,26 @@ const objectActor = actor({
 			const parentIds = headBytes(c);
 			const change = createChange(c.state.id, [{ blockAdd: { parentId: "", afterId: "", block } }], parentIds);
 			commitChange(c, change);
+		},
+
+		/** Create a snapshot Change that embeds the full current state.
+		 *  Replay will skip everything before this point. */
+		createSnapshot: (c): string => {
+			const { state: computed } = recomputeFromDisk(c.state.id);
+			const snapshot = toSnapshot(computed);
+			const change: Change = {
+				id: new Uint8Array(0),
+				objectId: c.state.id,
+				parentIds: headBytes(c),
+				ops: [],
+				snapshot,
+				timestamp: Date.now(),
+				author: "local",
+			};
+			// Content-address it.
+			change.id = sha256(encodeChangeForHashing(change));
+			commitChange(c, change);
+			return hexEncode(change.id);
 		},
 
 		// ── Sync protocol ────────────────────────────────────────

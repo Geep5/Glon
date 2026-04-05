@@ -78,6 +78,7 @@ export interface Change {
 	objectId: string;
 	parentIds: Uint8Array[];
 	ops: Operation[];
+	snapshot?: ObjectSnapshot;
 	timestamp: number;
 	author: string;
 }

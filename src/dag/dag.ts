@@ -50,6 +50,16 @@ export function computeState(changes: Change[]): ObjectState {
 	const sorted = topoSort(changes);
 	const heads = findHeads(changes);
 
+	// Find the most recent snapshot to skip replay prefix.
+	let snapshotIdx = -1;
+	let snapshotTs = -1;
+	for (let i = 0; i < sorted.length; i++) {
+		if (sorted[i].snapshot && sorted[i].timestamp > snapshotTs) {
+			snapshotIdx = i;
+			snapshotTs = sorted[i].timestamp;
+		}
+	}
+
 	const state: ObjectState = {
 		id: objectId,
 		typeKey: "",
@@ -63,9 +73,32 @@ export function computeState(changes: Change[]): ObjectState {
 		heads,
 	};
 
+	// If a snapshot exists, initialize from it and skip earlier changes.
+	let startIdx = 0;
+	if (snapshotIdx >= 0) {
+		const snap = sorted[snapshotIdx].snapshot!;
+		state.typeKey = snap.typeKey;
+		state.deleted = snap.deleted;
+		state.createdAt = snap.createdAt;
+		state.updatedAt = snap.updatedAt;
+		state.content = snap.content ?? new Uint8Array(0);
+		state.blocks = snap.blocks ? [...snap.blocks] : [];
+		if (snap.fields) {
+			for (const [k, v] of Object.entries(snap.fields)) {
+				state.fields.set(k, v);
+			}
+		}
+		// Provenance isn't in the snapshot — blocks created before the
+		// snapshot lose individual provenance. That's the tradeoff:
+		// you trade per-block authorship history for replay speed.
+		// Blocks added AFTER the snapshot get provenance tracked normally.
+		startIdx = snapshotIdx + 1;
+	}
+
 	let maxTimestamp = 0;
 
-	for (const change of sorted) {
+	for (let i = startIdx; i < sorted.length; i++) {
+		const change = sorted[i];
 		if (change.timestamp > maxTimestamp) maxTimestamp = change.timestamp;
 
 		for (const op of change.ops) {

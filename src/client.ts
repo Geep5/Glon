@@ -750,6 +750,20 @@ async function cmdChat(args: string[]): Promise<void> {
 	}
 }
 
+async function cmdSnapshot(args: string[]): Promise<void> {
+	const raw = args[0];
+	if (!raw) { console.log(red("Usage: /snapshot <id>")); return; }
+	const id = await resolveId(raw);
+	if (!id) { console.log(red("Not found: ") + raw); return; }
+	const actor = client.objectActor.getOrCreate([id]);
+	const before = await actor.getHeads();
+	const snapshotHex = await actor.createSnapshot();
+	const after = await actor.getHeads();
+	console.log(green("Snapshot created: ") + dim(snapshotHex.slice(0, 16)));
+	console.log(dim(`  heads: ${before.map((h: string) => h.slice(0, 12)).join(", ")} → ${after.map((h: string) => h.slice(0, 12)).join(", ")}`));
+	console.log(dim("  Replay will skip all changes before this point."));
+}
+
 function cmdHelp(): void {
 	const cmds = [
 		["/create <type> [name]", "Create a new object"],
@@ -768,6 +782,7 @@ function cmdHelp(): void {
 		["/sync <idA> <idB>", "Sync DAG state between two objects"],
 		["/ttt new|board|move|history", "Tic-Tac-Toe (try /ttt for help)"],
 		["/chat new|send|read|reply|react", "Chat rooms (try /chat for help)"],
+		["/snapshot <id>", "Create a state snapshot (speeds up replay)"],
 		["/info", "Store summary"],
 		["/disk", "Disk usage stats"],
 		["/remote pull|push <endpoint> <id>", "Cross-instance sync"],
@@ -810,6 +825,7 @@ async function dispatch(line: string): Promise<boolean> {
 			case "/ttt": await cmdTtt(args); break;
 			case "/chat": await cmdChat(args); break;
 			case "/remote": await cmdRemote(args); break;
+			case "/snapshot": await cmdSnapshot(args); break;
 			case "/info": await cmdInfo(); break;
 			case "/disk": cmdDisk(); break;
 			case "/help": cmdHelp(); break;
