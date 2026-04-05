@@ -1,18 +1,23 @@
 /**
- * Glon OS Shell
+ * Glon OS CLI shell.
  *
- * The operating system's own command-line interface.
- * Connects to the running OS actors and interprets commands.
+ * Connects to a running Glon OS instance via Rivet client and provides
+ * an interactive command interface for CRUD, IPC, inspection, and search.
  *
- * Usage: npm run client
+ * Usage: npm run client / npx tsx src/client.ts
  */
 
 import { createClient } from "rivetkit/client";
 import type { app } from "./index.js";
 import { createInterface } from "node:readline";
-import { readFromDisk, readRawFromDisk, diskStats, listOnDisk } from "./disk.js";
+import { diskStats, readChangeByHex, listChangeFiles } from "./disk.js";
+import { hexEncode } from "./crypto.js";
+import { stringVal, intVal, floatVal, boolVal, displayValue } from "./proto.js";
+import type { Value, Change } from "./proto.js";
 
-// ── ANSI helpers ──────────────────────────────────────────────────
+const ENDPOINT = process.env.GLON_ENDPOINT ?? "http://localhost:6420";
+
+// ── ANSI helpers ─────────────────────────────────────────────────
 
 const DIM = "\x1b[2m";
 const BOLD = "\x1b[1m";
@@ -22,378 +27,423 @@ const YELLOW = "\x1b[33m";
 const RED = "\x1b[31m";
 const RESET = "\x1b[0m";
 
-function dim(s: string) { return `${DIM}${s}${RESET}`; }
-function bold(s: string) { return `${BOLD}${s}${RESET}`; }
-function cyan(s: string) { return `${CYAN}${s}${RESET}`; }
-function green(s: string) { return `${GREEN}${s}${RESET}`; }
-function yellow(s: string) { return `${YELLOW}${s}${RESET}`; }
-function red(s: string) { return `${RED}${s}${RESET}`; }
+function dim(s: string): string { return `${DIM}${s}${RESET}`; }
+function bold(s: string): string { return `${BOLD}${s}${RESET}`; }
+function cyan(s: string): string { return `${CYAN}${s}${RESET}`; }
+function green(s: string): string { return `${GREEN}${s}${RESET}`; }
+function yellow(s: string): string { return `${YELLOW}${s}${RESET}`; }
+function red(s: string): string { return `${RED}${s}${RESET}`; }
 
-// ── Table formatter ───────────────────────────────────────────────
+// ── Value parsing ────────────────────────────────────────────────
 
-function table(headers: string[], rows: string[][]): string {
-	const widths = headers.map((h, i) =>
-		Math.max(h.length, ...rows.map(r => (r[i] ?? "").length)),
-	);
-	const sep = widths.map(w => "─".repeat(w)).join("──");
-	const hdr = headers.map((h, i) => dim(h.padEnd(widths[i]!))).join("  ");
-	const body = rows
-		.map(r => r.map((c, i) => c.padEnd(widths[i]!)).join("  "))
-		.join("\n");
-	return `${hdr}\n${dim(sep)}\n${body}`;
+/** Parse a user-supplied string into a proto Value. */
+function parseValue(raw: string): Value {
+	if (raw === "true") return boolVal(true);
+	if (raw === "false") return boolVal(false);
+	const n = Number(raw);
+	if (!Number.isNaN(n) && raw.trim() !== "") {
+		return Number.isInteger(n) ? intVal(n) : floatVal(n);
+	}
+	return stringVal(raw);
 }
 
-// ── Main ──────────────────────────────────────────────────────────
+// ── Client setup ─────────────────────────────────────────────────
 
-const ENDPOINT = process.env.GLON_ENDPOINT ?? "http://localhost:6420";
+const client = createClient<typeof app>(ENDPOINT);
+const store = client.storeActor.getOrCreate(["root"]);
 
-async function main() {
-	const client = createClient<typeof app>(ENDPOINT);
-	const store = client.storeActor.getOrCreate(["root"]);
+/** Resolve an id prefix to a full id. Returns null if not found/ambiguous. */
+async function resolveId(raw: string): Promise<string | null> {
+	if (!raw) return null;
+	// Try exact match first (fast path for full UUIDs)
+	const exact = await store.exists(raw);
+	if (exact) return raw;
+	// Prefix match
+	const resolved = await store.resolvePrefix(raw);
+	if (resolved) return resolved;
+	return null;
+}
 
-	// Boot banner
-	let info;
-	try {
-		info = await store.info();
-	} catch (err) {
-		console.error(red("Cannot connect to Glon OS at " + ENDPOINT));
-		console.error(dim("Start the OS first: npm run dev"));
-		process.exit(1);
+// ── Command handlers ─────────────────────────────────────────────
+
+async function cmdCreate(args: string[]): Promise<void> {
+	const typeKey = args[0];
+	if (!typeKey) {
+		console.log(red("Usage: /create <type> [name]"));
+		return;
+	}
+	const name = args.slice(1).join(" ") || typeKey;
+	const fieldsJson = JSON.stringify({ name: stringVal(name) });
+	const id = await store.create(typeKey, fieldsJson);
+	console.log(green("Created: ") + bold(id));
+}
+
+async function cmdList(args: string[]): Promise<void> {
+	const typeKey = args[0] || undefined;
+	const refs = await store.list(typeKey);
+	if (refs.length === 0) {
+		console.log(dim("(no objects)"));
+		return;
+	}
+	console.log(
+		dim("TYPE".padEnd(14) + "ID".padEnd(40) + "UPDATED"),
+	);
+	for (const r of refs) {
+		const shortId = r.id.length > 12 ? r.id.slice(0, 12) + "..." : r.id;
+		const updated = r.updatedAt ? new Date(r.updatedAt).toISOString().slice(0, 19) : "?";
+		console.log(
+			cyan(r.typeKey.padEnd(14)) +
+			dim(shortId.padEnd(40)) +
+			updated,
+		);
+	}
+	console.log(dim(`\n${refs.length} object(s)`));
+}
+
+async function cmdGet(args: string[]): Promise<void> {
+	const raw = args[0];
+	if (!raw) {
+		console.log(red("Usage: /get <id>"));
+		return;
+	}
+	const id = await resolveId(raw);
+	if (!id) {
+		console.log(red("Not found: ") + raw);
+		return;
+	}
+	const state = await store.get(id);
+	if (!state) {
+		console.log(red("Not found: ") + id);
+		return;
 	}
 
-	console.log();
-	console.log(cyan(bold("  GLON OS")));
-	console.log(dim(`  ${info.totalObjects} objects · protobuf primitives · rivet actors`));
-	console.log(dim(`  type ${bold("/help")} for commands`));
-	console.log();
+	console.log(bold("id:       ") + state.id);
+	console.log(bold("type:     ") + state.typeKey);
+	console.log(bold("deleted:  ") + String(state.deleted));
+	console.log(bold("created:  ") + (state.createdAt ? new Date(state.createdAt).toISOString() : "?"));
+	console.log(bold("updated:  ") + (state.updatedAt ? new Date(state.updatedAt).toISOString() : "?"));
+	console.log(bold("changes:  ") + String(state.changeCount));
+
+	// Head IDs
+	if (state.headIds.length > 0) {
+		console.log(bold("heads:    ") + state.headIds.map((h: string) => h.slice(0, 12)).join(", "));
+	}
+
+	// Content
+	if (state.content) {
+		const bytes = Buffer.from(state.content, "base64").byteLength;
+		console.log(bold("content:  ") + `${bytes} bytes`);
+	} else {
+		console.log(bold("content:  ") + dim("(empty)"));
+	}
+
+	// Fields
+	const fields = state.fields as Record<string, Value> | undefined;
+	if (fields && Object.keys(fields).length > 0) {
+		console.log(bold("fields:"));
+		for (const [k, v] of Object.entries(fields)) {
+			console.log(`  ${cyan(k)}: ${displayValue(v)}`);
+		}
+	}
+}
+
+async function cmdSet(args: string[]): Promise<void> {
+	if (args.length < 3) {
+		console.log(red("Usage: /set <id> <key> <value>"));
+		return;
+	}
+	const resolved = await resolveId(args[0]);
+	if (!resolved) { console.log(red("Not found: ") + args[0]); return; }
+	const key = args[1];
+	const value = parseValue(args.slice(2).join(" "));
+	const objActor = client.objectActor.getOrCreate([resolved]);
+	await objActor.setField(key, JSON.stringify(value));
+	console.log(green("Set ") + cyan(key) + " on " + dim(resolved.slice(0, 12) + "..."));
+}
+
+async function cmdDelete(args: string[]): Promise<void> {
+	const raw = args[0];
+	if (!raw) {
+		console.log(red("Usage: /delete <id>"));
+		return;
+	}
+	const id = await resolveId(raw);
+	if (!id) { console.log(red("Not found: ") + raw); return; }
+	const ok = await store.delete(id);
+	if (ok) {
+		console.log(green("Deleted: ") + id);
+	} else {
+		console.log(red("Not found: ") + id);
+	}
+}
+
+async function cmdSearch(args: string[]): Promise<void> {
+	const query = args.join(" ");
+	if (!query) {
+		console.log(red("Usage: /search <query>"));
+		return;
+	}
+	const refs = await store.search(query);
+	if (refs.length === 0) {
+		console.log(dim("(no matches)"));
+		return;
+	}
+	for (const r of refs) {
+		const shortId = r.id.length > 12 ? r.id.slice(0, 12) + "..." : r.id;
+		console.log(cyan(r.typeKey.padEnd(14)) + dim(shortId.padEnd(40)) + new Date(r.updatedAt).toISOString().slice(0, 19));
+	}
+	console.log(dim(`\n${refs.length} match(es)`));
+}
+
+async function cmdSend(args: string[]): Promise<void> {
+	if (args.length < 3) {
+		console.log(red("Usage: /send <from-id> <to-id> <action> [payload]"));
+		return;
+	}
+	const [rawFrom, rawTo, action, ...rest] = args;
+	const payload = rest.join(" ");
+
+	const fromId = await resolveId(rawFrom);
+	if (!fromId) { console.log(red("Sender not found: ") + rawFrom); return; }
+	const toId = await resolveId(rawTo);
+	if (!toId) { console.log(red("Receiver not found: ") + rawTo); return; }
+
+	const sender = client.objectActor.getOrCreate([fromId]);
+	await sender.sendMessage(toId, action, payload);
+
+	const receiver = client.objectActor.getOrCreate([toId]);
+	await receiver.receiveMessage(fromId, action, payload, Date.now());
+
+	console.log(green("Sent: ") + `${action} from ${dim(fromId.slice(0, 12))} → ${dim(toId.slice(0, 12))}`);
+}
+
+async function cmdInbox(args: string[]): Promise<void> {
+	const raw = args[0];
+	if (!raw) { console.log(red("Usage: /inbox <id>")); return; }
+	const id = await resolveId(raw);
+	if (!id) { console.log(red("Not found: ") + raw); return; }
+	const objActor = client.objectActor.getOrCreate([id]);
+	const msgs = await objActor.getInbox();
+	if (msgs.length === 0) { console.log(dim("(empty inbox)")); return; }
+	for (const m of msgs) {
+		const ts = new Date(m.timestamp).toISOString();
+		console.log(
+			dim(ts.slice(11, 19)) + "  " +
+			cyan(m.action.padEnd(14)) +
+			"from " + dim(m.fromId.slice(0, 12)) +
+			(m.payload ? "  " + m.payload.slice(0, 60) : ""),
+		);
+	}
+}
+
+async function cmdOutbox(args: string[]): Promise<void> {
+	const raw = args[0];
+	if (!raw) { console.log(red("Usage: /outbox <id>")); return; }
+	const id = await resolveId(raw);
+	if (!id) { console.log(red("Not found: ") + raw); return; }
+	const objActor = client.objectActor.getOrCreate([id]);
+	const msgs = await objActor.getOutbox();
+	if (msgs.length === 0) { console.log(dim("(empty outbox)")); return; }
+	for (const m of msgs) {
+		const ts = new Date(m.timestamp).toISOString();
+		console.log(
+			dim(ts.slice(11, 19)) + "  " +
+			cyan(m.action.padEnd(14)) +
+			"to " + dim(m.toId.slice(0, 12)) +
+			(m.payload ? "  " + m.payload.slice(0, 60) : ""),
+		);
+	}
+}
+
+function summarizeOps(change: Change): string {
+	const parts: string[] = [];
+	for (const op of change.ops) {
+		if (op.objectCreate) parts.push(`create(${op.objectCreate.typeKey})`);
+		if (op.objectDelete) parts.push("delete");
+		if (op.fieldSet) parts.push(`set(${op.fieldSet.key})`);
+		if (op.fieldDelete) parts.push(`del(${op.fieldDelete.key})`);
+		if (op.contentSet) parts.push(`content(${op.contentSet.content.byteLength}b)`);
+		if (op.blockAdd) parts.push("block+");
+		if (op.blockRemove) parts.push("block-");
+		if (op.blockUpdate) parts.push("block~");
+		if (op.blockMove) parts.push("blockmv");
+	}
+	return parts.join(", ") || "(no ops)";
+}
+
+async function cmdHistory(args: string[]): Promise<void> {
+	const raw = args[0];
+	if (!raw) { console.log(red("Usage: /history <id>")); return; }
+	// History reads from disk, but we still need the full id for filtering.
+	// Try resolveId; if it fails, use raw as-is (might be a full UUID).
+	const id = (await resolveId(raw)) ?? raw;
+	const hexIds = listChangeFiles();
+	const matches: Change[] = [];
+	for (const hexId of hexIds) {
+		const c = readChangeByHex(hexId);
+		if (c && c.objectId === id) matches.push(c);
+	}
+	if (matches.length === 0) { console.log(dim("(no changes found)")); return; }
+	matches.sort((a, b) => a.timestamp - b.timestamp);
+	for (const c of matches) {
+		const hex = hexEncode(c.id).slice(0, 12);
+		const ts = new Date(c.timestamp).toISOString();
+		console.log(dim(hex) + "  " + dim(ts.slice(0, 19)) + "  " + summarizeOps(c));
+	}
+	console.log(dim(`\n${matches.length} change(s)`));
+}
+
+function cmdChange(args: string[]): void {
+	const hexId = args[0];
+	if (!hexId) { console.log(red("Usage: /change <hex-id>")); return; }
+	const c = readChangeByHex(hexId);
+	if (!c) { console.log(red("Not found: ") + hexId); return; }
+	console.log(bold("id:       ") + hexEncode(c.id));
+	console.log(bold("objectId: ") + c.objectId);
+	console.log(bold("time:     ") + new Date(c.timestamp).toISOString());
+	console.log(bold("author:   ") + (c.author || dim("(none)")));
+	if (c.parentIds.length > 0) {
+		console.log(bold("parents:  ") + c.parentIds.map(p => hexEncode(p).slice(0, 12)).join(", "));
+	} else {
+		console.log(bold("parents:  ") + dim("(genesis)"));
+	}
+	console.log(bold("ops:"));
+	for (const op of c.ops) {
+		if (op.objectCreate) console.log("  create  type=" + cyan(op.objectCreate.typeKey));
+		if (op.objectDelete) console.log("  " + red("delete"));
+		if (op.fieldSet) console.log("  set     " + cyan(op.fieldSet.key) + "=" + displayValue(op.fieldSet.value));
+		if (op.fieldDelete) console.log("  del     " + cyan(op.fieldDelete.key));
+		if (op.contentSet) console.log("  content " + op.contentSet.content.byteLength + " bytes");
+		if (op.blockAdd) console.log("  block+  " + op.blockAdd.block.id);
+		if (op.blockRemove) console.log("  block-  " + op.blockRemove.blockId);
+		if (op.blockUpdate) console.log("  block~  " + op.blockUpdate.blockId);
+		if (op.blockMove) console.log("  blockmv " + op.blockMove.blockId);
+	}
+}
+
+async function cmdInfo(): Promise<void> {
+	const info = await store.info();
+	console.log(bold("Objects: ") + String(info.totalObjects));
+	console.log(bold("Changes: ") + String(info.totalChanges));
+	if (Object.keys(info.byType).length > 0) {
+		console.log(bold("By type:"));
+		for (const [typeKey, cnt] of Object.entries(info.byType)) {
+			console.log(`  ${cyan(typeKey.padEnd(14))} ${cnt}`);
+		}
+	}
+}
+
+function cmdDisk(): void {
+	const stats = diskStats();
+	console.log(bold("Path:    ") + stats.path);
+	console.log(bold("Changes: ") + String(stats.changeCount));
+	console.log(bold("Bytes:   ") + stats.totalBytes.toLocaleString());
+}
+
+function cmdHelp(): void {
+	const cmds = [
+		["/create <type> [name]", "Create a new object"],
+		["/list [type]", "List objects (optionally filter by type)"],
+		["/get <id>", "Show full object state"],
+		["/set <id> <key> <value>", "Set a field on an object"],
+		["/delete <id>", "Delete an object"],
+		["/search <query>", "Search objects by ID substring"],
+		["/send <from> <to> <action> [payload]", "Send IPC message"],
+		["/inbox <id>", "Show object inbox"],
+		["/outbox <id>", "Show object outbox"],
+		["/history <id>", "Show change history for an object"],
+		["/change <hex-id>", "Inspect a single change"],
+		["/info", "Store summary"],
+		["/disk", "Disk usage stats"],
+		["/help", "This help"],
+		["/quit", "Exit"],
+	];
+	for (const [cmd, desc] of cmds) {
+		console.log(`  ${cyan(cmd.padEnd(42))} ${dim(desc)}`);
+	}
+}
+
+// ── REPL ─────────────────────────────────────────────────────────
+
+async function dispatch(line: string): Promise<boolean> {
+	const trimmed = line.trim();
+	if (!trimmed) return true;
+	if (!trimmed.startsWith("/")) {
+		console.log(dim("Commands start with /. Type /help."));
+		return true;
+	}
+
+	const [cmd, ...args] = trimmed.split(/\s+/);
+
+	try {
+		switch (cmd) {
+			case "/create": await cmdCreate(args); break;
+			case "/list": await cmdList(args); break;
+			case "/get": await cmdGet(args); break;
+			case "/set": await cmdSet(args); break;
+			case "/delete": await cmdDelete(args); break;
+			case "/search": await cmdSearch(args); break;
+			case "/send": await cmdSend(args); break;
+			case "/inbox": await cmdInbox(args); break;
+			case "/outbox": await cmdOutbox(args); break;
+			case "/history": await cmdHistory(args); break;
+			case "/change": cmdChange(args); break;
+			case "/info": await cmdInfo(); break;
+			case "/disk": cmdDisk(); break;
+			case "/help": cmdHelp(); break;
+			case "/quit":
+			case "/exit":
+			case "/q":
+				return false;
+			default:
+				console.log(red(`Unknown command: ${cmd}`) + "  " + dim("Try /help"));
+		}
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err);
+		console.log(red("Error: ") + msg);
+	}
+
+	return true;
+}
+
+async function main() {
+	console.log(bold("Glon OS") + dim(` — ${ENDPOINT}`));
+	console.log(dim("Type /help for commands.\n"));
 
 	const rl = createInterface({
 		input: process.stdin,
 		output: process.stdout,
-		prompt: `${CYAN}glon${DIM}>${RESET} `,
-		terminal: true,
+		prompt: `${CYAN}glon>${RESET} `,
 	});
 
-
-	// Queue commands so async handlers don't race
+	// Queue commands so async handlers don't race with readline close.
 	let pending: Promise<void> = Promise.resolve();
+	let alive = true;
 
 	rl.prompt();
 
-	rl.on("line", (line) => {
-		pending = pending.then(() => handleLine(line));
-	});
-
-	async function handleLine(line: string) {
-		const raw = line.trim();
-		if (!raw) { rl.prompt(); return; }
-
-		const cmd = raw.startsWith("/") ? raw.slice(1) : raw;
-		const parts = cmd.split(/\s+/);
-		const command = parts[0]?.toLowerCase() ?? "";
-		const args = parts.slice(1);
-
-		try {
-			switch (command) {
-				// ── /help ─────────────────────────────────────
-				case "help":
-				case "h":
-				case "?":
-					console.log([
-						"",
-						bold("  Objects"),
-						`    ${cyan("/list")} ${dim("[kind]")}          list all objects`,
-						`    ${cyan("/get")} ${dim("<id>")}             inspect an object`,
-						`    ${cyan("/search")} ${dim("<query>")}       search by name`,
-						`    ${cyan("/create")} ${dim("<kind> <name>")} create an object`,
-						`    ${cyan("/delete")} ${dim("<id>")}          delete an object`,
-						"",
-						bold("  System"),
-						`    ${cyan("/info")}                  system stats`,
-						`    ${cyan("/kinds")}                 list object kinds`,
-						`    ${cyan("/proto")}                 show the proto schema`,
-						"",
-						bold("  Disk"),
-						`    ${cyan("/disk")}                  raw protobuf storage stats`,
-						`    ${cyan("/dump")} ${dim("<id>")}             hex dump of protobuf bytes`,
-						`    ${cyan("/cat")} ${dim("<id>")}              read file content from disk`,
-						"",
-						bold("  IPC"),
-						`    ${cyan("/send")} ${dim("<from> <to> <action> [msg]")} send a message`,
-						`    ${cyan("/messages")} ${dim("<id>")}         show inbox`,
-						`    ${cyan("/outbox")} ${dim("<id>")}           show sent messages`,
-						"",
-						bold("  Shell"),
-						`    ${cyan("/help")}                  this message`,
-						`    ${cyan("/quit")}                  exit`,
-						"",
-					].join("\n"));
-					break;
-
-				// ── /list [kind] ──────────────────────────────
-				case "list":
-				case "ls": {
-					const kind = args[0] || undefined;
-					const refs = await store.list(kind);
-					if (refs.length === 0) {
-						console.log(dim("  (no objects)"));
-					} else {
-						const rows = refs.map(r => [
-							cyan(String(r.kind)),
-							String(r.name),
-							dim(String(r.size) + "b"),
-							dim(String(r.id)),
-						]);
-						console.log(table(
-							["KIND", "NAME", "SIZE", "ID"],
-							rows,
-						));
-						console.log(dim(`\n  ${refs.length} objects`));
-					}
-					break;
-				}
-
-				// ── /get <id> ─────────────────────────────────
-				case "get":
-				case "inspect": {
-					const id = args.join(" ");
-					if (!id) { console.log(yellow("  usage: /get <id>")); break; }
-					const ref = await store.get(id);
-					if (!ref) { console.log(red(`  not found: ${id}`)); break; }
-					console.log(`  ${dim("id:")}    ${ref.id}`);
-					console.log(`  ${dim("kind:")}  ${cyan(String(ref.kind))}`);
-					console.log(`  ${dim("name:")}  ${ref.name}`);
-					console.log(`  ${dim("size:")}  ${ref.size} bytes`);
-					break;
-				}
-
-				// ── /search <query> ───────────────────────────
-				case "search":
-				case "find": {
-					const query = args.join(" ");
-					if (!query) { console.log(yellow("  usage: /search <query>")); break; }
-					const results = await store.search(query);
-					if (results.length === 0) {
-						console.log(dim("  (no matches)"));
-					} else {
-						for (const ref of results) {
-							console.log(`  ${cyan(String(ref.kind).padEnd(14))} ${ref.name}  ${dim(String(ref.id))}`);
-						}
-						console.log(dim(`\n  ${results.length} results`));
-					}
-					break;
-				}
-
-				// ── /create <kind> <name> ─────────────────────
-				case "create":
-				case "new": {
-					const kind = args[0];
-					const name = args.slice(1).join(" ");
-					if (!kind || !name) {
-						console.log(yellow("  usage: /create <kind> <name>"));
-						break;
-					}
-					const id = await store.create({ kind, name });
-					console.log(green(`  created ${id}`));
-					break;
-				}
-
-				// ── /delete <id> ──────────────────────────────
-				case "delete":
-				case "rm": {
-					const id = args.join(" ");
-					if (!id) { console.log(yellow("  usage: /delete <id>")); break; }
-					const ok = await store.delete(id);
-					console.log(ok ? green(`  deleted ${id}`) : red(`  not found: ${id}`));
-					break;
-				}
-
-				// ── /info ─────────────────────────────────────
-				case "info":
-				case "status": {
-					const sysInfo = await store.info();
-					console.log(`  ${dim("objects:")}  ${bold(String(sysInfo.totalObjects))}`);
-					console.log(`  ${dim("store:")}    rivet actor + sqlite`);
-					console.log(`  ${dim("format:")}   protobuf (glon.Object)`);
-					if (sysInfo.byKind.length > 0) {
-						console.log(`  ${dim("kinds:")}`);
-						for (const { kind, cnt } of sysInfo.byKind) {
-							console.log(`    ${cyan(kind)}: ${cnt}`);
-						}
-					}
-					break;
-				}
-
-				// ── /kinds ────────────────────────────────────
-				case "kinds": {
-					const sysInfo = await store.info();
-					for (const { kind, cnt } of sysInfo.byKind) {
-						console.log(`  ${cyan(kind.padEnd(16))} ${cnt} objects`);
-					}
-					break;
-				}
-
-				// ── /proto ────────────────────────────────────
-				case "proto":
-				case "schema": {
-					// The proto file is itself an object in the OS
-					const ref = await store.get("proto:glon.proto");
-					if (!ref) {
-						console.log(dim("  proto schema not bootstrapped"));
-						break;
-					}
-					// Read it from the filesystem since the store only has the ref
-					const { readFileSync } = await import("node:fs");
-					const { resolve, dirname } = await import("node:path");
-					const { fileURLToPath } = await import("node:url");
-					const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-					const content = readFileSync(resolve(root, "proto/glon.proto"), "utf-8");
-					for (const line of content.split("\n")) {
-						if (line.startsWith("//")) {
-							console.log(dim(`  ${line}`));
-						} else if (line.includes("message") || line.includes("enum")) {
-							console.log(cyan(`  ${line}`));
-						} else {
-							console.log(`  ${line}`);
-						}
-					}
-					break;
-				}
-
-				// ── /disk ─────────────────────────────────────────
-				case "disk":
-				case "storage": {
-					const stats = diskStats();
-					console.log(`  ${dim("path:")}     ${stats.path}`);
-					console.log(`  ${dim("objects:")}  ${bold(String(stats.objectCount))} .pb files`);
-					console.log(`  ${dim("size:")}     ${stats.totalBytes} bytes (raw protobuf)`);
-					console.log(`  ${dim("format:")}   protobuf wire format (binary)`);
-					break;
-				}
-
-				// ── /dump <id> ────────────────────────────────────
-				case "dump":
-				case "hex": {
-					const dumpId = args.join(" ");
-					if (!dumpId) { console.log(yellow("  usage: /dump <id>")); break; }
-					const raw = readRawFromDisk(dumpId);
-					if (!raw) { console.log(red(`  not on disk: ${dumpId}`)); break; }
-					// Hex dump with offset and ASCII
-					console.log(dim(`  ${raw.byteLength} bytes of raw protobuf:\n`));
-					for (let off = 0; off < raw.byteLength; off += 16) {
-						const slice = raw.slice(off, off + 16);
-						const hex = Array.from(slice).map(b => b.toString(16).padStart(2, "0")).join(" ");
-						const ascii = Array.from(slice).map(b => (b >= 32 && b < 127) ? String.fromCharCode(b) : ".").join("");
-						console.log(`  ${dim(off.toString(16).padStart(4, "0"))}  ${hex.padEnd(48)}  ${dim(ascii)}`);
-					}
-					break;
-				}
-
-				// ── /cat <id> ─────────────────────────────────────
-				case "cat":
-				case "read": {
-					const catId = args.join(" ");
-					if (!catId) { console.log(yellow("  usage: /cat <id>")); break; }
-					const obj = readFromDisk(catId);
-					if (!obj) { console.log(red(`  not on disk: ${catId}`)); break; }
-					const text = Buffer.from(obj.content).toString("utf-8");
-					console.log(dim(`  ── ${obj.name} (${obj.kind}, ${obj.size}b) ──`));
-					for (const line of text.split("\n")) {
-						console.log(`  ${line}`);
-					}
-					break;
-				}
-
-				// ── /send <from> <to> <action> [payload] ─────────────
-				case "send": {
-					const [fromId, toId, act, ...rest] = args;
-					if (!fromId || !toId || !act) {
-						console.log(yellow("  usage: /send <from-id> <to-id> <action> [message]"));
-						break;
-					}
-					const payload = rest.join(" ");
-					const ipcClient = createClient<typeof app>(ENDPOINT);
-
-					// 1. Sender records in outbox
-					const sender = ipcClient.objectActor.getOrCreate([fromId]);
-					const envelope = await sender.recordSend(toId, act, payload);
-
-					// 2. Router delivers to receiver's inbox
-					const receiver = ipcClient.objectActor.getOrCreate([toId]);
-					await receiver.receive(envelope.fromId, envelope.toId, envelope.action, envelope.payload, envelope.timestamp);
-
-					console.log(green(`  delivered: ${fromId} → ${toId} [${act}]`));
-					if (payload) console.log(dim(`  payload: ${payload}`));
-					break;
-				}
-
-				// ── /messages <id> ──────────────────────────────────
-				case "messages":
-				case "inbox": {
-					const msgId = args.join(" ");
-					if (!msgId) { console.log(yellow("  usage: /messages <id>")); break; }
-					const c3 = createClient<typeof app>(ENDPOINT);
-					const target = c3.objectActor.getOrCreate([msgId]);
-					const messages = await target.getInbox();
-					if (messages.length === 0) {
-						console.log(dim("  (no messages)"));
-					} else {
-						for (const msg of messages) {
-							const time = new Date(msg.timestamp).toISOString();
-							console.log(`  ${dim(time)}  ${cyan(msg.fromId)} → ${bold(msg.action)}${msg.payload ? ` ${dim(msg.payload)}` : ""}`);
-						}
-						console.log(dim(`\n  ${messages.length} messages`));
-					}
-					break;
-				}
-
-				// ── /outbox <id> ───────────────────────────────────
-				case "outbox":
-				case "sent": {
-					const outId = args.join(" ");
-					if (!outId) { console.log(yellow("  usage: /outbox <id>")); break; }
-					const c4 = createClient<typeof app>(ENDPOINT);
-					const outActor = c4.objectActor.getOrCreate([outId]);
-					const sent = await outActor.getOutbox();
-					if (sent.length === 0) {
-						console.log(dim("  (no sent messages)"));
-					} else {
-						for (const msg of sent) {
-							const time = new Date(msg.timestamp).toISOString();
-							console.log(`  ${dim(time)}  → ${cyan(msg.toId)} ${bold(msg.action)}${msg.payload ? ` ${dim(msg.payload)}` : ""}`);
-						}
-						console.log(dim(`\n  ${sent.length} messages`));
-					}
-					break;
-				}
-
-				// ── /quit ─────────────────────────────────────
-				case "quit":
-				case "exit":
-				case "q":
-					console.log(dim("  bye"));
-					rl.close();
-					process.exit(0);
-					break;
-
-				// ── unknown ───────────────────────────────────
-				default:
-					console.log(yellow(`  unknown: ${command}`) + dim("  (type /help)"));
+	rl.on("line", (line: string) => {
+		pending = pending.then(async () => {
+			if (!alive) return;
+			const keepGoing = await dispatch(line);
+			if (!keepGoing) {
+				alive = false;
+				rl.close();
+				return;
 			}
-		} catch (err) {
-			console.error(red(`  error: ${err}`));
-		}
-
-		console.log();
-		rl.prompt();
-	}
+			if (alive) rl.prompt();
+		});
+	});
 
 	rl.on("close", () => {
 		pending.then(() => {
-			console.log(dim("\n  bye"));
+			console.log(dim("\nBye."));
 			process.exit(0);
 		});
 	});
 }
 
-main();
+main().catch((err) => {
+	console.error("Client failed:", err);
+	process.exit(1);
+});

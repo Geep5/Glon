@@ -5,235 +5,209 @@ system built on two primitives and nothing else.
 
 ## The Two Primitives
 
-### 1. Protobuf
+### 1. The Change DAG
 
-Every entity in the system is a single protobuf message:
-
-```protobuf
-message GlonObject {
-  string id = 1;
-  string kind = 2;
-  string name = 3;
-  bytes content = 4;
-  map<string, string> meta = 5;
-  int64 created_at = 6;
-  int64 updated_at = 7;
-  int64 size = 8;
-}
-```
-
-There is one type. A file is a GlonObject. A process is a GlonObject.
-A configuration is a GlonObject. The proto schema itself is a GlonObject.
-The `kind` field is the only distinction. The wire format is binary --
-field tags, varint lengths, raw bytes. This is what lives on disk.
-
-### 2. Actors
-
-Every GlonObject is embodied by a durable actor (Rivet). The actor IS
-the object. It holds the protobuf state in memory, persists it, survives
-crashes, hibernates when idle, wakes on demand. Actors communicate
-through typed actions and broadcast events.
-
-The store actor is a coordinator. It maintains a SQLite index of all
-objects for queries. It creates and destroys object actors. There is
-one store per namespace (currently one: "root").
-
-## Storage Model
+Every mutation in the system is a **Change** — a content-addressed
+protobuf message appended to a directed acyclic graph. Current state
+is computed by replaying changes from genesis to heads.
 
 ```
-Disk (local)              Actors (Rivet)           Client (shell)
-~/.glon/objects/*.pb  --> objectActor instances --> glon> /list
-raw protobuf binary       in-memory state          CLI commands
-                          durable, hibernatable
+Change₀ (genesis)  →  Change₁ (set fields)  →  Change₂ (set content)
+   |                                                ↑ HEAD
+   └── id = SHA-256(protobuf bytes with id zeroed)
 ```
 
-### On Disk
+Changes are immutable once created. The protobuf bytes on disk ARE
+the change. There is no wrapper, no metadata, no index that
+supersedes the raw bytes.
 
-Each object is a file at `~/.glon/objects/<id>.pb` containing the raw
-protobuf wire-format encoding of a GlonObject. No headers, no wrappers,
-no filesystem metadata. The protobuf bytes ARE the file.
+Operations within a Change:
+- `ObjectCreate` — initialize with a type key (genesis change)
+- `ObjectDelete` — tombstone (soft delete flag)
+- `FieldSet` / `FieldDelete` — typed field mutations
+- `ContentSet` — raw byte content (source files, images)
+- `BlockAdd` / `BlockRemove` / `BlockUpdate` / `BlockMove` — block tree
 
-You can decode any object with standard tooling:
+### 2. Rivet Actors
 
-```
-protoc --decode=glon.GlonObject proto/glon.proto < ~/.glon/objects/proto_glon.proto.pb
-```
+Every object is embodied by a durable Rivet actor — globally
+addressable over HTTP, hibernatable, wakes on demand. The actor
+caches the computed state derived from replaying the DAG. The DAG
+on disk is the source of truth; the actor state is a cache.
 
-### In Actors
+The store actor is a coordinator: it maintains a SQLite index for
+cross-object queries, creates and destroys object actors, and
+validates IPC routing.
 
-Each object actor holds the GlonObject fields as in-memory state.
-Content is base64-encoded for JSON serialization (Rivet's persistence
-layer). The actor provides actions: read, write, setMeta, readContent,
-readProto. It broadcasts a `changed` event on mutation.
+## The Sync Protocol
 
-### In the Index
-
-The store actor runs a SQLite database with a single table:
-
-```sql
-CREATE TABLE objects (
-  id         TEXT PRIMARY KEY,
-  kind       TEXT NOT NULL,
-  name       TEXT NOT NULL,
-  size       INTEGER NOT NULL DEFAULT 0,
-  created_at INTEGER NOT NULL DEFAULT 0
-);
-```
-
-This is a derived index. The protobuf on disk is the source of truth.
-
-## Object Identity
-
-IDs are derived from kind and name: `<kind>:<name>`. Examples:
-
-```
-proto:glon.proto
-typescript:store.ts
-json:package.json
-note:hello-world
-```
-
-This is deterministic. The same kind + name always produces the same ID.
-There are no UUIDs, no auto-increment, no randomness.
-
-## Self-Description
-
-On bootstrap, the OS reads its own source files from disk, encodes each
-as a GlonObject, writes the protobuf bytes to `~/.glon/objects/`, and
-registers them in the store actor's index.
-
-After bootstrap, the OS contains:
-
-```
-proto:glon.proto           -- the type system itself
-typescript:proto.ts        -- the protobuf encode/decode layer
-typescript:object.ts       -- the object actor definition
-typescript:store.ts        -- the store coordinator
-typescript:index.ts        -- the registry entry point
-typescript:bootstrap.ts    -- the bootstrap script
-typescript:client.ts       -- the CLI shell
-json:package.json          -- dependencies
-json:tsconfig.json         -- compiler config
-```
-
-The operating system describes itself. You can `/cat` any of these to
-read the source code that built the OS you're running.
-
-## The Shell
-
-The CLI is the primary interface. It connects to the store actor over
-HTTP (Rivet's actor protocol, default port 6420).
-
-```
-glon> /list              -- list all objects
-glon> /list typescript   -- list objects of kind "typescript"
-glon> /info              -- system stats
-glon> /get <id>          -- inspect an object ref
-glon> /search <query>    -- search by name
-glon> /create <kind> <name>  -- create an empty object
-glon> /delete <id>       -- delete an object
-glon> /cat <id>          -- read content from disk (decoded protobuf)
-glon> /dump <id>         -- hex dump of raw protobuf bytes on disk
-glon> /disk              -- disk storage stats
-glon> /proto             -- display the proto schema
-glon> /kinds             -- list object kinds with counts
-glon> /help              -- command reference
-```
-
-## IPC
-
-The Envelope message defines actor-to-actor communication:
+Actor-to-actor communication uses typed protobuf Envelope messages.
+The protocol is pull-based: a peer advertises its heads, the other
+responds with what's missing.
 
 ```protobuf
 message Envelope {
   string from_id = 1;
   string to_id = 2;
-  string action = 3;
-  bytes payload = 4;
-  int64 timestamp = 5;
+  int64 timestamp = 3;
+
+  oneof message {
+    HeadAdvertise   head_advertise   = 10;
+    HeadRequest     head_request     = 11;
+    ChangePush      change_push      = 12;
+    ChangeRequest   change_request   = 13;
+    ObjectSubscribe object_subscribe = 20;
+    ObjectEvent     object_event     = 21;
+    AppMessage      app_message      = 30;
+  }
 }
 ```
 
-The payload is itself a protobuf-encoded message. Protobuf all the way
-down. This is defined but not yet wired into the runtime.
+Each object actor is a sync peer. Because Rivet actors are
+globally addressable, the OS is a mesh of sync peers that could
+be running anywhere — your laptop, an edge node in Tokyo, a
+Raspberry Pi. The "local" experience is just the network being fast.
+
+## Storage Model
+
+```
+Disk (~/.glon/)           Actors (Rivet)            Client (shell)
+  changes/*.pb        --> object actor instances --> glon> /list
+  content-addressed       cached computed state     CLI commands
+  protobuf binary         durable, hibernatable
+
+  index.db (SQLite)   --> store actor
+  derived, rebuildable    coordinator + index
+```
+
+### On Disk
+
+Each change is a file at `~/.glon/changes/<sha256-hex>.pb` containing
+raw protobuf wire-format bytes. The hash IS the filename. The bytes
+ARE the change. Delete the SQLite index and it rebuilds from the `.pb`
+files on next boot.
+
+### In Actors
+
+Each object actor caches:
+- Computed state (type, fields, content, blocks, deleted flag)
+- Current head change IDs
+- Change count
+- IPC inbox/outbox
+
+State is recomputed from disk on mutation — the actor reads all
+changes for its object, replays them via topological sort, and
+updates its cache.
+
+### In the Index
+
+The store actor's SQLite database:
+```sql
+objects (id, type_key, deleted, created_at, updated_at)
+changes (id, object_id, timestamp, is_head)
+change_parents (change_id, parent_id)
+```
+
+This is derived. The changes on disk are the source of truth.
+
+## Object Identity
+
+- **Object ID**: Stable UUID, generated once at creation.
+- **Change ID**: SHA-256 hash of protobuf bytes (content-addressed).
+- Objects are referenced by UUID (or prefix). Changes by hash.
+
+## Self-Description
+
+On bootstrap, the OS reads its own source files, creates a Change
+DAG for each (genesis → fields → content), and registers them in
+the store. The OS contains its own source as objects.
+
+## The Shell
+
+```
+glon> /list              list all objects
+glon> /list typescript   filter by type
+glon> /get <id>          full object state from live actor
+glon> /set <id> <k> <v>  set a field (creates a Change)
+glon> /create <type> [n] create an object
+glon> /delete <id>       soft-delete
+glon> /search <query>    search by field values
+glon> /history <id>      show the change DAG
+glon> /change <hex-id>   inspect a single change
+glon> /send <f> <t> <a>  IPC between objects
+glon> /inbox <id>        show inbox
+glon> /outbox <id>       show outbox
+glon> /info              system stats
+glon> /disk              disk stats
+glon> /help              command reference
+```
 
 ## Project Layout
 
 ```
 glon/
-  proto/glon.proto         -- the primitive
+  proto/glon.proto         the protocol (DAG + Sync + State + Blocks + Values)
   src/
-    proto.ts               -- load .proto, encode/decode, type helpers
-    disk.ts                -- read/write raw protobuf to ~/.glon/
-    actors/
-      object.ts            -- object actor (one per entity)
-      store.ts             -- store coordinator (SQLite index)
-    index.ts               -- actor registry, start server
-    bootstrap.ts           -- seed source files into the OS
-    client.ts              -- CLI shell
+    crypto.ts              SHA-256 content-addressing
+    proto.ts               typed encode/decode for all messages
+    dag/
+      change.ts            change creation, content-address computation
+      dag.ts               topological sort, state computation
+    storage/ (actors/)
+      object.ts            (stub — actors defined in index.ts)
+      store.ts             (stub — actors defined in index.ts)
+    disk.ts                raw .pb file storage
+    index.ts               actor definitions + registry
+    bootstrap.ts           seed source files as objects
+    client.ts              CLI shell
   package.json
   tsconfig.json
   ARCHITECTURE.md
-  WHITEROOM.md             -- this file
-```
-
-## Running
-
-```bash
-# Install
-cd glon && npm install
-
-# Start the OS
-npm run dev
-
-# Bootstrap (first time -- seeds source files)
-npm run bootstrap
-
-# Open the shell
-npm run client
+  WHITEROOM.md             this file
 ```
 
 ## What Exists
 
-- Protobuf schema with three messages (GlonObject, ObjectRef, Envelope)
-- Object actor: durable, stateful, per-entity
-- Store actor: coordinator with SQLite, CRUD + search
-- Disk layer: raw .pb files at ~/.glon/objects/
-- CLI shell: /list, /cat, /dump, /disk, /info, /create, /delete, /search
-- Self-describing: the OS contains its own source as objects
-- TypeScript compiles clean, runtime tested
+- Content-addressed Change DAG with topological sort and state replay
+- Typed protobuf protocol: Changes, Operations, Sync messages, Blocks, Values
+- Rivet actors: per-object sync peers, globally addressable over HTTP
+- Store actor with SQLite index (objects, changes, DAG edges)
+- Typed operations: ObjectCreate, FieldSet, FieldDelete, ContentSet, ObjectDelete, Block ops
+- Raw .pb change files on disk, content-addressed by SHA-256
+- Boot-from-disk: all state reconstructed from change files
+- CLI with CRUD, field mutation, history inspection, IPC, search
+- ID prefix resolution
+- Self-describing: OS source files are objects in the OS
 
 ## What Does Not Exist Yet
 
-- Actor-to-actor IPC via Envelope messages
-- Object actor instances (store tracks refs, but individual object
-  actors are not yet created per-object -- the store handles CRUD
-  directly against its SQLite index)
-- Disk-to-actor sync on boot (loading .pb files back into actor state)
-- Permissions / capability tokens
-- Namespaces beyond "root"
-- Process actors (actors that execute logic, not just hold data)
-- Browser/Canvas UI
-- Persistence of user-created objects to disk (only bootstrap writes .pb)
-- Schema validation (enforcing that objects match their kind's expected fields)
-- Replication / multi-node
+- Sync protocol execution (HeadAdvertise/ChangePush/ChangeRequest actions
+  are defined in the proto but not yet wired into actor actions)
+- Peer-to-peer sync between Rivet actors (exchange heads, push missing changes)
+- Block tree positioning (blocks append-only, no tree ordering)
+- End-to-end encryption (encrypt changes before writing)
+- Snapshot compaction (periodic snapshots to speed up replay)
+- Multiple namespaces / spaces
+- Process actors (actors that execute logic)
+- Browser / Canvas UI
+- Schema validation (enforcing type constraints on fields)
+- Replication / multi-node Rivet deployment
 
 ## Design Constraints
 
-1. One message type. No inheritance, no subtypes, no schemas-per-kind.
-   The `kind` field and `meta` map handle all variation.
+1. **Changes are truth.** The `.pb` files on disk are the source of
+   truth. Actor state is a cache. SQLite is an index. Both are derived
+   from the change DAG and rebuildable.
 
-2. Binary on disk. No JSON, no SQL, no filesystem metadata wrapping
-   the protobuf. The .pb file IS the object.
+2. **One protocol.** Storage, sync, IPC — all protobuf. The `.proto`
+   file IS the protocol specification. There is no second format.
 
-3. Actors are the runtime. Not threads, not processes, not lambdas.
-   Each object is an actor. The actor model provides isolation,
-   durability, communication, and lifecycle management.
+3. **Actors are sync peers.** Each object actor is a globally-addressable
+   endpoint. Sync is peer-to-peer between actors. No central server,
+   no relay infrastructure (Rivet provides the addressing).
 
-4. The OS is its own content. Every source file that builds Glon is
-   an object inside Glon. If you delete the source from the filesystem
-   but the .pb files survive, the OS still knows what it is.
+4. **Content-addressed.** Changes are identified by their hash. Same
+   mutation → same hash. Tamper-evident. Deduplication is free.
 
-5. Protobuf is the lingua franca. Storage is protobuf. IPC will be
-   protobuf. The schema is protobuf. There is no second serialization
-   format.
+5. **The OS is its own content.** Every source file that builds Glon is
+   an object inside Glon with full change history.

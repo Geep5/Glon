@@ -1,32 +1,31 @@
 /**
- * Bootstrap — seeds the OS with its own source files.
+ * Bootstrap — seed Glon OS with its own source files.
  *
- * Populates both the Rivet actor store AND the local disk.
- * Each source file becomes:
- *   1. A protobuf glon.Object encoded to raw bytes on disk (~/.glon/objects/)
- *   2. An entry in the Rivet store actor's SQLite index
+ * Each source file becomes a Glon object created through the store actor.
+ * The store handles genesis/field/content changes, disk writes, indexing,
+ * and object actor spawning.
  *
- * The OS is self-describing: the protobuf bytes on your hard drive
- * ARE the operating system.
- *
- * Usage: npm run bootstrap
+ * Usage: npm run bootstrap / npx tsx src/bootstrap.ts
  */
 
 import { createClient } from "rivetkit/client";
 import type { app } from "./index.js";
 import { readFileSync } from "node:fs";
 import { resolve, basename, extname } from "node:path";
-import { initDisk, writeToDisk, diskStats } from "./disk.js";
-import { createObject, deriveId } from "./proto.js";
+import { initDisk } from "./disk.js";
+import { stringVal, intVal } from "./proto.js";
 
-const ROOT = resolve(import.meta.dirname ?? ".", "..");
+const ENDPOINT = process.env.GLON_ENDPOINT ?? "http://localhost:6420";
 
-// Every file that constitutes Glon OS.
 const SOURCES = [
 	"proto/glon.proto",
 	"src/proto.ts",
+	"src/crypto.ts",
+	"src/dag/change.ts",
+	"src/dag/dag.ts",
 	"src/actors/object.ts",
 	"src/actors/store.ts",
+	"src/disk.ts",
 	"src/index.ts",
 	"src/bootstrap.ts",
 	"src/client.ts",
@@ -38,72 +37,77 @@ const KIND_MAP: Record<string, string> = {
 	".proto": "proto",
 	".ts": "typescript",
 	".json": "json",
-	".md": "markdown",
-	".html": "html",
 };
 
-function kindFromExt(path: string): string {
-	return KIND_MAP[extname(path)] ?? "file";
+function kindOf(file: string): string {
+	return KIND_MAP[extname(file)] ?? "unknown";
 }
 
-async function bootstrap() {
-	const client = createClient<typeof app>("http://localhost:6420");
+async function main() {
+	const projectRoot = resolve(import.meta.dirname ?? ".", "..");
+
+	initDisk();
+
+	const client = createClient<typeof app>(ENDPOINT);
 	const store = client.storeActor.getOrCreate(["root"]);
 
 	console.log("Bootstrapping Glon OS...\n");
 
 	let created = 0;
-
-	// Ensure disk storage exists
-	initDisk();
+	let skipped = 0;
 
 	for (const relPath of SOURCES) {
-		const absPath = resolve(ROOT, relPath);
+		const absPath = resolve(projectRoot, relPath);
 		const name = basename(relPath);
-		const kind = kindFromExt(relPath);
+		const kind = kindOf(relPath);
 
-		let content: Buffer;
+		let raw: Buffer;
 		try {
-			content = readFileSync(absPath);
+			raw = readFileSync(absPath);
 		} catch {
-			console.log(`  skip  ${relPath} (not found)`);
+			console.log(`  SKIP  ${relPath} (not found)`);
+			skipped++;
 			continue;
 		}
 
-		const contentBase64 = content.toString("base64");
-		const meta: Record<string, string> = {
-			path: relPath,
-			lines: content.toString("utf-8").split("\n").length.toString(),
-			size: content.byteLength.toString(),
-		};
+		const lineCount = raw.toString("utf-8").split("\n").length;
+		const contentBase64 = raw.toString("base64");
 
-		const id = await store.create({ kind, name, content: contentBase64, meta });
-
-		// Write raw protobuf bytes to disk
-		const obj = createObject({
-			id: deriveId(kind, name),
-			kind,
-			name,
-			content: new Uint8Array(content),
-			meta,
+		// Fields: name, path, lines, size — serialized as JSON Record<string, Value>
+		const fieldsJson = JSON.stringify({
+			name: stringVal(name),
+			path: stringVal(relPath),
+			lines: intVal(lineCount),
+			size: intVal(raw.byteLength),
 		});
-		writeToDisk(obj);
 
-		console.log(`  ${kind.padEnd(12)} ${relPath.padEnd(30)} → ${id}`);
-		created++;
+		try {
+			const id = await store.create(kind, fieldsJson, contentBase64);
+			console.log(`  OK    ${relPath.padEnd(28)} ${kind.padEnd(12)} ${id.slice(0, 12)}...`);
+			created++;
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			console.log(`  ERR   ${relPath} — ${msg}`);
+			skipped++;
+		}
 	}
 
-	console.log(`\n${created} objects created.`);
+	console.log(`\nDone. ${created} created, ${skipped} skipped.`);
 
-	const info = await store.info();
-	console.log(`\nSystem info:`);
-	console.log(`  total objects: ${info.totalObjects}`);
-	for (const { kind, cnt } of info.byKind) {
-		console.log(`  ${kind}: ${cnt}`);
+	try {
+		const info = await store.info();
+		console.log(`Store: ${info.totalObjects} objects, ${info.totalChanges} changes.`);
+		for (const [typeKey, cnt] of Object.entries(info.byType)) {
+			console.log(`  ${typeKey}: ${cnt}`);
+		}
+	} catch {
+		// Store info may fail if not fully ready; non-fatal.
 	}
+
+	process.exit(0);
 }
 
-bootstrap().catch((err) => {
+main().catch((err) => {
 	console.error("Bootstrap failed:", err);
 	process.exit(1);
 });

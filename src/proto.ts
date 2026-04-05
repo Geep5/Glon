@@ -1,11 +1,12 @@
 /**
- * Proto layer — the primitive.
+ * Proto layer — typed encode/decode for every message in glon.proto.
  *
- * Loads glon.proto at import time and exposes typed helpers for
- * creating, encoding, and decoding glon.Object messages.
+ * One type system. Protobuf types throughout. The .proto file is
+ * the single source of truth for all data shapes.
  *
- * Every other module in Glon imports from here. Nothing else
- * defines data shapes. The .proto file is the single source of truth.
+ * Binary data is Uint8Array. Integers are numbers (JS safe range).
+ * No JSON-safe parallel types — serialization boundaries are handled
+ * at the edges (actor state, wire), not in the type system.
  */
 
 import protobuf from "protobufjs";
@@ -16,167 +17,207 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const PROTO_PATH = resolve(__dirname, "../proto/glon.proto");
 
-// ── Load schema synchronously at startup ──────────────────────────
+// ── Load schema ─────────────────────────────────────────────────
 
 const root = protobuf.loadSync(PROTO_PATH);
 
-const ObjectType = root.lookupType("glon.GlonObject");
-const ObjectRefType = root.lookupType("glon.ObjectRef");
+const ChangeType = root.lookupType("glon.Change");
 const EnvelopeType = root.lookupType("glon.Envelope");
+const ObjectSnapshotType = root.lookupType("glon.ObjectSnapshot");
 
-// ── TypeScript interfaces mirroring the proto ─────────────────────
+// ── TypeScript interfaces ───────────────────────────────────────
 
-export interface GlonObject {
-	id: string;
-	kind: string;
-	name: string;
-	content: Uint8Array;
-	meta: Record<string, string>;
-	createdAt: number; // unix ms (protobuf int64 → number in JS)
-	updatedAt: number;
-	size: number;
+export interface Value {
+	stringValue?: string;
+	intValue?: number;
+	floatValue?: number;
+	boolValue?: boolean;
+	bytesValue?: Uint8Array;
+	listValue?: { values: string[] };
 }
 
-export interface GlonObjectRef {
-	id: string;
-	kind: string;
-	name: string;
-	size: number;
+export interface TextContent {
+	text: string;
+	style: number;
 }
 
-export interface GlonEnvelope {
-	fromId: string;
-	toId: string;
-	action: string;
-	payload: Uint8Array;
+export interface BlockContent {
+	text?: TextContent;
+}
+
+export interface Block {
+	id: string;
+	childrenIds: string[];
+	content: BlockContent;
+}
+
+export interface ObjectCreate { typeKey: string; }
+export interface ObjectDelete {}
+export interface FieldSet { key: string; value: Value; }
+export interface FieldDelete { key: string; }
+export interface ContentSet { content: Uint8Array; }
+export interface BlockAdd { parentId: string; afterId: string; block: Block; }
+export interface BlockRemove { blockId: string; }
+export interface BlockUpdate { blockId: string; content: BlockContent; }
+export interface BlockMove { blockId: string; newParentId: string; afterId: string; }
+
+export interface Operation {
+	objectCreate?: ObjectCreate;
+	objectDelete?: ObjectDelete;
+	fieldSet?: FieldSet;
+	fieldDelete?: FieldDelete;
+	contentSet?: ContentSet;
+	blockAdd?: BlockAdd;
+	blockRemove?: BlockRemove;
+	blockUpdate?: BlockUpdate;
+	blockMove?: BlockMove;
+}
+
+export interface Change {
+	id: Uint8Array;
+	objectId: string;
+	parentIds: Uint8Array[];
+	ops: Operation[];
 	timestamp: number;
+	author: string;
 }
 
-// ── JSON-safe state shape (for Rivet actor state persistence) ─────
-// Rivet state must survive structuredClone. Uint8Array is fine, but
-// we store content as base64 for readability in debugging/logging.
-
-export interface ObjectState {
+export interface ObjectSnapshot {
 	id: string;
-	kind: string;
-	name: string;
-	content: string; // base64-encoded bytes
-	meta: Record<string, string>;
+	typeKey: string;
+	fields: Record<string, Value>;
+	content: Uint8Array;
+	blocks: Block[];
+	deleted: boolean;
 	createdAt: number;
 	updatedAt: number;
-	size: number;
 }
 
-// ── Envelope record (JSON-safe for actor state) ──────────────────
+export interface ObjectRef {
+	id: string;
+	typeKey: string;
+	createdAt: number;
+	updatedAt: number;
+}
 
-export interface EnvelopeRecord {
+// ── Sync protocol messages ──────────────────────────────────────
+
+export interface HeadAdvertise {
+	objectId: string;
+	headIds: Uint8Array[];
+}
+
+export interface HeadRequest {
+	objectId: string;
+	knownIds: Uint8Array[];
+	targetIds: Uint8Array[];
+}
+
+export interface ChangePush {
+	objectId: string;
+	changes: Change[];
+}
+
+export interface ChangeRequest {
+	objectId: string;
+	changeIds: Uint8Array[];
+}
+
+export interface ObjectSubscribe {
+	objectId: string;
+}
+
+export interface ObjectEvent {
+	objectId: string;
+	newHeadIds: Uint8Array[];
+	changes: Change[];
+}
+
+export interface AppMessage {
+	action: string;
+	payload: Uint8Array;
+}
+
+export interface Envelope {
 	fromId: string;
 	toId: string;
-	action: string;
-	payload: string; // base64-encoded bytes, or plain text for simple messages
 	timestamp: number;
+	headAdvertise?: HeadAdvertise;
+	headRequest?: HeadRequest;
+	changePush?: ChangePush;
+	changeRequest?: ChangeRequest;
+	objectSubscribe?: ObjectSubscribe;
+	objectEvent?: ObjectEvent;
+	appMessage?: AppMessage;
 }
 
-/** Create an EnvelopeRecord with defaults. */
-export function createEnvelope(
-	fromId: string,
-	toId: string,
-	action: string,
-	payload = "",
-): EnvelopeRecord {
-	return { fromId, toId, action, payload, timestamp: Date.now() };
+// ── Codec options ───────────────────────────────────────────────
+
+const DECODE_OPTS = { bytes: Uint8Array, longs: Number, defaults: true } as const;
+
+// ── Change codec ────────────────────────────────────────────────
+
+export function encodeChange(c: Change): Uint8Array {
+	const err = ChangeType.verify(c);
+	if (err) throw new Error(`Change verify: ${err}`);
+	return ChangeType.encode(ChangeType.create(c)).finish();
 }
 
-// ── Encode / Decode ───────────────────────────────────────────────
-
-/** Encode a GlonObject to protobuf wire bytes. */
-export function encodeObject(obj: GlonObject): Uint8Array {
-	const err = ObjectType.verify(obj);
-	if (err) throw new Error(`proto verify: ${err}`);
-	return ObjectType.encode(ObjectType.create(obj)).finish();
+export function decodeChange(bytes: Uint8Array): Change {
+	const msg = ChangeType.decode(bytes);
+	return ChangeType.toObject(msg, DECODE_OPTS) as unknown as Change;
 }
 
-/** Decode protobuf wire bytes to a GlonObject. */
-export function decodeObject(bytes: Uint8Array): GlonObject {
-	const msg = ObjectType.decode(bytes);
-	return ObjectType.toObject(msg, {
-		bytes: Uint8Array,
-		longs: Number,
-		defaults: true,
-	}) as unknown as GlonObject;
+/** Encode with id zeroed — hash these bytes to get the content address. */
+export function encodeChangeForHashing(c: Change): Uint8Array {
+	const copy = { ...c, id: new Uint8Array(0) };
+	return ChangeType.encode(ChangeType.create(copy)).finish();
 }
 
-/** Encode a GlonObjectRef to protobuf wire bytes. */
-export function encodeObjectRef(ref: GlonObjectRef): Uint8Array {
-	return ObjectRefType.encode(ObjectRefType.create(ref)).finish();
+// ── Snapshot codec ──────────────────────────────────────────────
+
+export function encodeSnapshot(s: ObjectSnapshot): Uint8Array {
+	return ObjectSnapshotType.encode(ObjectSnapshotType.create(s)).finish();
 }
 
-/** Decode protobuf wire bytes to a GlonObjectRef. */
-export function decodeObjectRef(bytes: Uint8Array): GlonObjectRef {
-	const msg = ObjectRefType.decode(bytes);
-	return ObjectRefType.toObject(msg, {
-		defaults: true,
-	}) as unknown as GlonObjectRef;
+export function decodeSnapshot(bytes: Uint8Array): ObjectSnapshot {
+	const msg = ObjectSnapshotType.decode(bytes);
+	return ObjectSnapshotType.toObject(msg, DECODE_OPTS) as unknown as ObjectSnapshot;
 }
 
-/** Encode a GlonEnvelope to protobuf wire bytes. */
-export function encodeEnvelope(env: GlonEnvelope): Uint8Array {
-	return EnvelopeType.encode(EnvelopeType.create(env)).finish();
+// ── Envelope codec ──────────────────────────────────────────────
+
+export function encodeEnvelope(e: Envelope): Uint8Array {
+	return EnvelopeType.encode(EnvelopeType.create(e)).finish();
 }
 
-/** Decode protobuf wire bytes to a GlonEnvelope. */
-export function decodeEnvelope(bytes: Uint8Array): GlonEnvelope {
+export function decodeEnvelope(bytes: Uint8Array): Envelope {
 	const msg = EnvelopeType.decode(bytes);
-	return EnvelopeType.toObject(msg, {
-		bytes: Uint8Array,
-		longs: Number,
-		defaults: true,
-	}) as unknown as GlonEnvelope;
+	return EnvelopeType.toObject(msg, DECODE_OPTS) as unknown as Envelope;
 }
 
-// ── Helpers ───────────────────────────────────────────────────────
+// ── Value helpers ───────────────────────────────────────────────
 
-/** Create a GlonObject from minimal input. Fills defaults. */
-export function createObject(
-	input: Pick<GlonObject, "id" | "kind" | "name"> &
-		Partial<Omit<GlonObject, "id" | "kind" | "name">>,
-): GlonObject {
-	const now = Date.now();
-	const content = input.content ?? new Uint8Array(0);
-	return {
-		id: input.id,
-		kind: input.kind,
-		name: input.name,
-		content,
-		meta: input.meta ?? {},
-		createdAt: input.createdAt ?? now,
-		updatedAt: input.updatedAt ?? now,
-		size: input.size ?? content.byteLength,
-	};
+export function stringVal(s: string): Value { return { stringValue: s }; }
+export function intVal(n: number): Value { return { intValue: n }; }
+export function floatVal(n: number): Value { return { floatValue: n }; }
+export function boolVal(b: boolean): Value { return { boolValue: b }; }
+export function bytesVal(b: Uint8Array): Value { return { bytesValue: b }; }
+
+export function unwrapValue(v: Value): string | number | boolean | Uint8Array | string[] | null {
+	if (v.stringValue !== undefined && v.stringValue !== "") return v.stringValue;
+	if (v.intValue !== undefined && v.intValue !== 0) return v.intValue;
+	if (v.floatValue !== undefined && v.floatValue !== 0) return v.floatValue;
+	if (v.boolValue !== undefined && v.boolValue !== false) return v.boolValue;
+	if (v.bytesValue !== undefined && v.bytesValue.length > 0) return v.bytesValue;
+	if (v.listValue !== undefined) return v.listValue.values;
+	return null;
 }
 
-/** Convert GlonObject ↔ ObjectState (actor-safe representation). */
-export function toState(obj: GlonObject): ObjectState {
-	return {
-		...obj,
-		content: Buffer.from(obj.content).toString("base64"),
-	};
-}
-
-export function fromState(state: ObjectState): GlonObject {
-	const content = Buffer.from(state.content, "base64");
-	return {
-		...state,
-		content: new Uint8Array(content),
-	};
-}
-
-/** Create a ref from a full object. */
-export function toRef(obj: GlonObject | ObjectState): GlonObjectRef {
-	return { id: obj.id, kind: obj.kind, name: obj.name, size: obj.size };
-}
-
-/** Derive a stable ID from a kind + path/name. */
-export function deriveId(kind: string, path: string): string {
-	return `${kind}:${path}`;
+export function displayValue(v: Value): string {
+	const raw = unwrapValue(v);
+	if (raw === null) return "(empty)";
+	if (Array.isArray(raw)) return raw.join(", ");
+	if (raw instanceof Uint8Array) return `<${raw.byteLength} bytes>`;
+	return String(raw);
 }

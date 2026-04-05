@@ -1,106 +1,101 @@
 /**
- * Disk layer — raw protobuf on the hard drive.
+ * Disk layer — raw protobuf change files on disk.
  *
- * Each glon.Object is stored as a single file containing its
- * protobuf wire-format bytes. Nothing else. No JSON wrappers,
- * no SQLite, no filesystem metadata. The protobuf IS the file.
+ * Each Change is stored as a single file containing its protobuf
+ * wire-format bytes, named by its content-address (hex SHA-256).
  *
  * Directory layout:
  *   ~/.glon/
- *     objects/
- *       <id>.pb          raw protobuf bytes (glon.Object)
- *
- * To inspect with protoc:
- *   protoc --decode=glon.Object proto/glon.proto < ~/.glon/objects/<id>.pb
+ *     changes/
+ *       <hex-hash>.pb    raw protobuf bytes (glon.Change)
  */
 
-import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, unlinkSync, statSync } from "node:fs";
+import {
+	mkdirSync,
+	writeFileSync,
+	readFileSync,
+	readdirSync,
+	existsSync,
+	unlinkSync,
+	statSync,
+} from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import {
-	type GlonObject,
-	encodeObject,
-	decodeObject,
-	createObject,
-} from "./proto.js";
+import { encodeChange, decodeChange, type Change } from "./proto.js";
+import { hexEncode } from "./crypto.js";
 
-// ── Paths ─────────────────────────────────────────────────────────
+// ── Paths ──────────────────────────────────────────────────────────
 
 const GLON_ROOT = process.env.GLON_DATA ?? join(homedir(), ".glon");
-const OBJECTS_DIR = join(GLON_ROOT, "objects");
+const CHANGES_DIR = join(GLON_ROOT, "changes");
 
-/** Ensure the storage directory exists. */
+export function getGlonRoot(): string {
+	return GLON_ROOT;
+}
+
+/** Ensure the storage directories exist. */
 export function initDisk(): void {
-	mkdirSync(OBJECTS_DIR, { recursive: true });
+	mkdirSync(CHANGES_DIR, { recursive: true });
 }
 
-/** Sanitize an object ID for use as a filename. */
-function idToFilename(id: string): string {
-	// Replace characters that are unsafe in filenames
-	return id.replace(/[/\\:*?"<>|]/g, "_") + ".pb";
+// ── Write ──────────────────────────────────────────────────────────
+
+/** Write a Change to disk as raw protobuf bytes. */
+export function writeChange(change: Change): void {
+	const bytes = encodeChange(change);
+	const hex = hexEncode(change.id);
+	writeFileSync(join(CHANGES_DIR, `${hex}.pb`), bytes);
 }
 
-function filePathFor(id: string): string {
-	return join(OBJECTS_DIR, idToFilename(id));
+// ── Read ───────────────────────────────────────────────────────────
+
+/** Read a Change by its binary id. Returns null if not found. */
+export function readChange(id: Uint8Array): Change | null {
+	return readChangeByHex(hexEncode(id));
 }
 
-// ── Write ─────────────────────────────────────────────────────────
-
-/** Write a GlonObject to disk as raw protobuf bytes. */
-export function writeToDisk(obj: GlonObject): void {
-	const bytes = encodeObject(obj);
-	writeFileSync(filePathFor(obj.id), bytes);
-}
-
-/** Write raw protobuf bytes to disk by ID. */
-export function writeRawToDisk(id: string, bytes: Uint8Array): void {
-	writeFileSync(filePathFor(id), bytes);
-}
-
-// ── Read ──────────────────────────────────────────────────────────
-
-/** Read a GlonObject from disk. Returns null if not found. */
-export function readFromDisk(id: string): GlonObject | null {
-	const path = filePathFor(id);
+/** Read a Change by its hex id. Returns null if not found. */
+export function readChangeByHex(hexId: string): Change | null {
+	const path = join(CHANGES_DIR, `${hexId}.pb`);
 	if (!existsSync(path)) return null;
-	const bytes = readFileSync(path);
-	return decodeObject(new Uint8Array(bytes));
+	return decodeChange(new Uint8Array(readFileSync(path)));
 }
 
-/** Read raw protobuf bytes from disk. Returns null if not found. */
-export function readRawFromDisk(id: string): Uint8Array | null {
-	const path = filePathFor(id);
-	if (!existsSync(path)) return null;
-	return new Uint8Array(readFileSync(path));
+// ── List ───────────────────────────────────────────────────────────
+
+/** List hex ids of all stored changes. */
+export function listChangeFiles(): string[] {
+	if (!existsSync(CHANGES_DIR)) return [];
+	return readdirSync(CHANGES_DIR)
+		.filter((f) => f.endsWith(".pb"))
+		.map((f) => f.slice(0, -3));
 }
 
-// ── Delete ────────────────────────────────────────────────────────
+// ── Delete ─────────────────────────────────────────────────────────
 
-/** Remove an object from disk. */
-export function deleteFromDisk(id: string): boolean {
-	const path = filePathFor(id);
+/** Remove a change file by binary id. */
+export function deleteChangeFile(id: Uint8Array): boolean {
+	const path = join(CHANGES_DIR, `${hexEncode(id)}.pb`);
 	if (!existsSync(path)) return false;
 	unlinkSync(path);
 	return true;
 }
 
-// ── List / Stats ──────────────────────────────────────────────────
-
-/** List all object IDs on disk. */
-export function listOnDisk(): string[] {
-	if (!existsSync(OBJECTS_DIR)) return [];
-	return readdirSync(OBJECTS_DIR)
-		.filter(f => f.endsWith(".pb"))
-		.map(f => f.slice(0, -3).replace(/_/g, ":")); // reverse filename sanitization
-}
+// ── Stats ──────────────────────────────────────────────────────────
 
 /** Disk usage stats. */
-export function diskStats(): { objectCount: number; totalBytes: number; path: string } {
-	if (!existsSync(OBJECTS_DIR)) return { objectCount: 0, totalBytes: 0, path: OBJECTS_DIR };
-	const files = readdirSync(OBJECTS_DIR).filter(f => f.endsWith(".pb"));
+export function diskStats(): {
+	changeCount: number;
+	totalBytes: number;
+	path: string;
+} {
+	if (!existsSync(CHANGES_DIR)) {
+		return { changeCount: 0, totalBytes: 0, path: GLON_ROOT };
+	}
+	const files = readdirSync(CHANGES_DIR).filter((f) => f.endsWith(".pb"));
 	let totalBytes = 0;
 	for (const f of files) {
-		totalBytes += statSync(join(OBJECTS_DIR, f)).size;
+		totalBytes += statSync(join(CHANGES_DIR, f)).size;
 	}
-	return { objectCount: files.length, totalBytes, path: GLON_ROOT };
+	return { changeCount: files.length, totalBytes, path: GLON_ROOT };
 }

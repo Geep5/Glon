@@ -1,110 +1,246 @@
 /**
- * Glon OS -- entry point.
+ * Glon OS — actor registry.
  *
- * All actors and the registry are defined here in one file.
- * This is required by Rivet: c.client<typeof registry>() needs
- * the registry variable in scope at runtime.
+ * Two actors: objectActor (one per object, sync peer) and storeActor
+ * (singleton coordinator with SQLite index). Changes live on disk as
+ * .pb files; actors cache computed state derived from DAG replay.
+ *
+ * Rivet requires the registry in scope for c.client<typeof app>().
  */
 
 import { actor, event, setup } from "rivetkit";
 import { db } from "rivetkit/db";
-import type { ObjectState, EnvelopeRecord, GlonObjectRef } from "./proto.js";
-import { toState, fromState, createObject, toRef, encodeObject, createEnvelope, deriveId } from "./proto.js";
+import type { Change, Operation, Value, ObjectRef } from "./proto.js";
+import { encodeChange, decodeChange, stringVal, displayValue } from "./proto.js";
+import { sha256, hexEncode, hexDecode, generateObjectId } from "./crypto.js";
+import {
+	createChange,
+	createGenesisChange,
+	createFieldChange,
+	createContentChange,
+	createDeleteChange,
+	changeId,
+} from "./dag/change.js";
+import { computeState, findHeads, toSnapshot, type ObjectState } from "./dag/dag.js";
+import { initDisk, writeChange, readChangeByHex, listChangeFiles, diskStats } from "./disk.js";
 
-// ── Object Actor ──────────────────────────────────────────────────
+// ── Types ────────────────────────────────────────────────────────
+
+interface IpcMessage {
+	fromId: string;
+	toId: string;
+	action: string;
+	payload: string;
+	timestamp: number;
+}
+
+interface ObjectActorState {
+	// Identity
+	id: string;
+	typeKey: string;
+
+	// Computed state (cached from DAG replay)
+	fields: Record<string, any>;
+	content: string; // base64 of raw bytes
+	deleted: boolean;
+	createdAt: number;
+	updatedAt: number;
+
+	// DAG
+	headIds: string[]; // hex-encoded
+	changeCount: number;
+
+	// IPC
+	inbox: IpcMessage[];
+	outbox: IpcMessage[];
+}
 
 export interface ObjectInput {
 	id: string;
-	kind: string;
-	name: string;
+	typeKey: string;
+	headIds: string[];
+	changeCount: number;
+	fields?: Record<string, any>;
 	content?: string;
-	meta?: Record<string, string>;
+	createdAt?: number;
+	updatedAt?: number;
 }
 
-interface ObjectActorState extends ObjectState {
-	inbox: EnvelopeRecord[];
-	outbox: EnvelopeRecord[];
+// ── Helpers (module-level) ───────────────────────────────────────
+
+/**
+ * Re-read all changes for an object from disk and recompute state.
+ * The DAG on disk is the source of truth; actor state is a cache.
+ */
+function recomputeFromDisk(objectId: string): { state: ObjectState; changeCount: number } {
+	const allHexIds = listChangeFiles();
+	const changes: Change[] = [];
+	for (const hexId of allHexIds) {
+		const change = readChangeByHex(hexId);
+		if (change && change.objectId === objectId) changes.push(change);
+	}
+	if (changes.length === 0) throw new Error(`no changes on disk for ${objectId}`);
+	return { state: computeState(changes), changeCount: changes.length };
 }
+
+/** Copy computed ObjectState into the actor's mutable state. */
+function syncState(cState: ObjectActorState, computed: ObjectState, changeCount: number): void {
+	cState.typeKey = computed.typeKey;
+	cState.deleted = computed.deleted;
+	cState.createdAt = computed.createdAt;
+	cState.updatedAt = computed.updatedAt;
+	cState.headIds = computed.heads.map((h) => hexEncode(h));
+	cState.changeCount = changeCount;
+	cState.content = Buffer.from(computed.content).toString("base64");
+	// Convert fields Map to Record
+	const fields: Record<string, any> = {};
+	for (const [k, v] of computed.fields) fields[k] = v;
+	cState.fields = fields;
+}
+
+// ── Object Actor ─────────────────────────────────────────────────
 
 const objectActor = actor({
-	createState: (_c, input?: ObjectInput): ObjectActorState => {
-		const id = input?.id ?? "";
-		const kind = input?.kind ?? "";
-		const name = input?.name ?? "";
-		const content = input?.content
-			? new Uint8Array(Buffer.from(input.content, "base64"))
-			: new Uint8Array(0);
-
-		const base = toState(
-			createObject({ id, kind, name, content, meta: input?.meta ?? {} }),
-		);
-		return { ...base, inbox: [], outbox: [] };
-	},
+	createState: (_c, input?: ObjectInput): ObjectActorState => ({
+		id: input?.id ?? "",
+		typeKey: input?.typeKey ?? "",
+		fields: input?.fields ?? {},
+		content: input?.content ?? "",
+		deleted: false,
+		createdAt: input?.createdAt ?? 0,
+		updatedAt: input?.updatedAt ?? 0,
+		headIds: input?.headIds ?? [],
+		changeCount: input?.changeCount ?? 0,
+		inbox: [],
+		outbox: [],
+	}),
 
 	events: {
 		changed: event<{ id: string; updatedAt: number }>(),
-		message: event<EnvelopeRecord>(),
+		synced: event<{ id: string; headIds: string[] }>(),
 	},
 
 	actions: {
-		read: (c): ObjectState => {
-			const { inbox: _i, outbox: _o, ...state } = c.state;
-			return state;
-		},
+		// ── CRUD ──────────────────────────────────────────────────
 
-		readProto: (c): string => {
-			const { inbox: _i, outbox: _o, ...state } = c.state;
-			return Buffer.from(encodeObject(fromState(state))).toString("base64");
+		read: (c): Omit<ObjectActorState, "inbox" | "outbox"> => {
+			const { inbox: _i, outbox: _o, ...rest } = c.state;
+			return rest;
 		},
 
 		readContent: (c): string => {
+			if (!c.state.content) return "";
 			return Buffer.from(c.state.content, "base64").toString("utf-8");
 		},
 
-		write: (c, contentBase64: string) => {
-			c.state.content = contentBase64;
-			c.state.size = Buffer.from(contentBase64, "base64").byteLength;
-			c.state.updatedAt = Date.now();
+		// ── Mutation ─────────────────────────────────────────────
+
+		setField: (c, key: string, valueJson: string) => {
+			const value: Value = JSON.parse(valueJson);
+			const parentIds = c.state.headIds.map((h) => hexDecode(h));
+			const change = createFieldChange(c.state.id, parentIds, key, value);
+			writeChange(change);
+			const { state: computed, changeCount } = recomputeFromDisk(c.state.id);
+			syncState(c.state, computed, changeCount);
 			c.broadcast("changed", { id: c.state.id, updatedAt: c.state.updatedAt });
 		},
 
-		setMeta: (c, key: string, value: string) => {
-			c.state.meta[key] = value;
-			c.state.updatedAt = Date.now();
+		setContent: (c, contentBase64: string) => {
+			const contentBytes = Buffer.from(contentBase64, "base64");
+			const parentIds = c.state.headIds.map((h) => hexDecode(h));
+			const change = createContentChange(c.state.id, parentIds, contentBytes);
+			writeChange(change);
+			const { state: computed, changeCount } = recomputeFromDisk(c.state.id);
+			syncState(c.state, computed, changeCount);
 			c.broadcast("changed", { id: c.state.id, updatedAt: c.state.updatedAt });
 		},
 
-		getMeta: (c): Record<string, string> => c.state.meta,
-
-		ref: (c) => toRef(c.state),
-
-		// ── IPC ───────────────────────────────────────────────────
-
-		recordSend: (c, targetId: string, actionName: string, msg = ""): EnvelopeRecord => {
-			const envelope = createEnvelope(c.state.id, targetId, actionName, msg);
-			c.state.outbox.push(envelope);
-			return envelope;
+		deleteField: (c, key: string) => {
+			const parentIds = c.state.headIds.map((h) => hexDecode(h));
+			const change = createChange(c.state.id, [{ fieldDelete: { key } }], parentIds);
+			writeChange(change);
+			const { state: computed, changeCount } = recomputeFromDisk(c.state.id);
+			syncState(c.state, computed, changeCount);
+			c.broadcast("changed", { id: c.state.id, updatedAt: c.state.updatedAt });
 		},
 
-		receive: (c, fromId: string, toId: string, action: string, payload: string, timestamp: number) => {
-			const envelope: EnvelopeRecord = { fromId, toId, action, payload, timestamp };
-			c.state.inbox.push(envelope);
-			c.broadcast("message", envelope);
+		markDeleted: (c) => {
+			const parentIds = c.state.headIds.map((h) => hexDecode(h));
+			const change = createDeleteChange(c.state.id, parentIds);
+			writeChange(change);
+			const { state: computed, changeCount } = recomputeFromDisk(c.state.id);
+			syncState(c.state, computed, changeCount);
+			c.broadcast("changed", { id: c.state.id, updatedAt: c.state.updatedAt });
 		},
 
-		getInbox: (c): EnvelopeRecord[] => c.state.inbox,
-		getOutbox: (c): EnvelopeRecord[] => c.state.outbox,
+		// ── Sync protocol ────────────────────────────────────────
+
+		getHeads: (c): string[] => c.state.headIds,
+
+		getChanges: (_c, hexIds: string): string => {
+			const ids = hexIds.split(",").filter(Boolean);
+			const results: string[] = [];
+			for (const hexId of ids) {
+				const change = readChangeByHex(hexId);
+				if (change) {
+					const encoded = encodeChange(change);
+					results.push(Buffer.from(encoded).toString("base64"));
+				}
+			}
+			return results.join(",");
+		},
+
+		pushChanges: (c, changesBase64: string) => {
+			const parts = changesBase64.split(",").filter(Boolean);
+			for (const b64 of parts) {
+				const bytes = Buffer.from(b64, "base64");
+				const change = decodeChange(new Uint8Array(bytes));
+				writeChange(change);
+			}
+			const { state: computed, changeCount } = recomputeFromDisk(c.state.id);
+			syncState(c.state, computed, changeCount);
+			c.broadcast("synced", { id: c.state.id, headIds: c.state.headIds });
+		},
+
+		// ── IPC ──────────────────────────────────────────────────
+
+		sendMessage: (c, toId: string, action: string, payload: string): IpcMessage => {
+			const msg: IpcMessage = {
+				fromId: c.state.id,
+				toId,
+				action,
+				payload,
+				timestamp: Date.now(),
+			};
+			c.state.outbox.push(msg);
+			return msg;
+		},
+
+		receiveMessage: (c, fromId: string, action: string, payload: string, timestamp: number) => {
+			const msg: IpcMessage = { fromId, toId: c.state.id, action, payload, timestamp };
+			c.state.inbox.push(msg);
+			c.broadcast("changed", { id: c.state.id, updatedAt: c.state.updatedAt });
+		},
+
+		getInbox: (c): IpcMessage[] => c.state.inbox,
+		getOutbox: (c): IpcMessage[] => c.state.outbox,
+
+		// ── Meta ─────────────────────────────────────────────────
+
+		ref: (c): ObjectRef => ({
+			id: c.state.id,
+			typeKey: c.state.typeKey,
+			createdAt: c.state.createdAt,
+			updatedAt: c.state.updatedAt,
+		}),
+
+		destroy: (c) => {
+			c.destroy();
+		},
 	},
 });
 
-// ── Store Actor ───────────────────────────────────────────────────
-
-export interface CreateInput {
-	kind: string;
-	name: string;
-	content?: string;
-	meta?: Record<string, string>;
-}
+// ── Store Actor ──────────────────────────────────────────────────
 
 const storeActor = actor({
 	state: { objectCount: 0 },
@@ -113,75 +249,263 @@ const storeActor = actor({
 		onMigrate: async (database) => {
 			await database.execute(`
 				CREATE TABLE IF NOT EXISTS objects (
-					id   TEXT PRIMARY KEY,
-					kind TEXT NOT NULL,
-					name TEXT NOT NULL,
-					size INTEGER NOT NULL DEFAULT 0,
-					created_at INTEGER NOT NULL DEFAULT 0
+					id TEXT PRIMARY KEY,
+					type_key TEXT NOT NULL DEFAULT '',
+					deleted INTEGER NOT NULL DEFAULT 0,
+					created_at INTEGER NOT NULL DEFAULT 0,
+					updated_at INTEGER NOT NULL DEFAULT 0
 				)
 			`);
-			await database.execute("CREATE INDEX IF NOT EXISTS idx_objects_kind ON objects(kind)");
-			await database.execute("CREATE INDEX IF NOT EXISTS idx_objects_name ON objects(name)");
+			await database.execute(`
+				CREATE TABLE IF NOT EXISTS changes (
+					id TEXT PRIMARY KEY,
+					object_id TEXT NOT NULL,
+					timestamp INTEGER NOT NULL,
+					is_head INTEGER NOT NULL DEFAULT 1
+				)
+			`);
+			await database.execute(`
+				CREATE TABLE IF NOT EXISTS change_parents (
+					change_id TEXT NOT NULL,
+					parent_id TEXT NOT NULL,
+					PRIMARY KEY (change_id, parent_id)
+				)
+			`);
+			await database.execute(
+				"CREATE INDEX IF NOT EXISTS idx_changes_object ON changes(object_id)",
+			);
+			await database.execute(
+				"CREATE INDEX IF NOT EXISTS idx_objects_type ON objects(type_key)",
+			);
 		},
 	}),
 
 	actions: {
-		create: async (c, input: CreateInput): Promise<string> => {
-			const id = deriveId(input.kind, input.name);
-			const contentBytes = input.content ? Buffer.from(input.content, "base64").byteLength : 0;
-			await c.db.execute(
-				"INSERT OR REPLACE INTO objects (id, kind, name, size, created_at) VALUES (?, ?, ?, ?, ?)",
-				id, input.kind, input.name, contentBytes, Date.now(),
-			);
-			c.state.objectCount++;
-			return id;
-		},
+		create: async (c, typeKey: string, fieldsJson?: string, contentBase64?: string): Promise<string> => {
+			initDisk();
+			const objectId = generateObjectId();
 
-		list: async (c, kind?: string): Promise<GlonObjectRef[]> => {
-			if (kind) {
-				return await c.db.execute(
-					"SELECT id, kind, name, size FROM objects WHERE kind = ? ORDER BY name", kind,
-				) as unknown as GlonObjectRef[];
+			// Genesis change — creates the object with its type
+			const genesis = createGenesisChange(objectId, typeKey);
+			writeChange(genesis);
+			const genesisHex = hexEncode(genesis.id);
+			await indexChangeInDb(c, genesisHex, objectId, genesis.parentIds, genesis.timestamp);
+
+			let lastParentIds: Uint8Array[] = [genesis.id];
+
+			// Optional field change
+			if (fieldsJson) {
+				const fieldsRecord: Record<string, Value> = JSON.parse(fieldsJson);
+				const ops: Operation[] = [];
+				for (const [key, value] of Object.entries(fieldsRecord)) {
+					ops.push({ fieldSet: { key, value } });
+				}
+				const fieldChange = createChange(objectId, ops, lastParentIds);
+				writeChange(fieldChange);
+				const fieldHex = hexEncode(fieldChange.id);
+				await indexChangeInDb(c, fieldHex, objectId, fieldChange.parentIds, fieldChange.timestamp);
+				lastParentIds = [fieldChange.id];
 			}
-			return await c.db.execute(
-				"SELECT id, kind, name, size FROM objects ORDER BY kind, name",
-			) as unknown as GlonObjectRef[];
+
+			// Optional content change
+			if (contentBase64) {
+				const contentBytes = Buffer.from(contentBase64, "base64");
+				const contentChange = createContentChange(objectId, lastParentIds, contentBytes);
+				writeChange(contentChange);
+				const contentHex = hexEncode(contentChange.id);
+				await indexChangeInDb(c, contentHex, objectId, contentChange.parentIds, contentChange.timestamp);
+			}
+
+			// Recompute state from disk
+			const { state: computed, changeCount } = recomputeFromDisk(objectId);
+
+			// Upsert objects table
+			await c.db.execute(
+				"INSERT OR REPLACE INTO objects (id, type_key, deleted, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+				objectId, computed.typeKey, computed.deleted ? 1 : 0, computed.createdAt, computed.updatedAt,
+			);
+
+			// Convert fields Map to Record for actor input
+			const fieldsRecord: Record<string, any> = {};
+			for (const [k, v] of computed.fields) fieldsRecord[k] = v;
+			const contentB64 = Buffer.from(computed.content).toString("base64");
+			const headHexIds = computed.heads.map((h) => hexEncode(h));
+
+			// Spawn object actor
+			const client = c.client<typeof app>();
+			const objActor = client.objectActor.getOrCreate([objectId], {
+				createWithInput: {
+					id: objectId,
+					typeKey: computed.typeKey,
+					headIds: headHexIds,
+					changeCount,
+					fields: fieldsRecord,
+					content: contentB64,
+					createdAt: computed.createdAt,
+					updatedAt: computed.updatedAt,
+				} as ObjectInput,
+			});
+			await objActor.ref();
+
+			c.state.objectCount++;
+			return objectId;
 		},
 
-		get: async (c, id: string): Promise<GlonObjectRef | null> => {
-			const rows = await c.db.execute(
-				"SELECT id, kind, name, size FROM objects WHERE id = ?", id,
-			) as unknown as GlonObjectRef[];
+		list: async (c, typeKey?: string): Promise<ObjectRef[]> => {
+			if (typeKey) {
+				return (await c.db.execute(
+					"SELECT id, type_key AS typeKey, created_at AS createdAt, updated_at AS updatedAt FROM objects WHERE type_key = ? ORDER BY updated_at DESC",
+					typeKey,
+				)) as unknown as ObjectRef[];
+			}
+			return (await c.db.execute(
+				"SELECT id, type_key AS typeKey, created_at AS createdAt, updated_at AS updatedAt FROM objects ORDER BY updated_at DESC",
+			)) as unknown as ObjectRef[];
+		},
+
+		get: async (c, id: string): Promise<Omit<ObjectActorState, "inbox" | "outbox"> | null> => {
+			const rows = (await c.db.execute(
+				"SELECT id FROM objects WHERE id = ?", id,
+			)) as unknown as { id: string }[];
+			if (rows.length === 0) return null;
+
+			const client = c.client<typeof app>();
+			const objActor = client.objectActor.getOrCreate([id]);
+			return await objActor.read();
+		},
+
+		getRef: async (c, id: string): Promise<ObjectRef | null> => {
+			const rows = (await c.db.execute(
+				"SELECT id, type_key AS typeKey, created_at AS createdAt, updated_at AS updatedAt FROM objects WHERE id = ?",
+				id,
+			)) as unknown as ObjectRef[];
 			return rows[0] ?? null;
 		},
 
-		search: async (c, query: string): Promise<GlonObjectRef[]> => {
-			return await c.db.execute(
-				"SELECT id, kind, name, size FROM objects WHERE name LIKE ? ORDER BY name", `%${query}%`,
-			) as unknown as GlonObjectRef[];
+		search: async (c, query: string): Promise<ObjectRef[]> => {
+			return (await c.db.execute(
+				"SELECT id, type_key AS typeKey, created_at AS createdAt, updated_at AS updatedAt FROM objects WHERE id LIKE ? ORDER BY updated_at DESC",
+				`%${query}%`,
+			)) as unknown as ObjectRef[];
 		},
 
 		delete: async (c, id: string): Promise<boolean> => {
-			const rows = await c.db.execute("SELECT id FROM objects WHERE id = ?", id) as unknown as { id: string }[];
+			const rows = (await c.db.execute(
+				"SELECT id FROM objects WHERE id = ?", id,
+			)) as unknown as { id: string }[];
 			if (rows.length === 0) return false;
+
+			try {
+				const client = c.client<typeof app>();
+				const objActor = client.objectActor.getOrCreate([id]);
+				await objActor.destroy();
+			} catch {
+				// Actor already gone — fine
+			}
+
 			await c.db.execute("DELETE FROM objects WHERE id = ?", id);
 			c.state.objectCount = Math.max(0, c.state.objectCount - 1);
 			return true;
 		},
 
-		count: (c): number => c.state.objectCount,
+		exists: async (c, id: string): Promise<boolean> => {
+			const rows = (await c.db.execute(
+				"SELECT id FROM objects WHERE id = ?", id,
+			)) as unknown as { id: string }[];
+			return rows.length > 0;
+		},
+
+		// Resolve an id prefix to a full id. Returns empty string if ambiguous or not found.
+		resolvePrefix: async (c, prefix: string): Promise<string> => {
+			const rows = (await c.db.execute(
+				"SELECT id FROM objects WHERE id LIKE ? AND deleted = 0", prefix + "%",
+			)) as unknown as { id: string }[];
+			if (rows.length === 1) return rows[0].id;
+			return "";
+		},
 
 		info: async (c) => {
-			const countRows = await c.db.execute("SELECT COUNT(*) as cnt FROM objects") as unknown as { cnt: number }[];
-			const kindRows = await c.db.execute(
-				"SELECT kind, COUNT(*) as cnt FROM objects GROUP BY kind ORDER BY cnt DESC",
-			) as unknown as { kind: string; cnt: number }[];
-			return { totalObjects: countRows[0]?.cnt ?? 0, byKind: kindRows };
+			const countRows = (await c.db.execute(
+				"SELECT COUNT(*) as cnt FROM objects",
+			)) as unknown as { cnt: number }[];
+			const changeCountRows = (await c.db.execute(
+				"SELECT COUNT(*) as cnt FROM changes",
+			)) as unknown as { cnt: number }[];
+			const typeRows = (await c.db.execute(
+				"SELECT type_key, COUNT(*) as cnt FROM objects GROUP BY type_key ORDER BY cnt DESC",
+			)) as unknown as { type_key: string; cnt: number }[];
+			const byType: Record<string, number> = {};
+			for (const row of typeRows) byType[row.type_key] = row.cnt;
+			return {
+				totalObjects: countRows[0]?.cnt ?? 0,
+				totalChanges: changeCountRows[0]?.cnt ?? 0,
+				byType,
+			};
+		},
+
+		indexChange: async (c, changeHexId: string, objectId: string, parentHexIds: string, timestamp: number) => {
+			await c.db.execute(
+				"INSERT OR IGNORE INTO changes (id, object_id, timestamp, is_head) VALUES (?, ?, ?, 1)",
+				changeHexId, objectId, timestamp,
+			);
+			const parents = parentHexIds.split(",").filter(Boolean);
+			for (const parentHex of parents) {
+				await c.db.execute(
+					"INSERT OR IGNORE INTO change_parents (change_id, parent_id) VALUES (?, ?)",
+					changeHexId, parentHex,
+				);
+				// Parent is no longer a head
+				await c.db.execute(
+					"UPDATE changes SET is_head = 0 WHERE id = ?",
+					parentHex,
+				);
+			}
+		},
+
+		indexObject: async (c, id: string, typeKey: string, deleted: number, createdAt: number, updatedAt: number) => {
+			await c.db.execute(
+				"INSERT OR REPLACE INTO objects (id, type_key, deleted, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+				id, typeKey, deleted, createdAt, updatedAt,
+			);
+		},
+
+		getHeadIds: async (c, objectId: string): Promise<string[]> => {
+			const rows = (await c.db.execute(
+				"SELECT id FROM changes WHERE object_id = ? AND is_head = 1",
+				objectId,
+			)) as unknown as { id: string }[];
+			return rows.map((r) => r.id);
 		},
 	},
 });
 
-// ── Registry ──────────────────────────────────────────────────────
+// ── Store helper: index a change in the DB ───────────────────────
+
+async function indexChangeInDb(
+	c: { db: { execute: (sql: string, ...args: any[]) => Promise<unknown> } },
+	changeHexId: string,
+	objectId: string,
+	parentIds: Uint8Array[],
+	timestamp: number,
+): Promise<void> {
+	await c.db.execute(
+		"INSERT OR IGNORE INTO changes (id, object_id, timestamp, is_head) VALUES (?, ?, ?, 1)",
+		changeHexId, objectId, timestamp,
+	);
+	for (const parentId of parentIds) {
+		const parentHex = hexEncode(parentId);
+		await c.db.execute(
+			"INSERT OR IGNORE INTO change_parents (change_id, parent_id) VALUES (?, ?)",
+			changeHexId, parentHex,
+		);
+		await c.db.execute(
+			"UPDATE changes SET is_head = 0 WHERE id = ?",
+			parentHex,
+		);
+	}
+}
+
+// ── Registry ─────────────────────────────────────────────────────
 
 export const app = setup({
 	use: { objectActor, storeActor },
