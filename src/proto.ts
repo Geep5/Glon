@@ -67,6 +67,26 @@ export interface ObjectState {
 	size: number;
 }
 
+// ── Envelope record (JSON-safe for actor state) ──────────────────
+
+export interface EnvelopeRecord {
+	fromId: string;
+	toId: string;
+	action: string;
+	payload: string; // base64-encoded bytes, or plain text for simple messages
+	timestamp: number;
+}
+
+/** Create an EnvelopeRecord with defaults. */
+export function createEnvelope(
+	fromId: string,
+	toId: string,
+	action: string,
+	payload = "",
+): EnvelopeRecord {
+	return { fromId, toId, action, payload, timestamp: Date.now() };
+}
+
 // ── Encode / Decode ───────────────────────────────────────────────
 
 /** Encode a GlonObject to protobuf wire bytes. */

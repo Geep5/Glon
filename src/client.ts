@@ -118,6 +118,11 @@ async function main() {
 						`    ${cyan("/dump")} ${dim("<id>")}             hex dump of protobuf bytes`,
 						`    ${cyan("/cat")} ${dim("<id>")}              read file content from disk`,
 						"",
+						bold("  IPC"),
+						`    ${cyan("/send")} ${dim("<from> <to> <action> [msg]")} send a message`,
+						`    ${cyan("/messages")} ${dim("<id>")}         show inbox`,
+						`    ${cyan("/outbox")} ${dim("<id>")}           show sent messages`,
+						"",
 						bold("  Shell"),
 						`    ${cyan("/help")}                  this message`,
 						`    ${cyan("/quit")}                  exit`,
@@ -295,6 +300,69 @@ async function main() {
 					console.log(dim(`  ── ${obj.name} (${obj.kind}, ${obj.size}b) ──`));
 					for (const line of text.split("\n")) {
 						console.log(`  ${line}`);
+					}
+					break;
+				}
+
+				// ── /send <from> <to> <action> [payload] ─────────────
+				case "send": {
+					const [fromId, toId, act, ...rest] = args;
+					if (!fromId || !toId || !act) {
+						console.log(yellow("  usage: /send <from-id> <to-id> <action> [message]"));
+						break;
+					}
+					const payload = rest.join(" ");
+					const ipcClient = createClient<typeof app>(ENDPOINT);
+
+					// 1. Sender records in outbox
+					const sender = ipcClient.objectActor.getOrCreate([fromId]);
+					const envelope = await sender.recordSend(toId, act, payload);
+
+					// 2. Router delivers to receiver's inbox
+					const receiver = ipcClient.objectActor.getOrCreate([toId]);
+					await receiver.receive(envelope.fromId, envelope.toId, envelope.action, envelope.payload, envelope.timestamp);
+
+					console.log(green(`  delivered: ${fromId} → ${toId} [${act}]`));
+					if (payload) console.log(dim(`  payload: ${payload}`));
+					break;
+				}
+
+				// ── /messages <id> ──────────────────────────────────
+				case "messages":
+				case "inbox": {
+					const msgId = args.join(" ");
+					if (!msgId) { console.log(yellow("  usage: /messages <id>")); break; }
+					const c3 = createClient<typeof app>(ENDPOINT);
+					const target = c3.objectActor.getOrCreate([msgId]);
+					const messages = await target.getInbox();
+					if (messages.length === 0) {
+						console.log(dim("  (no messages)"));
+					} else {
+						for (const msg of messages) {
+							const time = new Date(msg.timestamp).toISOString();
+							console.log(`  ${dim(time)}  ${cyan(msg.fromId)} → ${bold(msg.action)}${msg.payload ? ` ${dim(msg.payload)}` : ""}`);
+						}
+						console.log(dim(`\n  ${messages.length} messages`));
+					}
+					break;
+				}
+
+				// ── /outbox <id> ───────────────────────────────────
+				case "outbox":
+				case "sent": {
+					const outId = args.join(" ");
+					if (!outId) { console.log(yellow("  usage: /outbox <id>")); break; }
+					const c4 = createClient<typeof app>(ENDPOINT);
+					const outActor = c4.objectActor.getOrCreate([outId]);
+					const sent = await outActor.getOutbox();
+					if (sent.length === 0) {
+						console.log(dim("  (no sent messages)"));
+					} else {
+						for (const msg of sent) {
+							const time = new Date(msg.timestamp).toISOString();
+							console.log(`  ${dim(time)}  → ${cyan(msg.toId)} ${bold(msg.action)}${msg.payload ? ` ${dim(msg.payload)}` : ""}`);
+						}
+						console.log(dim(`\n  ${sent.length} messages`));
 					}
 					break;
 				}
