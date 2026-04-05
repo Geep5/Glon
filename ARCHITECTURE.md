@@ -1,140 +1,143 @@
-# Glon OS — Architecture
+# Glon OS -- Architecture
 
-## What It Is
+## Layers
 
-An operating system where every entity is a protobuf message
-living as a durable Rivet actor. No filesystem. No traditional
-processes. Just protobuf objects and the actors that embody them.
+```
++---------------------------------------------------------------+
+|  Programs (src/programs/)                                     |
+|  Tic-tac-toe, future apps. Pure logic on objects.             |
++------------------------------+--------------------------------+
+|  Shell (src/client.ts)       |  Bootstrap (src/bootstrap.ts)  |
+|  CLI over Rivet HTTP         |  Seed OS source as objects     |
++------------------------------+--------------------------------+
+|  Store Actor (coordinator)                                    |
+|  SQLite index: objects, changes, DAG edges                    |
+|  Creates/destroys object actors                               |
++------------------------------+--------------------------------+
+|  Object Actors (one per entity)                               |
+|  Cached computed state from DAG replay                        |
+|  Sync protocol: advertiseHeads, pushChanges, getChanges       |
+|  IPC: sendMessage, receiveMessage                             |
++------------------------------+--------------------------------+
+|  Change DAG (src/dag/)                                        |
+|  Topological sort, state computation, content-addressing      |
++------------------------------+--------------------------------+
+|  Disk (src/disk.ts)          |  Proto (src/proto.ts)          |
+|  ~/.glon/changes/<hash>.pb   |  Typed encode/decode           |
++------------------------------+--------------------------------+
+```
 
-## Two Primitives
+## The Change DAG
 
-### 1. Protobuf `Object` (the data)
+Every mutation is a `Change` — an immutable protobuf message.
 
-Defined in `proto/glon.proto`. One message type. Everything is one.
-
-```protobuf
-message Object {
-  string id = 1;
-  string kind = 2;
-  string name = 3;
-  bytes content = 4;
-  map<string, string> meta = 5;
-  int64 created_at = 6;
-  int64 updated_at = 7;
-  int64 size = 8;
+```
+Change {
+  id: bytes           SHA-256 of the wire bytes (id field zeroed)
+  object_id: string   stable UUID of the object
+  parent_ids: bytes[] DAG edges to parent changes
+  ops: Operation[]    mutations in this change
+  timestamp: int64    unix ms
+  author: string      device/user identifier
 }
 ```
 
-### 2. Rivet Actor (the runtime)
+**Content-addressed.** `id = SHA-256(encode(change with id zeroed))`.
+Same mutation always produces the same hash.
 
-Each Object lives as a durable actor. The actor IS the object.
-State persists through crashes, restarts, and hibernation.
-Actors communicate through typed actions and events.
+**DAG structure.** Parent edges form the graph. No parents = genesis.
+Multiple parents = merge of concurrent changes. Heads = changes with
+no children.
 
-## Architecture
+**State = replay.** Current state is computed by topological sort
+(Kahn's BFS, ties broken by hex id) from genesis to heads, applying
+operations in order:
 
-```
-┌─────────────────────────────────────────────────┐
-│                   Clients                       │
-│  CLI (client.ts)  ·  Browser  ·  Other actors   │
-└─────────────┬───────────────────┬───────────────┘
-              │ actions/events    │
-┌─────────────▼───────────────────▼───────────────┐
-│              Store Actor (coordinator)           │
-│  key: ["root"]                                   │
-│  SQLite index: objects(id, kind, name, size)      │
-│  actions: create, list, get, search, delete      │
-└─────────────┬───────────────────────────────────┘
-              │ creates/destroys
-┌─────────────▼───────────────────────────────────┐
-│           Object Actors (one per entity)         │
-│  key: [object-id]                                │
-│  state: protobuf Object fields                   │
-│  actions: read, write, setMeta, readContent      │
-│  events: changed                                 │
-└─────────────────────────────────────────────────┘
-              │
-┌─────────────▼───────────────────────────────────┐
-│              Protobuf Layer (src/proto.ts)        │
-│  encode/decode glon.Object ↔ Uint8Array           │
-│  state conversion (GlonObject ↔ ObjectState)      │
-│  ID derivation, ref creation                      │
-└─────────────────────────────────────────────────┘
-```
+| Operation | Effect |
+|---|---|
+| `ObjectCreate` | Set type key, created timestamp |
+| `FieldSet` | Set a typed field |
+| `FieldDelete` | Remove a field |
+| `ContentSet` | Set raw byte content |
+| `ObjectDelete` | Tombstone flag |
+| `BlockAdd/Remove/Update` | Block tree mutations |
 
-## Self-Describing
+## Sync Protocol
 
-On bootstrap, the OS loads its own source files as objects
-into the store. Every `.ts`, `.proto`, `.json` file that
-constitutes Glon becomes a protobuf Object in the graph.
+Typed protobuf `Envelope` messages between actors:
 
-You can query the OS for its own source code.
+| Message | Purpose |
+|---|---|
+| `HeadAdvertise` | "Here are my heads for this object" |
+| `HeadRequest` | "Send me changes between these ancestors and these heads" |
+| `ChangePush` | "Here are changes you're missing" (topologically sorted) |
+| `ChangeRequest` | "Send me these specific changes by hash" |
+| `ObjectSubscribe` | "Notify me when this object changes" |
+| `ObjectEvent` | "This object changed, here are the new heads + changes" |
+| `AppMessage` | Free-form IPC between objects |
 
-## Project Structure
+The sync handshake:
+1. Both sides exchange their full change ID sets
+2. Compute set difference (what each is missing)
+3. Fetch missing changes from the peer
+4. Push missing changes to the peer
+5. Both recompute state from the merged DAG
+
+## Storage
 
 ```
-glon/
-  proto/
-    glon.proto            # The primitive. One message type.
-  src/
-    proto.ts              # Load .proto, typed encode/decode
-    actors/
-      object.ts           # Object actor — one per entity
-      store.ts            # Store coordinator — SQLite index
-    index.ts              # Registry. Start the OS.
-    bootstrap.ts          # Seed source files as objects
-    client.ts             # CLI client
-  package.json
-  tsconfig.json
+~/.glon/
+  changes/              one .pb file per change
+    <sha256-hex>.pb     raw protobuf wire bytes
 ```
 
-## Running
+The `.pb` files are the source of truth. The SQLite index in the
+store actor is derived — it tracks objects, changes, and DAG edges
+for efficient queries. Delete the index and it rebuilds from disk.
 
-```bash
-# Terminal 1: Start the OS
-npm run dev
+## Actor System
 
-# Terminal 2: Bootstrap source files
-npx tsx src/bootstrap.ts
+**Rivet actors over HTTP.** No custom actor framework. Each object
+actor is a globally-addressable endpoint that wakes on demand,
+hibernates when idle, survives crashes.
 
-# Terminal 3: Connect CLI
-npx tsx src/client.ts
-```
+**Object actor state** (cached, not truth):
+- Computed fields, content, blocks, deleted flag
+- Current DAG head IDs
+- Change count
+- IPC inbox/outbox
 
-## Commands
+**Store actor:**
+- SQLite index for cross-object queries
+- Creates/destroys object actors
+- Validates IPC routing
 
-```
-/list [kind]           List all objects (or filter by kind)
-/info                  System stats
-/search <query>        Search by name
-/create <kind> <name>  Create an object
-/delete <id>           Delete an object
-/get <id>              Get object details
-/help                  Command list
-/quit                  Exit
-```
+**Constraint:** `c.client()` from within a Rivet actor can read
+other actors but state mutations don't persist on the target.
+Sync and IPC delivery happen from the external client.
 
-## Design Decisions
+## Programs
 
-**Why protobuf, not JSON?**
-Protobuf is the primitive, not a transport optimization. The `.proto`
-file IS the type system. Schema evolution is built in (field numbers).
-Binary encoding is compact. The same schema works across languages.
+Programs are protocol consumers. They read object state, validate
+logic, write changes through the standard DAG protocol. No special
+actor types, no framework hooks.
 
-**Why Rivet actors, not a database?**
-Each object is alive. It can react to events, enforce invariants,
-communicate with other objects. A database row is dead data. An actor
-is a running entity. The actor model maps directly to OS concepts:
-actors are processes, state is memory, actions are syscalls.
+Tic-tac-toe (`src/programs/tictactoe.ts`) demonstrates this:
+the board is a regular object with fields (`cell_0`..`cell_8`,
+`turn`, `status`). Game logic validates moves and writes field
+changes. Every move is a content-addressed Change in the DAG.
 
-**Why SQLite in the store?**
-Actors are great for individual entities but bad for cross-entity
-queries. The store actor maintains a SQLite index for "find all
-objects of kind X" queries. The index is derived — the actors are
-the source of truth.
+## Data Flow
 
-**Why one Object message?**
-Maximum primitiveness. A file and a process and a type definition
-are all the same shape. The `kind` field distinguishes them. This
-mirrors how Unix treats everything as a file descriptor — Glon
-treats everything as a protobuf Object.
+**Write:** Shell -> Store -> Object Actor -> create Change ->
+write .pb to disk -> recompute state from DAG -> update cache ->
+Store indexes in SQLite
+
+**Read:** Shell -> Store -> Object Actor (cached state) or
+SQLite (queries)
+
+**Boot:** Store reads all .pb files -> groups by object ->
+creates Object Actor per object -> replays DAG -> indexes state
+
+**Sync:** Actor A.getAllChangeIds() -> Actor B.getAllChangeIds() ->
+set difference -> exchange missing changes -> both recompute
