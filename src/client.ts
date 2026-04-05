@@ -15,6 +15,8 @@ import { hexEncode } from "./crypto.js";
 import { stringVal, intVal, floatVal, boolVal, displayValue } from "./proto.js";
 import type { Value, Change } from "./proto.js";
 import { readBoard, computeMove, renderBoard, renderMoveHistory, newGameFields } from "./programs/tictactoe.js";
+import { extractMessages, renderChat } from "./programs/chat.js";
+import { randomUUID } from "node:crypto";
 
 const ENDPOINT = process.env.GLON_ENDPOINT ?? "http://localhost:6420";
 
@@ -535,6 +537,219 @@ async function cmdTtt(args: string[]): Promise<void> {
 	}
 }
 
+// ── Remote sync commands ─────────────────────────────────────────
+
+function remoteClient(endpoint: string) {
+	const url = endpoint.startsWith("http") ? endpoint : `http://${endpoint}`;
+	return createClient<typeof app>(url);
+}
+
+async function cmdRemote(args: string[]): Promise<void> {
+	const sub = args[0];
+	const rest = args.slice(1);
+
+	switch (sub) {
+		case "pull": {
+			const endpoint = rest[0];
+			const rawId = rest[1];
+			if (!endpoint || !rawId) {
+				console.log(red("Usage: /remote pull <endpoint> <objectId>"));
+				return;
+			}
+
+			// Resolve locally — might not exist yet, that's fine.
+			const objectId = (await resolveId(rawId)) ?? rawId;
+
+			const remote = remoteClient(endpoint);
+			const remoteStore = remote.storeActor.getOrCreate(["root"]);
+			const exists = await remoteStore.exists(objectId);
+			if (!exists) {
+				console.log(red("Object not found on remote: ") + objectId);
+				return;
+			}
+
+			const remoteActor = remote.objectActor.getOrCreate([objectId]);
+			const remoteCSV = await remoteActor.getAllChangeIds(objectId);
+			const remoteIds = new Set(remoteCSV.split(",").filter(Boolean));
+
+			// Local change IDs (empty set if object doesn't exist locally).
+			const localActor = client.objectActor.getOrCreate([objectId]);
+			let localIds = new Set<string>();
+			const localExists = await store.exists(objectId);
+			if (localExists) {
+				const localCSV = await localActor.getAllChangeIds(objectId);
+				localIds = new Set(localCSV.split(",").filter(Boolean));
+			}
+
+			// Changes remote has that local doesn't.
+			const missing: string[] = [];
+			for (const id of remoteIds) {
+				if (!localIds.has(id)) missing.push(id);
+			}
+
+			if (missing.length === 0) {
+				console.log(green("Already up to date."));
+				return;
+			}
+
+			const b64 = await remoteActor.getChanges(missing.join(","));
+			await localActor.pushChanges(b64);
+			console.log(green(`Pulled ${missing.length} change(s)`) + " from " + dim(endpoint));
+			break;
+		}
+
+		case "push": {
+			const endpoint = rest[0];
+			const rawId = rest[1];
+			if (!endpoint || !rawId) {
+				console.log(red("Usage: /remote push <endpoint> <objectId>"));
+				return;
+			}
+
+			const objectId = await resolveId(rawId);
+			if (!objectId) {
+				console.log(red("Not found locally: ") + rawId);
+				return;
+			}
+
+			const localActor = client.objectActor.getOrCreate([objectId]);
+			const localCSV = await localActor.getAllChangeIds(objectId);
+			const localIds = new Set(localCSV.split(",").filter(Boolean));
+
+			const remote = remoteClient(endpoint);
+			const remoteActor = remote.objectActor.getOrCreate([objectId]);
+
+			// Remote change IDs (may be empty if object doesn't exist there).
+			const remoteStore = remote.storeActor.getOrCreate(["root"]);
+			let remoteIds = new Set<string>();
+			const remoteExists = await remoteStore.exists(objectId);
+			if (remoteExists) {
+				const remoteCSV = await remoteActor.getAllChangeIds(objectId);
+				remoteIds = new Set(remoteCSV.split(",").filter(Boolean));
+			}
+
+			// Changes local has that remote doesn't.
+			const missing: string[] = [];
+			for (const id of localIds) {
+				if (!remoteIds.has(id)) missing.push(id);
+			}
+
+			if (missing.length === 0) {
+				console.log(green("Remote already up to date."));
+				return;
+			}
+
+			const b64 = await localActor.getChanges(missing.join(","));
+			await remoteActor.pushChanges(b64);
+			console.log(green(`Pushed ${missing.length} change(s)`) + " to " + dim(endpoint));
+			break;
+		}
+
+		default:
+			console.log([
+				bold("  Remote Sync"),
+				`    ${cyan("/remote pull")} ${dim("<endpoint> <id>")}   pull changes from remote`,
+				`    ${cyan("/remote push")} ${dim("<endpoint> <id>")}   push changes to remote`,
+				"",
+				`  ${dim("Endpoint is host:port, e.g. localhost:6421")}`,
+				`  ${dim("Run two instances on different ports to test:")}`,
+				`  ${dim("  GLON_DATA=~/.glon-a npx tsx src/index.ts")}`,
+				`  ${dim("  GLON_DATA=~/.glon-b PORT=6421 npx tsx src/index.ts")}`,
+			].join("\n"));
+	}
+}
+
+// ── Chat commands ────────────────────────────────────────────────
+
+async function cmdChat(args: string[]): Promise<void> {
+	const sub = args[0];
+	const rest = args.slice(1);
+
+	switch (sub) {
+		case "new": {
+			const name = rest.join(" ") || undefined;
+			const fieldsJson = name ? JSON.stringify({ name: stringVal(name) }) : undefined;
+			const id = await store.create("chat", fieldsJson);
+			console.log(green("Chat room: ") + bold(id));
+			console.log(dim("  /chat send " + id.slice(0, 8) + " Hello!"));
+			break;
+		}
+
+		case "send": {
+			const raw = rest[0];
+			const messageText = rest.slice(1).join(" ");
+			if (!raw || !messageText) { console.log(red("Usage: /chat send <id> <message...>")); break; }
+			const id = await resolveId(raw);
+			if (!id) { console.log(red("Not found: ") + raw); break; }
+			const actor = client.objectActor.getOrCreate([id]);
+			const blockId = randomUUID();
+			const block = { id: blockId, childrenIds: [] as string[], content: { text: { text: messageText, style: 0 } } };
+			await actor.addBlock(JSON.stringify(block));
+			console.log(dim("sent ") + blockId.slice(0, 8));
+			break;
+		}
+
+		case "read": {
+			const raw = rest[0];
+			if (!raw) { console.log(red("Usage: /chat read <id>")); break; }
+			const id = await resolveId(raw);
+			if (!id) { console.log(red("Not found: ") + raw); break; }
+			const state = await store.get(id);
+			if (!state) { console.log(red("Object not found")); break; }
+			const nameField = state.fields["name"] as { stringValue?: string } | undefined;
+			const roomName = typeof nameField === "string" ? nameField : nameField?.stringValue;
+			const messages = extractMessages(state.blocks, state.blockProvenance, state.fields);
+			console.log(renderChat(messages, roomName));
+			break;
+		}
+
+		case "reply": {
+			const raw = rest[0];
+			const targetBlockId = rest[1];
+			const messageText = rest.slice(2).join(" ");
+			if (!raw || !targetBlockId || !messageText) {
+				console.log(red("Usage: /chat reply <id> <msgBlockId> <message...>"));
+				break;
+			}
+			const id = await resolveId(raw);
+			if (!id) { console.log(red("Not found: ") + raw); break; }
+			const actor = client.objectActor.getOrCreate([id]);
+			const blockId = randomUUID();
+			const block = { id: blockId, childrenIds: [] as string[], content: { text: { text: messageText, style: 0 } } };
+			await actor.addBlock(JSON.stringify(block));
+			await actor.setField(`reply:${blockId}`, JSON.stringify(stringVal(targetBlockId)));
+			console.log(dim("replied ") + blockId.slice(0, 8));
+			break;
+		}
+
+		case "react": {
+			const raw = rest[0];
+			const targetBlockId = rest[1];
+			const emoji = rest[2];
+			if (!raw || !targetBlockId || !emoji) {
+				console.log(red("Usage: /chat react <id> <msgBlockId> <emoji>"));
+				break;
+			}
+			const id = await resolveId(raw);
+			if (!id) { console.log(red("Not found: ") + raw); break; }
+			const actor = client.objectActor.getOrCreate([id]);
+			await actor.setField(`react:${targetBlockId}:${emoji}`, JSON.stringify(stringVal("local")));
+			console.log(dim("reacted ") + emoji);
+			break;
+		}
+
+		default:
+			console.log([
+				bold("  Chat"),
+				`    ${cyan("/chat new")} ${dim("[name]")}                  create a chat room`,
+				`    ${cyan("/chat send")} ${dim("<id> <message...>")}     send a message`,
+				`    ${cyan("/chat read")} ${dim("<id>")}                   read messages`,
+				`    ${cyan("/chat reply")} ${dim("<id> <blockId> <msg>")}  reply to a message`,
+				`    ${cyan("/chat react")} ${dim("<id> <blockId> <emoji>")} react to a message`,
+			].join("\n"));
+	}
+}
+
 function cmdHelp(): void {
 	const cmds = [
 		["/create <type> [name]", "Create a new object"],
@@ -552,8 +767,10 @@ function cmdHelp(): void {
 		["/changes <id>", "List all change IDs for an object"],
 		["/sync <idA> <idB>", "Sync DAG state between two objects"],
 		["/ttt new|board|move|history", "Tic-Tac-Toe (try /ttt for help)"],
+		["/chat new|send|read|reply|react", "Chat rooms (try /chat for help)"],
 		["/info", "Store summary"],
 		["/disk", "Disk usage stats"],
+		["/remote pull|push <endpoint> <id>", "Cross-instance sync"],
 		["/help", "This help"],
 		["/quit", "Exit"],
 	];
@@ -591,6 +808,8 @@ async function dispatch(line: string): Promise<boolean> {
 			case "/changes": await cmdChanges(args); break;
 			case "/sync": await cmdSync(args); break;
 			case "/ttt": await cmdTtt(args); break;
+			case "/chat": await cmdChat(args); break;
+			case "/remote": await cmdRemote(args); break;
 			case "/info": await cmdInfo(); break;
 			case "/disk": cmdDisk(); break;
 			case "/help": cmdHelp(); break;

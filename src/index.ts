@@ -10,7 +10,7 @@
 
 import { actor, event, setup } from "rivetkit";
 import { db } from "rivetkit/db";
-import type { Change, Operation, Value, ObjectRef } from "./proto.js";
+import type { Change, Operation, Value, ObjectRef, Block } from "./proto.js";
 import { encodeChange, decodeChange, stringVal, displayValue } from "./proto.js";
 import { sha256, hexEncode, hexDecode, generateObjectId } from "./crypto.js";
 import {
@@ -34,6 +34,12 @@ interface IpcMessage {
 	timestamp: number;
 }
 
+interface BlockProvenanceRecord {
+	changeId: string; // hex
+	author: string;
+	timestamp: number;
+}
+
 interface ObjectActorState {
 	// Identity
 	id: string;
@@ -42,6 +48,8 @@ interface ObjectActorState {
 	// Computed state (cached from DAG replay)
 	fields: Record<string, any>;
 	content: string; // base64 of raw bytes
+	blocks: any[]; // Block objects (structuredClone-safe)
+	blockProvenance: Record<string, BlockProvenanceRecord>;
 	deleted: boolean;
 	createdAt: number;
 	updatedAt: number;
@@ -96,6 +104,14 @@ function syncState(cState: ObjectActorState, computed: ObjectState, changeCount:
 	const fields: Record<string, any> = {};
 	for (const [k, v] of computed.fields) fields[k] = v;
 	cState.fields = fields;
+	// Convert blocks (already structuredClone-safe)
+	cState.blocks = computed.blocks;
+	// Convert blockProvenance Map to Record (hex-encode changeId)
+	const prov: Record<string, BlockProvenanceRecord> = {};
+	for (const [blockId, p] of computed.blockProvenance) {
+		prov[blockId] = { changeId: hexEncode(p.changeId), author: p.author, timestamp: p.timestamp };
+	}
+	cState.blockProvenance = prov;
 }
 
 /** Extract current head IDs as Uint8Array[] from actor state. */
@@ -119,6 +135,8 @@ const objectActor = actor({
 		typeKey: input?.typeKey ?? "",
 		fields: input?.fields ?? {},
 		content: input?.content ?? "",
+		blocks: [],
+		blockProvenance: {},
 		deleted: false,
 		createdAt: input?.createdAt ?? 0,
 		updatedAt: input?.updatedAt ?? 0,
@@ -180,6 +198,13 @@ const objectActor = actor({
 
 		markDeleted: (c) => {
 			const change = createDeleteChange(c.state.id, headBytes(c));
+			commitChange(c, change);
+		},
+
+		addBlock: (c, blockJson: string) => {
+			const block: Block = JSON.parse(blockJson);
+			const parentIds = headBytes(c);
+			const change = createChange(c.state.id, [{ blockAdd: { parentId: "", afterId: "", block } }], parentIds);
 			commitChange(c, change);
 		},
 

@@ -9,7 +9,14 @@
 import { hexEncode } from "../crypto.js";
 import type { Change, Value, Block, ObjectSnapshot } from "../proto.js";
 
-// ── State ──────────────────────────────────────────────────────────
+// ── State ────────────────────────────────────────────────────────────
+
+/** Provenance of a block: which Change created or last modified it. */
+export interface BlockProvenance {
+	changeId: Uint8Array;
+	author: string;
+	timestamp: number;
+}
 
 export interface ObjectState {
 	id: string;
@@ -17,6 +24,8 @@ export interface ObjectState {
 	fields: Map<string, Value>;
 	content: Uint8Array;
 	blocks: Block[];
+	/** Tracks which Change created or last modified each block. */
+	blockProvenance: Map<string, BlockProvenance>;
 	deleted: boolean;
 	createdAt: number;
 	updatedAt: number;
@@ -47,6 +56,7 @@ export function computeState(changes: Change[]): ObjectState {
 		fields: new Map(),
 		content: new Uint8Array(0),
 		blocks: [],
+		blockProvenance: new Map(),
 		deleted: false,
 		createdAt: 0,
 		updatedAt: 0,
@@ -72,10 +82,16 @@ export function computeState(changes: Change[]): ObjectState {
 				state.deleted = true;
 			} else if (op.blockAdd) {
 				state.blocks.push(op.blockAdd.block);
+				state.blockProvenance.set(op.blockAdd.block.id, {
+					changeId: change.id,
+					author: change.author,
+					timestamp: change.timestamp,
+				});
 			} else if (op.blockRemove) {
 				state.blocks = state.blocks.filter(
 					(b) => b.id !== op.blockRemove!.blockId,
 				);
+				state.blockProvenance.delete(op.blockRemove.blockId);
 			} else if (op.blockUpdate) {
 				const idx = state.blocks.findIndex(
 					(b) => b.id === op.blockUpdate!.blockId,
@@ -85,6 +101,11 @@ export function computeState(changes: Change[]): ObjectState {
 						...state.blocks[idx],
 						content: op.blockUpdate.content,
 					};
+					state.blockProvenance.set(op.blockUpdate.blockId, {
+						changeId: change.id,
+						author: change.author,
+						timestamp: change.timestamp,
+					});
 				}
 			}
 			// blockMove: no-op (future)
