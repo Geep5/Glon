@@ -98,6 +98,19 @@ function syncState(cState: ObjectActorState, computed: ObjectState, changeCount:
 	cState.fields = fields;
 }
 
+/** Extract current head IDs as Uint8Array[] from actor state. */
+function headBytes(c: { state: ObjectActorState }): Uint8Array[] {
+	return c.state.headIds.map((h) => hexDecode(h));
+}
+
+/** Write a change to disk, recompute state from DAG, update actor cache, broadcast. */
+function commitChange(c: any, change: Change): void {
+	writeChange(change);
+	const { state: computed, changeCount } = recomputeFromDisk(c.state.id);
+	syncState(c.state, computed, changeCount);
+	c.broadcast("changed", { id: c.state.id, updatedAt: c.state.updatedAt });
+}
+
 // ── Object Actor ─────────────────────────────────────────────────
 
 const objectActor = actor({
@@ -133,44 +146,41 @@ const objectActor = actor({
 			return Buffer.from(c.state.content, "base64").toString("utf-8");
 		},
 
-		// ── Mutation ─────────────────────────────────────────────
+		// ── Mutation ─────────────────────────────────────────
+		//
+		// Every mutation: build Change → write to disk → recompute
+		// from DAG → update cached state → broadcast.
 
 		setField: (c, key: string, valueJson: string) => {
 			const value: Value = JSON.parse(valueJson);
-			const parentIds = c.state.headIds.map((h) => hexDecode(h));
-			const change = createFieldChange(c.state.id, parentIds, key, value);
-			writeChange(change);
-			const { state: computed, changeCount } = recomputeFromDisk(c.state.id);
-			syncState(c.state, computed, changeCount);
-			c.broadcast("changed", { id: c.state.id, updatedAt: c.state.updatedAt });
+			const change = createFieldChange(c.state.id, headBytes(c), key, value);
+			commitChange(c, change);
+		},
+
+		/** Batch: set multiple fields in a single Change. */
+		setFields: (c, fieldsJson: string) => {
+			const fields: Record<string, Value> = JSON.parse(fieldsJson);
+			const ops: Operation[] = Object.entries(fields).map(([key, value]) => ({
+				fieldSet: { key, value },
+			}));
+			const change = createChange(c.state.id, ops, headBytes(c));
+			commitChange(c, change);
 		},
 
 		setContent: (c, contentBase64: string) => {
 			const contentBytes = Buffer.from(contentBase64, "base64");
-			const parentIds = c.state.headIds.map((h) => hexDecode(h));
-			const change = createContentChange(c.state.id, parentIds, contentBytes);
-			writeChange(change);
-			const { state: computed, changeCount } = recomputeFromDisk(c.state.id);
-			syncState(c.state, computed, changeCount);
-			c.broadcast("changed", { id: c.state.id, updatedAt: c.state.updatedAt });
+			const change = createContentChange(c.state.id, headBytes(c), contentBytes);
+			commitChange(c, change);
 		},
 
 		deleteField: (c, key: string) => {
-			const parentIds = c.state.headIds.map((h) => hexDecode(h));
-			const change = createChange(c.state.id, [{ fieldDelete: { key } }], parentIds);
-			writeChange(change);
-			const { state: computed, changeCount } = recomputeFromDisk(c.state.id);
-			syncState(c.state, computed, changeCount);
-			c.broadcast("changed", { id: c.state.id, updatedAt: c.state.updatedAt });
+			const change = createChange(c.state.id, [{ fieldDelete: { key } }], headBytes(c));
+			commitChange(c, change);
 		},
 
 		markDeleted: (c) => {
-			const parentIds = c.state.headIds.map((h) => hexDecode(h));
-			const change = createDeleteChange(c.state.id, parentIds);
-			writeChange(change);
-			const { state: computed, changeCount } = recomputeFromDisk(c.state.id);
-			syncState(c.state, computed, changeCount);
-			c.broadcast("changed", { id: c.state.id, updatedAt: c.state.updatedAt });
+			const change = createDeleteChange(c.state.id, headBytes(c));
+			commitChange(c, change);
 		},
 
 		// ── Sync protocol ────────────────────────────────────────

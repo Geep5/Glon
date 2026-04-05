@@ -492,11 +492,9 @@ async function cmdTtt(args: string[]): Promise<void> {
 				break;
 			}
 
-			// Apply: set each field as a change on the object actor.
+			// Apply all field updates as a single Change.
 			const actor = client.objectActor.getOrCreate([id]);
-			for (const [key, value] of Object.entries(result.fields)) {
-				await actor.setField(key, JSON.stringify(value));
-			}
+			await actor.setFields(JSON.stringify(result.fields));
 
 			// Re-read and render.
 			const updated = await store.get(id);
