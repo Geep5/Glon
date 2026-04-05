@@ -168,6 +168,11 @@ exchanging DAG state between actors. `HeadAdvertise`, `ChangePush`,
 source of truth. Any actor can recompute it from changes alone.
 The SQLite index is a cache.
 
+**Snapshots.** A snapshot is a Change with no operations and an embedded
+full state. Replay starts from the most recent snapshot, skipping
+everything before it. Create one manually with `/snapshot <id>` — a
+chat with 10,000 messages compacts to a single checkpoint.
+
 ## Shell Commands
 
 | Command | Description |
@@ -187,6 +192,7 @@ The SQLite index is a cache.
 | `/ttt new\|board\|move\|history` | Tic-Tac-Toe |
 | `/chat new\|send\|read\|reply\|react` | Chat |
 | `/remote pull\|push <endpoint> <id>` | Cross-instance sync |
+| `/snapshot <id>` | Checkpoint state (speeds up replay) |
 | `/info` / `/disk` / `/help` | System info |
 
 ## Project Structure
@@ -229,6 +235,11 @@ Tamper-evident. Deduplication is free.
 **Programs are protocol consumers.** Tic-tac-toe uses no special APIs.
 It reads fields, validates a move, writes fields. Any program on this
 OS works the same way.
+
+**Snapshots for scale.** Every change is preserved, but replay doesn't
+start from genesis. A snapshot checkpoints the full state into the DAG.
+Future reads skip everything before it. History is never lost — the
+old changes are still on disk — but you don't pay the replay cost.
 
 ## License
 
