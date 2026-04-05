@@ -340,6 +340,102 @@ function cmdDisk(): void {
 	console.log(bold("Bytes:   ") + stats.totalBytes.toLocaleString());
 }
 
+// ── Sync protocol commands ────────────────────────────────────────
+
+async function cmdHeads(args: string[]): Promise<void> {
+	const raw = args[0];
+	if (!raw) { console.log(red("Usage: /heads <id>")); return; }
+	const id = await resolveId(raw);
+	if (!id) { console.log(red("Not found: ") + raw); return; }
+	const actor = client.objectActor.getOrCreate([id]);
+	const heads = await actor.getHeads();
+	console.log(bold("Heads for ") + dim(id.slice(0, 12) + "..."));
+	for (const h of heads) {
+		console.log("  " + cyan(h.slice(0, 16)) + dim("..."));
+	}
+}
+
+async function cmdChanges(args: string[]): Promise<void> {
+	const raw = args[0];
+	if (!raw) { console.log(red("Usage: /changes <id>")); return; }
+	const id = await resolveId(raw);
+	if (!id) { console.log(red("Not found: ") + raw); return; }
+	const actor = client.objectActor.getOrCreate([id]);
+	const csv = await actor.getAllChangeIds(id);
+	const ids = csv.split(",").filter(Boolean);
+	console.log(bold(`${ids.length} change(s)`) + " for " + dim(id.slice(0, 12) + "..."));
+	for (const h of ids) {
+		console.log("  " + dim(h.slice(0, 16)));
+	}
+}
+
+/**
+ * Sync two objects that share the same objectId on different actors.
+ * In practice this demonstrates the sync protocol between two peers.
+ * 
+ * Usage: /sync <idA> <idB>
+ * 
+ * Both actors advertise their changes, compute the diff, and exchange
+ * what each is missing.
+ */
+async function cmdSync(args: string[]): Promise<void> {
+	const [rawA, rawB] = args;
+	if (!rawA || !rawB) {
+		console.log(red("Usage: /sync <objectA> <objectB>"));
+		console.log(dim("  Syncs DAG state between two object actors."));
+		return;
+	}
+	const idA = await resolveId(rawA);
+	const idB = await resolveId(rawB);
+	if (!idA) { console.log(red("Not found: ") + rawA); return; }
+	if (!idB) { console.log(red("Not found: ") + rawB); return; }
+
+	const actorA = client.objectActor.getOrCreate([idA]);
+	const actorB = client.objectActor.getOrCreate([idB]);
+
+	// Step 1: Gather all change IDs from both sides.
+	const csvA = await actorA.getAllChangeIds(idA);
+	const csvB = await actorB.getAllChangeIds(idB);
+	const setA = new Set(csvA.split(",").filter(Boolean));
+	const setB = new Set(csvB.split(",").filter(Boolean));
+
+	console.log(dim(`  A has ${setA.size} changes, B has ${setB.size} changes`));
+
+	// Step 2: Compute diff.
+	const missingInA: string[] = []; // B has, A doesn't
+	for (const id of setB) { if (!setA.has(id)) missingInA.push(id); }
+	const missingInB: string[] = []; // A has, B doesn't
+	for (const id of setA) { if (!setB.has(id)) missingInB.push(id); }
+
+	if (missingInA.length === 0 && missingInB.length === 0) {
+		console.log(green("  Already in sync."));
+		return;
+	}
+
+	console.log(dim(`  A missing ${missingInA.length}, B missing ${missingInB.length}`));
+
+	// Step 3: Exchange missing changes.
+	if (missingInA.length > 0) {
+		// Fetch from B, push to A.
+		const changesB64 = await actorB.getChanges(missingInA.join(","));
+		await actorA.pushChanges(changesB64);
+		console.log(green(`  Pushed ${missingInA.length} change(s) to A`));
+	}
+	if (missingInB.length > 0) {
+		// Fetch from A, push to B.
+		const changesB64 = await actorA.getChanges(missingInB.join(","));
+		await actorB.pushChanges(changesB64);
+		console.log(green(`  Pushed ${missingInB.length} change(s) to B`));
+	}
+
+	// Step 4: Verify.
+	const newHeadsA = await actorA.getHeads();
+	const newHeadsB = await actorB.getHeads();
+	console.log(dim(`  A heads: ${newHeadsA.map((h: string) => h.slice(0, 12)).join(", ")}`));
+	console.log(dim(`  B heads: ${newHeadsB.map((h: string) => h.slice(0, 12)).join(", ")}`));
+	console.log(green("  Sync complete."));
+}
+
 function cmdHelp(): void {
 	const cmds = [
 		["/create <type> [name]", "Create a new object"],
@@ -353,6 +449,9 @@ function cmdHelp(): void {
 		["/outbox <id>", "Show object outbox"],
 		["/history <id>", "Show change history for an object"],
 		["/change <hex-id>", "Inspect a single change"],
+		["/heads <id>", "Show DAG head change IDs"],
+		["/changes <id>", "List all change IDs for an object"],
+		["/sync <idA> <idB>", "Sync DAG state between two objects"],
 		["/info", "Store summary"],
 		["/disk", "Disk usage stats"],
 		["/help", "This help"],
@@ -388,6 +487,9 @@ async function dispatch(line: string): Promise<boolean> {
 			case "/outbox": await cmdOutbox(args); break;
 			case "/history": await cmdHistory(args); break;
 			case "/change": cmdChange(args); break;
+			case "/heads": await cmdHeads(args); break;
+			case "/changes": await cmdChanges(args); break;
+			case "/sync": await cmdSync(args); break;
 			case "/info": await cmdInfo(); break;
 			case "/disk": cmdDisk(); break;
 			case "/help": cmdHelp(); break;

@@ -177,6 +177,51 @@ const objectActor = actor({
 
 		getHeads: (c): string[] => c.state.headIds,
 
+		/** All change hex IDs for this object (from disk). */
+		getAllChangeIds: (_c, objectId: string): string => {
+			const allHex = listChangeFiles();
+			const matching: string[] = [];
+			for (const hexId of allHex) {
+				const c = readChangeByHex(hexId);
+				if (c && c.objectId === objectId) matching.push(hexId);
+			}
+			return matching.join(",");
+		},
+
+		/**
+		 * Sync handshake. Receive the remote peer's full set of change IDs
+		 * for this object. Return two comma-separated lists:
+		 *   - missingLocally: change IDs the remote has that we don't
+		 *   - missingRemotely: change IDs we have that the remote doesn't
+		 * Returned as "missingLocally|missingRemotely" (pipe-separated).
+		 *
+		 * After this, the caller pushes missingRemotely to us and
+		 * fetches missingLocally from us.
+		 */
+		advertiseHeads: (_c, objectId: string, remoteChangeHexIds: string): string => {
+			const remoteSet = new Set(remoteChangeHexIds.split(",").filter(Boolean));
+
+			// Gather our local change IDs for this object from disk.
+			const allHex = listChangeFiles();
+			const localSet = new Set<string>();
+			for (const hexId of allHex) {
+				const ch = readChangeByHex(hexId);
+				if (ch && ch.objectId === objectId) localSet.add(hexId);
+			}
+
+			// Set difference.
+			const missingLocally: string[] = [];  // remote has, we don't
+			for (const id of remoteSet) {
+				if (!localSet.has(id)) missingLocally.push(id);
+			}
+			const missingRemotely: string[] = []; // we have, remote doesn't
+			for (const id of localSet) {
+				if (!remoteSet.has(id)) missingRemotely.push(id);
+			}
+
+			return missingLocally.join(",") + "|" + missingRemotely.join(",");
+		},
+
 		getChanges: (_c, hexIds: string): string => {
 			const ids = hexIds.split(",").filter(Boolean);
 			const results: string[] = [];
