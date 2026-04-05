@@ -3,7 +3,13 @@
  *
  * Two actors: objectActor (one per object, sync peer) and storeActor
  * (singleton coordinator with SQLite index). Changes live on disk as
- * .pb files; actors cache computed state derived from DAG replay.
+ * .pb files; actors compute state from disk on every wake.
+ *
+ * Architecture (per Rivet best practices):
+ *   state  → minimal persistent data (id, inbox/outbox)
+ *   vars   → computed from disk on every wake (fields, blocks, heads, etc.)
+ *   disk   → .pb change files, source of truth
+ *   SQLite → derived index in the store actor
  *
  * Rivet requires the registry in scope for c.client<typeof app>().
  */
@@ -21,7 +27,7 @@ import {
 	createDeleteChange,
 	changeId,
 } from "./dag/change.js";
-import { computeState, findHeads, toSnapshot, type ObjectState } from "./dag/dag.js";
+import { computeState, findHeads, toSnapshot, type ObjectState, type BlockProvenance } from "./dag/dag.js";
 import { initDisk, writeChange, readChangeByHex, listChangeFiles, diskStats } from "./disk.js";
 
 // ── Types ────────────────────────────────────────────────────────
@@ -34,117 +40,123 @@ interface IpcMessage {
 	timestamp: number;
 }
 
-interface BlockProvenanceRecord {
-	changeId: string; // hex
-	author: string;
-	timestamp: number;
-}
-
+// Persistent state — survives sleep, crash, restart.
+// Minimal: just identity + IPC queues.
 interface ObjectActorState {
-	// Identity
 	id: string;
-	typeKey: string;
-
-	// Computed state (cached from DAG replay)
-	fields: Record<string, any>;
-	content: string; // base64 of raw bytes
-	blocks: any[]; // Block objects (structuredClone-safe)
-	blockProvenance: Record<string, BlockProvenanceRecord>;
-	deleted: boolean;
-	createdAt: number;
-	updatedAt: number;
-
-	// DAG
-	headIds: string[]; // hex-encoded
-	changeCount: number;
-
-	// IPC
 	inbox: IpcMessage[];
 	outbox: IpcMessage[];
 }
 
-export interface ObjectInput {
-	id: string;
+// Ephemeral vars — recomputed from disk on every wake.
+// This is the computed state derived from replaying the Change DAG.
+interface ObjectVars {
 	typeKey: string;
+	fields: Record<string, any>;
+	content: string; // base64
+	blocks: any[];
+	blockProvenance: Record<string, { changeId: string; author: string; timestamp: number }>;
+	deleted: boolean;
+	createdAt: number;
+	updatedAt: number;
 	headIds: string[];
 	changeCount: number;
-	fields?: Record<string, any>;
-	content?: string;
-	createdAt?: number;
-	updatedAt?: number;
 }
 
-// ── Helpers (module-level) ───────────────────────────────────────
+export interface ObjectInput {
+	id: string;
+}
 
-/**
- * Re-read all changes for an object from disk and recompute state.
- * The DAG on disk is the source of truth; actor state is a cache.
- */
-function recomputeFromDisk(objectId: string): { state: ObjectState; changeCount: number } {
+// ── Helpers ──────────────────────────────────────────────────────
+
+/** Load all changes for an object from disk and compute state. */
+function loadFromDisk(objectId: string): { state: ObjectState; changeCount: number } | null {
 	const allHexIds = listChangeFiles();
 	const changes: Change[] = [];
 	for (const hexId of allHexIds) {
 		const change = readChangeByHex(hexId);
 		if (change && change.objectId === objectId) changes.push(change);
 	}
-	if (changes.length === 0) throw new Error(`no changes on disk for ${objectId}`);
+	if (changes.length === 0) return null;
 	return { state: computeState(changes), changeCount: changes.length };
 }
 
-/** Copy computed ObjectState into the actor's mutable state. */
-function syncState(cState: ObjectActorState, computed: ObjectState, changeCount: number): void {
-	cState.typeKey = computed.typeKey;
-	cState.deleted = computed.deleted;
-	cState.createdAt = computed.createdAt;
-	cState.updatedAt = computed.updatedAt;
-	cState.headIds = computed.heads.map((h) => hexEncode(h));
-	cState.changeCount = changeCount;
-	cState.content = Buffer.from(computed.content).toString("base64");
-	// Convert fields Map to Record
+/** Convert ObjectState into the vars shape (Maps → Records, bytes → base64). */
+function computedToVars(computed: ObjectState, changeCount: number): ObjectVars {
 	const fields: Record<string, any> = {};
 	for (const [k, v] of computed.fields) fields[k] = v;
-	cState.fields = fields;
-	// Convert blocks (already structuredClone-safe)
-	cState.blocks = computed.blocks;
-	// Convert blockProvenance Map to Record (hex-encode changeId)
-	const prov: Record<string, BlockProvenanceRecord> = {};
+
+	const blockProvenance: Record<string, { changeId: string; author: string; timestamp: number }> = {};
 	for (const [blockId, p] of computed.blockProvenance) {
-		prov[blockId] = { changeId: hexEncode(p.changeId), author: p.author, timestamp: p.timestamp };
+		blockProvenance[blockId] = {
+			changeId: hexEncode(p.changeId),
+			author: p.author,
+			timestamp: p.timestamp,
+		};
 	}
-	cState.blockProvenance = prov;
+
+	return {
+		typeKey: computed.typeKey,
+		fields,
+		content: Buffer.from(computed.content).toString("base64"),
+		blocks: computed.blocks,
+		blockProvenance,
+		deleted: computed.deleted,
+		createdAt: computed.createdAt,
+		updatedAt: computed.updatedAt,
+		headIds: computed.heads.map((h) => hexEncode(h)),
+		changeCount,
+	};
 }
 
-/** Extract current head IDs as Uint8Array[] from actor state. */
-function headBytes(c: { state: ObjectActorState }): Uint8Array[] {
-	return c.state.headIds.map((h) => hexDecode(h));
+/** Current head IDs as Uint8Array[] from vars. */
+function headBytes(c: { vars: ObjectVars }): Uint8Array[] {
+	return c.vars.headIds.map((h) => hexDecode(h));
 }
 
-/** Write a change to disk, recompute state from DAG, update actor cache, broadcast. */
+/** Write a change to disk, recompute vars from DAG, broadcast. */
 function commitChange(c: any, change: Change): void {
 	writeChange(change);
-	const { state: computed, changeCount } = recomputeFromDisk(c.state.id);
-	syncState(c.state, computed, changeCount);
-	c.broadcast("changed", { id: c.state.id, updatedAt: c.state.updatedAt });
+	const result = loadFromDisk(c.state.id);
+	if (result) {
+		Object.assign(c.vars, computedToVars(result.state, result.changeCount));
+	}
+	c.broadcast("changed", { id: c.state.id, updatedAt: c.vars.updatedAt });
 }
 
 // ── Object Actor ─────────────────────────────────────────────────
 
 const objectActor = actor({
+	// Persistent state: minimal. Just the object ID and IPC queues.
 	createState: (_c, input?: ObjectInput): ObjectActorState => ({
 		id: input?.id ?? "",
-		typeKey: input?.typeKey ?? "",
-		fields: input?.fields ?? {},
-		content: input?.content ?? "",
-		blocks: [],
-		blockProvenance: {},
-		deleted: false,
-		createdAt: input?.createdAt ?? 0,
-		updatedAt: input?.updatedAt ?? 0,
-		headIds: input?.headIds ?? [],
-		changeCount: input?.changeCount ?? 0,
 		inbox: [],
 		outbox: [],
 	}),
+
+	// Ephemeral vars: recomputed from disk on every wake.
+	// This is the computed state derived from replaying the Change DAG.
+	createVars: (c): ObjectVars => {
+		if (!c.state.id) {
+			// Actor not yet initialized (no id). Return empty vars.
+			return {
+				typeKey: "", fields: {}, content: "", blocks: [],
+				blockProvenance: {}, deleted: false, createdAt: 0,
+				updatedAt: 0, headIds: [], changeCount: 0,
+			};
+		}
+		initDisk();
+		const result = loadFromDisk(c.state.id);
+		if (!result) {
+			// No changes on disk yet (actor just created, genesis not written yet).
+			return {
+				typeKey: "", fields: {}, content: "", blocks: [],
+				blockProvenance: {}, deleted: false, createdAt: 0,
+				updatedAt: 0, headIds: [], changeCount: 0,
+			};
+		}
+		return computedToVars(result.state, result.changeCount);
+	},
 
 	events: {
 		changed: event<{ id: string; updatedAt: number }>(),
@@ -152,22 +164,32 @@ const objectActor = actor({
 	},
 
 	actions: {
-		// ── CRUD ──────────────────────────────────────────────────
+		// ── Read ──────────────────────────────────────────────────
+		// Returns the computed state (from vars) + identity (from state).
 
-		read: (c): Omit<ObjectActorState, "inbox" | "outbox"> => {
-			const { inbox: _i, outbox: _o, ...rest } = c.state;
-			return rest;
-		},
+		read: (c) => ({
+			id: c.state.id,
+			typeKey: c.vars.typeKey,
+			fields: c.vars.fields,
+			content: c.vars.content,
+			blocks: c.vars.blocks,
+			blockProvenance: c.vars.blockProvenance,
+			deleted: c.vars.deleted,
+			createdAt: c.vars.createdAt,
+			updatedAt: c.vars.updatedAt,
+			headIds: c.vars.headIds,
+			changeCount: c.vars.changeCount,
+		}),
 
 		readContent: (c): string => {
-			if (!c.state.content) return "";
-			return Buffer.from(c.state.content, "base64").toString("utf-8");
+			if (!c.vars.content) return "";
+			return Buffer.from(c.vars.content, "base64").toString("utf-8");
 		},
 
-		// ── Mutation ─────────────────────────────────────────
+		// ── Mutation ─────────────────────────────────────────────
 		//
 		// Every mutation: build Change → write to disk → recompute
-		// from DAG → update cached state → broadcast.
+		// vars from DAG → broadcast.
 
 		setField: (c, key: string, valueJson: string) => {
 			const value: Value = JSON.parse(valueJson);
@@ -175,7 +197,6 @@ const objectActor = actor({
 			commitChange(c, change);
 		},
 
-		/** Batch: set multiple fields in a single Change. */
 		setFields: (c, fieldsJson: string) => {
 			const fields: Record<string, Value> = JSON.parse(fieldsJson);
 			const ops: Operation[] = Object.entries(fields).map(([key, value]) => ({
@@ -203,16 +224,14 @@ const objectActor = actor({
 
 		addBlock: (c, blockJson: string) => {
 			const block: Block = JSON.parse(blockJson);
-			const parentIds = headBytes(c);
-			const change = createChange(c.state.id, [{ blockAdd: { parentId: "", afterId: "", block } }], parentIds);
+			const change = createChange(c.state.id, [{ blockAdd: { parentId: "", afterId: "", block } }], headBytes(c));
 			commitChange(c, change);
 		},
 
-		/** Create a snapshot Change that embeds the full current state.
-		 *  Replay will skip everything before this point. */
 		createSnapshot: (c): string => {
-			const { state: computed } = recomputeFromDisk(c.state.id);
-			const snapshot = toSnapshot(computed);
+			const result = loadFromDisk(c.state.id);
+			if (!result) throw new Error("no changes on disk");
+			const snapshot = toSnapshot(result.state);
 			const change: Change = {
 				id: new Uint8Array(0),
 				objectId: c.state.id,
@@ -222,7 +241,6 @@ const objectActor = actor({
 				timestamp: Date.now(),
 				author: "local",
 			};
-			// Content-address it.
 			change.id = sha256(encodeChangeForHashing(change));
 			commitChange(c, change);
 			return hexEncode(change.id);
@@ -230,50 +248,34 @@ const objectActor = actor({
 
 		// ── Sync protocol ────────────────────────────────────────
 
-		getHeads: (c): string[] => c.state.headIds,
+		getHeads: (c): string[] => c.vars.headIds,
 
-		/** All change hex IDs for this object (from disk). */
 		getAllChangeIds: (_c, objectId: string): string => {
 			const allHex = listChangeFiles();
 			const matching: string[] = [];
 			for (const hexId of allHex) {
-				const c = readChangeByHex(hexId);
-				if (c && c.objectId === objectId) matching.push(hexId);
+				const ch = readChangeByHex(hexId);
+				if (ch && ch.objectId === objectId) matching.push(hexId);
 			}
 			return matching.join(",");
 		},
 
-		/**
-		 * Sync handshake. Receive the remote peer's full set of change IDs
-		 * for this object. Return two comma-separated lists:
-		 *   - missingLocally: change IDs the remote has that we don't
-		 *   - missingRemotely: change IDs we have that the remote doesn't
-		 * Returned as "missingLocally|missingRemotely" (pipe-separated).
-		 *
-		 * After this, the caller pushes missingRemotely to us and
-		 * fetches missingLocally from us.
-		 */
 		advertiseHeads: (_c, objectId: string, remoteChangeHexIds: string): string => {
 			const remoteSet = new Set(remoteChangeHexIds.split(",").filter(Boolean));
-
-			// Gather our local change IDs for this object from disk.
 			const allHex = listChangeFiles();
 			const localSet = new Set<string>();
 			for (const hexId of allHex) {
 				const ch = readChangeByHex(hexId);
 				if (ch && ch.objectId === objectId) localSet.add(hexId);
 			}
-
-			// Set difference.
-			const missingLocally: string[] = [];  // remote has, we don't
+			const missingLocally: string[] = [];
 			for (const id of remoteSet) {
 				if (!localSet.has(id)) missingLocally.push(id);
 			}
-			const missingRemotely: string[] = []; // we have, remote doesn't
+			const missingRemotely: string[] = [];
 			for (const id of localSet) {
 				if (!remoteSet.has(id)) missingRemotely.push(id);
 			}
-
 			return missingLocally.join(",") + "|" + missingRemotely.join(",");
 		},
 
@@ -291,16 +293,18 @@ const objectActor = actor({
 		},
 
 		pushChanges: (c, changesBase64: string) => {
-			initDisk(); // ensure changes dir exists on this instance
+			initDisk();
 			const parts = changesBase64.split(",").filter(Boolean);
 			for (const b64 of parts) {
 				const bytes = Buffer.from(b64, "base64");
 				const change = decodeChange(new Uint8Array(bytes));
 				writeChange(change);
 			}
-			const { state: computed, changeCount } = recomputeFromDisk(c.state.id);
-			syncState(c.state, computed, changeCount);
-			c.broadcast("synced", { id: c.state.id, headIds: c.state.headIds });
+			const result = loadFromDisk(c.state.id);
+			if (result) {
+				Object.assign(c.vars, computedToVars(result.state, result.changeCount));
+			}
+			c.broadcast("synced", { id: c.state.id, headIds: c.vars.headIds });
 		},
 
 		// ── IPC ──────────────────────────────────────────────────
@@ -320,7 +324,7 @@ const objectActor = actor({
 		receiveMessage: (c, fromId: string, action: string, payload: string, timestamp: number) => {
 			const msg: IpcMessage = { fromId, toId: c.state.id, action, payload, timestamp };
 			c.state.inbox.push(msg);
-			c.broadcast("changed", { id: c.state.id, updatedAt: c.state.updatedAt });
+			c.broadcast("changed", { id: c.state.id, updatedAt: c.vars.updatedAt });
 		},
 
 		getInbox: (c): IpcMessage[] => c.state.inbox,
@@ -330,9 +334,9 @@ const objectActor = actor({
 
 		ref: (c): ObjectRef => ({
 			id: c.state.id,
-			typeKey: c.state.typeKey,
-			createdAt: c.state.createdAt,
-			updatedAt: c.state.updatedAt,
+			typeKey: c.vars.typeKey,
+			createdAt: c.vars.createdAt,
+			updatedAt: c.vars.updatedAt,
 		}),
 
 		destroy: (c) => {
@@ -372,79 +376,51 @@ const storeActor = actor({
 					PRIMARY KEY (change_id, parent_id)
 				)
 			`);
-			await database.execute(
-				"CREATE INDEX IF NOT EXISTS idx_changes_object ON changes(object_id)",
-			);
-			await database.execute(
-				"CREATE INDEX IF NOT EXISTS idx_objects_type ON objects(type_key)",
-			);
+			await database.execute("CREATE INDEX IF NOT EXISTS idx_changes_object ON changes(object_id)");
+			await database.execute("CREATE INDEX IF NOT EXISTS idx_objects_type ON objects(type_key)");
 		},
 	}),
 
 	actions: {
 		create: async (c, typeKey: string, fieldsJson?: string, contentBase64?: string): Promise<string> => {
-			initDisk();
 			const objectId = generateObjectId();
+			initDisk();
 
-			// Genesis change — creates the object with its type
+			// Build changes: genesis + optional fields + optional content.
 			const genesis = createGenesisChange(objectId, typeKey);
 			writeChange(genesis);
-			const genesisHex = hexEncode(genesis.id);
-			await indexChangeInDb(c, genesisHex, objectId, genesis.parentIds, genesis.timestamp);
+			await indexChange(c, genesis);
+			let lastHeads = [genesis.id];
 
-			let lastParentIds: Uint8Array[] = [genesis.id];
-
-			// Optional field change
 			if (fieldsJson) {
-				const fieldsRecord: Record<string, Value> = JSON.parse(fieldsJson);
-				const ops: Operation[] = [];
-				for (const [key, value] of Object.entries(fieldsRecord)) {
-					ops.push({ fieldSet: { key, value } });
-				}
-				const fieldChange = createChange(objectId, ops, lastParentIds);
+				const fields: Record<string, Value> = JSON.parse(fieldsJson);
+				const ops: Operation[] = Object.entries(fields).map(([key, value]) => ({
+					fieldSet: { key, value },
+				}));
+				const fieldChange = createChange(objectId, ops, lastHeads);
 				writeChange(fieldChange);
-				const fieldHex = hexEncode(fieldChange.id);
-				await indexChangeInDb(c, fieldHex, objectId, fieldChange.parentIds, fieldChange.timestamp);
-				lastParentIds = [fieldChange.id];
+				await indexChange(c, fieldChange);
+				lastHeads = [fieldChange.id];
 			}
 
-			// Optional content change
 			if (contentBase64) {
 				const contentBytes = Buffer.from(contentBase64, "base64");
-				const contentChange = createContentChange(objectId, lastParentIds, contentBytes);
+				const contentChange = createContentChange(objectId, lastHeads, contentBytes);
 				writeChange(contentChange);
-				const contentHex = hexEncode(contentChange.id);
-				await indexChangeInDb(c, contentHex, objectId, contentChange.parentIds, contentChange.timestamp);
+				await indexChange(c, contentChange);
+				lastHeads = [contentChange.id];
 			}
 
-			// Recompute state from disk
-			const { state: computed, changeCount } = recomputeFromDisk(objectId);
+			// Compute state and index the object.
+			const result = loadFromDisk(objectId);
+			if (result) {
+				await indexObject(c, result.state);
+			}
 
-			// Upsert objects table
-			await c.db.execute(
-				"INSERT OR REPLACE INTO objects (id, type_key, deleted, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-				objectId, computed.typeKey, computed.deleted ? 1 : 0, computed.createdAt, computed.updatedAt,
-			);
-
-			// Convert fields Map to Record for actor input
-			const fieldsRecord: Record<string, any> = {};
-			for (const [k, v] of computed.fields) fieldsRecord[k] = v;
-			const contentB64 = Buffer.from(computed.content).toString("base64");
-			const headHexIds = computed.heads.map((h) => hexEncode(h));
-
-			// Spawn object actor
+			// Spawn the object actor. createVars will load state from disk.
 			const client = c.client<typeof app>();
 			const objActor = client.objectActor.getOrCreate([objectId], {
-				createWithInput: {
-					id: objectId,
-					typeKey: computed.typeKey,
-					headIds: headHexIds,
-					changeCount,
-					fields: fieldsRecord,
-					content: contentB64,
-					createdAt: computed.createdAt,
-					updatedAt: computed.updatedAt,
-				} as ObjectInput,
+				createWithInput: { id: objectId } as ObjectInput,
 			});
 			await objActor.ref();
 
@@ -453,18 +429,17 @@ const storeActor = actor({
 		},
 
 		list: async (c, typeKey?: string): Promise<ObjectRef[]> => {
+			let sql = "SELECT id, type_key AS typeKey, created_at AS createdAt, updated_at AS updatedAt FROM objects WHERE deleted = 0";
+			const params: any[] = [];
 			if (typeKey) {
-				return (await c.db.execute(
-					"SELECT id, type_key AS typeKey, created_at AS createdAt, updated_at AS updatedAt FROM objects WHERE type_key = ? ORDER BY updated_at DESC",
-					typeKey,
-				)) as unknown as ObjectRef[];
+				sql += " AND type_key = ?";
+				params.push(typeKey);
 			}
-			return (await c.db.execute(
-				"SELECT id, type_key AS typeKey, created_at AS createdAt, updated_at AS updatedAt FROM objects ORDER BY updated_at DESC",
-			)) as unknown as ObjectRef[];
+			sql += " ORDER BY type_key, created_at";
+			return (await c.db.execute(sql, ...params)) as unknown as ObjectRef[];
 		},
 
-		get: async (c, id: string): Promise<Omit<ObjectActorState, "inbox" | "outbox"> | null> => {
+		get: async (c, id: string): Promise<any | null> => {
 			const rows = (await c.db.execute(
 				"SELECT id FROM objects WHERE id = ?", id,
 			)) as unknown as { id: string }[];
@@ -485,38 +460,33 @@ const storeActor = actor({
 
 		search: async (c, query: string): Promise<ObjectRef[]> => {
 			return (await c.db.execute(
-				"SELECT id, type_key AS typeKey, created_at AS createdAt, updated_at AS updatedAt FROM objects WHERE id LIKE ? ORDER BY updated_at DESC",
+				"SELECT id, type_key AS typeKey, created_at AS createdAt, updated_at AS updatedAt FROM objects WHERE id LIKE ? AND deleted = 0",
 				`%${query}%`,
 			)) as unknown as ObjectRef[];
 		},
 
 		delete: async (c, id: string): Promise<boolean> => {
-			const rows = (await c.db.execute(
-				"SELECT id FROM objects WHERE id = ?", id,
-			)) as unknown as { id: string }[];
+			const rows = (await c.db.execute("SELECT id FROM objects WHERE id = ?", id)) as unknown as { id: string }[];
 			if (rows.length === 0) return false;
-
 			try {
 				const client = c.client<typeof app>();
 				const objActor = client.objectActor.getOrCreate([id]);
 				await objActor.destroy();
 			} catch {
-				// Actor already gone — fine
+				// Actor already gone.
 			}
-
-			await c.db.execute("DELETE FROM objects WHERE id = ?", id);
+			await c.db.execute("UPDATE objects SET deleted = 1 WHERE id = ?", id);
 			c.state.objectCount = Math.max(0, c.state.objectCount - 1);
 			return true;
 		},
 
 		exists: async (c, id: string): Promise<boolean> => {
 			const rows = (await c.db.execute(
-				"SELECT id FROM objects WHERE id = ?", id,
+				"SELECT id FROM objects WHERE id = ? AND deleted = 0", id,
 			)) as unknown as { id: string }[];
 			return rows.length > 0;
 		},
 
-		// Resolve an id prefix to a full id. Returns empty string if ambiguous or not found.
 		resolvePrefix: async (c, prefix: string): Promise<string> => {
 			const rows = (await c.db.execute(
 				"SELECT id FROM objects WHERE id LIKE ? AND deleted = 0", prefix + "%",
@@ -527,83 +497,64 @@ const storeActor = actor({
 
 		info: async (c) => {
 			const countRows = (await c.db.execute(
-				"SELECT COUNT(*) as cnt FROM objects",
+				"SELECT COUNT(*) as cnt FROM objects WHERE deleted = 0",
 			)) as unknown as { cnt: number }[];
-			const changeCountRows = (await c.db.execute(
+			const changeRows = (await c.db.execute(
 				"SELECT COUNT(*) as cnt FROM changes",
 			)) as unknown as { cnt: number }[];
 			const typeRows = (await c.db.execute(
-				"SELECT type_key, COUNT(*) as cnt FROM objects GROUP BY type_key ORDER BY cnt DESC",
+				"SELECT type_key, COUNT(*) as cnt FROM objects WHERE deleted = 0 GROUP BY type_key ORDER BY cnt DESC",
 			)) as unknown as { type_key: string; cnt: number }[];
+
 			const byType: Record<string, number> = {};
 			for (const row of typeRows) byType[row.type_key] = row.cnt;
+
 			return {
 				totalObjects: countRows[0]?.cnt ?? 0,
-				totalChanges: changeCountRows[0]?.cnt ?? 0,
+				totalChanges: changeRows[0]?.cnt ?? 0,
 				byType,
 			};
 		},
 
-		indexChange: async (c, changeHexId: string, objectId: string, parentHexIds: string, timestamp: number) => {
-			await c.db.execute(
-				"INSERT OR IGNORE INTO changes (id, object_id, timestamp, is_head) VALUES (?, ?, ?, 1)",
-				changeHexId, objectId, timestamp,
-			);
-			const parents = parentHexIds.split(",").filter(Boolean);
-			for (const parentHex of parents) {
-				await c.db.execute(
-					"INSERT OR IGNORE INTO change_parents (change_id, parent_id) VALUES (?, ?)",
-					changeHexId, parentHex,
-				);
-				// Parent is no longer a head
-				await c.db.execute(
-					"UPDATE changes SET is_head = 0 WHERE id = ?",
-					parentHex,
-				);
-			}
-		},
-
-		indexObject: async (c, id: string, typeKey: string, deleted: number, createdAt: number, updatedAt: number) => {
-			await c.db.execute(
-				"INSERT OR REPLACE INTO objects (id, type_key, deleted, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-				id, typeKey, deleted, createdAt, updatedAt,
-			);
-		},
-
 		getHeadIds: async (c, objectId: string): Promise<string[]> => {
 			const rows = (await c.db.execute(
-				"SELECT id FROM changes WHERE object_id = ? AND is_head = 1",
-				objectId,
+				"SELECT id FROM changes WHERE object_id = ? AND is_head = 1", objectId,
 			)) as unknown as { id: string }[];
-			return rows.map((r) => r.id);
+			return rows.map(r => r.id);
 		},
 	},
 });
 
-// ── Store helper: index a change in the DB ───────────────────────
+// ── Store helpers ────────────────────────────────────────────────
 
-async function indexChangeInDb(
-	c: { db: { execute: (sql: string, ...args: any[]) => Promise<unknown> } },
-	changeHexId: string,
-	objectId: string,
-	parentIds: Uint8Array[],
-	timestamp: number,
-): Promise<void> {
+async function indexChange(c: any, change: Change): Promise<void> {
+	const hexId = hexEncode(change.id);
 	await c.db.execute(
 		"INSERT OR IGNORE INTO changes (id, object_id, timestamp, is_head) VALUES (?, ?, ?, 1)",
-		changeHexId, objectId, timestamp,
+		hexId, change.objectId, change.timestamp,
 	);
-	for (const parentId of parentIds) {
-		const parentHex = hexEncode(parentId);
+	for (const pid of change.parentIds) {
+		const parentHex = hexEncode(pid);
 		await c.db.execute(
 			"INSERT OR IGNORE INTO change_parents (change_id, parent_id) VALUES (?, ?)",
-			changeHexId, parentHex,
+			hexId, parentHex,
 		);
-		await c.db.execute(
-			"UPDATE changes SET is_head = 0 WHERE id = ?",
-			parentHex,
-		);
+		await c.db.execute("UPDATE changes SET is_head = 0 WHERE id = ?", parentHex);
 	}
+}
+
+async function indexObject(c: any, computed: ObjectState): Promise<void> {
+	await c.db.execute(
+		`INSERT INTO objects (id, type_key, deleted, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(id) DO UPDATE SET
+		   type_key = excluded.type_key,
+		   deleted = excluded.deleted,
+		   created_at = excluded.created_at,
+		   updated_at = excluded.updated_at`,
+		computed.id, computed.typeKey, computed.deleted ? 1 : 0,
+		computed.createdAt, computed.updatedAt,
+	);
 }
 
 // ── Registry ─────────────────────────────────────────────────────
