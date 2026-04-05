@@ -15,7 +15,7 @@
 |  Creates/destroys object actors                               |
 +------------------------------+--------------------------------+
 |  Object Actors (one per entity)                               |
-|  Cached computed state from DAG replay                        |
+  Ephemeral vars: recomputed from disk on every wake             |
 |  Sync protocol: advertiseHeads, pushChanges, getChanges       |
 |  IPC: sendMessage, receiveMessage                             |
 +------------------------------+--------------------------------+
@@ -95,26 +95,41 @@ The `.pb` files are the source of truth. The SQLite index in the
 store actor is derived — it tracks objects, changes, and DAG edges
 for efficient queries. Delete the index and it rebuilds from disk.
 
-## Actor System
+## Actor State Model
 
-**Rivet actors over HTTP.** No custom actor framework. Each object
-actor is a globally-addressable endpoint that wakes on demand,
-hibernates when idle, survives crashes.
+Follows Rivet's `state` vs `vars` pattern:
 
-**Object actor state** (cached, not truth):
-- Computed fields, content, blocks, deleted flag
-- Current DAG head IDs
-- Change count
-- IPC inbox/outbox
+```
+state (persistent)           vars (ephemeral)
+────────────────────────────  ────────────────────────────
+id (object UUID)             typeKey
+inbox (IPC messages)         fields, content, blocks
+outbox (IPC messages)        blockProvenance
+                             deleted, createdAt, updatedAt
+                             headIds, changeCount
+```
+
+**`state`** is persistent — survives sleep, crash, restart. Holds only
+the object's UUID and IPC message queues. Minimal by design.
+
+**`vars`** is ephemeral — recomputed via `createVars` every time the
+actor wakes. Reads all changes from disk for this object, replays
+the DAG via topological sort, and produces fresh computed state.
+No stale cache. The DAG on disk is always truth.
+
+**`commitChange`** (the mutation path) writes the new change to disk,
+then reloads `vars` by recomputing from the full DAG. The actor
+never holds computed state that's out of sync with disk.
+
+**Rivet actors over HTTP.** Each object actor is a globally-addressable
+endpoint that wakes on demand, hibernates when idle, survives crashes.
+The `createVars` hook runs on every wake, so computed state is always
+fresh from disk.
 
 **Store actor:**
 - SQLite index for cross-object queries
-- Creates/destroys object actors
-- Validates IPC routing
-
-**Constraint:** `c.client()` from within a Rivet actor can read
-other actors but state mutations don't persist on the target.
-Sync and IPC delivery happen from the external client.
+- Creates/destroys object actors via `c.client()`
+- Validates existence for IPC routing
 
 ## Programs
 
@@ -129,15 +144,14 @@ changes. Every move is a content-addressed Change in the DAG.
 
 ## Data Flow
 
-**Write:** Shell -> Store -> Object Actor -> create Change ->
-write .pb to disk -> recompute state from DAG -> update cache ->
-Store indexes in SQLite
+**Write:** Shell → Object Actor → create Change → write .pb to disk
+→ reload vars from DAG → broadcast event → Store indexes in SQLite
 
-**Read:** Shell -> Store -> Object Actor (cached state) or
-SQLite (queries)
+**Read:** Shell → Store → Object Actor (vars, computed from disk)
+or SQLite (list queries)
 
-**Boot:** Store reads all .pb files -> groups by object ->
-creates Object Actor per object -> replays DAG -> indexes state
+**Wake:** Actor wakes → `createVars` runs → reads all changes from
+disk for this object → replays DAG → vars populated → ready
 
-**Sync:** Actor A.getAllChangeIds() -> Actor B.getAllChangeIds() ->
-set difference -> exchange missing changes -> both recompute
+**Sync:** Actor A.getAllChangeIds() → Actor B.getAllChangeIds() →
+set difference → exchange missing changes → both reload vars
