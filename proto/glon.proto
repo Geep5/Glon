@@ -1,0 +1,36 @@
+syntax = "proto3";
+package glon;
+
+// The only type in Glon OS.
+// Everything is a GlonObject. There is nothing else.
+// This file IS the operating system's type system.
+// (Named GlonObject, not Object, to avoid shadowing JS globals.)
+message GlonObject {
+  string id = 1;                    // stable unique identifier
+  string kind = 2;                  // classification: "file", "proto", "actor", "process"
+  string name = 3;                  // human-readable name
+  bytes content = 4;                // raw payload
+  map<string, string> meta = 5;     // arbitrary key-value metadata
+  int64 created_at = 6;             // unix ms
+  int64 updated_at = 7;             // unix ms
+  int64 size = 8;                   // content byte length
+}
+
+// Lightweight reference used in indexes and listings.
+// Intentionally excludes content to keep indexes small.
+message ObjectRef {
+  string id = 1;
+  string kind = 2;
+  string name = 3;
+  int64 size = 4;
+}
+
+// Envelope for actor-to-actor messages.
+// Every IPC message in Glon is one of these.
+message Envelope {
+  string from_id = 1;               // sender actor/object id
+  string to_id = 2;                 // recipient actor/object id
+  string action = 3;                // action name
+  bytes payload = 4;                // protobuf-encoded action arguments
+  int64 timestamp = 5;              // unix ms
+}
