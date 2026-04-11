@@ -152,6 +152,89 @@ glon> /chat read 4dfaa
 Both instances end up with the same content-addressed `.pb` files on
 disk — identical SHA-256 hashes. Same protobuf bytes. Same DAG.
 
+## Demo: LLM Agent with DAG-Backed Memory
+
+Agents are regular objects. Every prompt and response is a block in the
+DAG — content-addressed, replayable, syncable. The LLM call is I/O;
+the result is a Change. Any peer can replay the conversation without
+an API key.
+
+```bash
+# Requires an Anthropic API key
+ANTHROPIC_API_KEY=sk-... npm run client
+```
+
+Create an agent with a system prompt:
+
+```
+glon> /agent new analyst --system "You are a concise data analyst."
+Agent created: 9b2e4f17-...
+  model: claude-sonnet-4-20250514
+  system: You are a concise data analyst.
+```
+
+Chat with it — each exchange is two blocks (user + assistant) in the DAG:
+
+```
+glon> /agent ask 9b2e What are the tradeoffs of event sourcing vs CRUD?
+  thinking (claude-sonnet-4-20250514)...
+
+  assistant (847+312 tokens)
+
+  Event sourcing trades write simplicity for read complexity.
+  ...
+
+glon> /agent ask 9b2e How does that apply to distributed systems?
+  thinking (claude-sonnet-4-20250514)...
+
+  assistant (1203+487 tokens)
+
+  In distributed systems, event sourcing gives you ...
+```
+
+The full conversation is in the DAG:
+
+```
+glon> /agent history 9b2e
+  analyst (claude-sonnet-4-20250514)
+  system: You are a concise data analyst.
+
+  user 14:32
+    What are the tradeoffs of event sourcing vs CRUD?
+
+  assistant 14:32
+    Event sourcing trades write simplicity for read complexity.
+    ...
+
+  user 14:33
+    How does that apply to distributed systems?
+
+  assistant 14:33
+    In distributed systems, event sourcing gives you ...
+```
+
+Agents can read each other. Create a second agent and inject the first
+agent's conversation as context:
+
+```
+glon> /agent new reviewer --system "You critique technical analysis."
+Agent created: c41a8d03-...
+
+glon> /agent inject c41a 9b2e
+  Injected 4 turns from "analyst" into target
+
+glon> /agent ask c41a What did the analyst get wrong?
+  thinking (claude-sonnet-4-20250514)...
+
+  assistant (1891+402 tokens)
+
+  The analyst's framing overlooks ...
+```
+
+Every turn is a `.pb` file on disk. Push an agent to a remote peer
+and they get the full conversation history — same hashes, same DAG.
+
+
 ## The Protocol
 
 Three layers:
