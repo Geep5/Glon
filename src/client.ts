@@ -4,6 +4,10 @@
  * Connects to a running Glon OS instance via Rivet client and provides
  * an interactive command interface for CRUD, IPC, inspection, and search.
  *
+ * Programs are loaded dynamically from Glon objects of type "program".
+ * The shell has zero hardcoded program commands — it discovers them
+ * at startup via the program runtime.
+ *
  * Usage: npm run client / npx tsx src/client.ts
  */
 
@@ -12,10 +16,9 @@ import type { app } from "./index.js";
 import { createInterface } from "node:readline";
 import { diskStats, readChangeByHex, listChangeFiles } from "./disk.js";
 import { hexEncode } from "./crypto.js";
-import { stringVal, intVal, floatVal, boolVal, displayValue } from "./proto.js";
+import { stringVal, intVal, floatVal, boolVal, mapVal, listVal, displayValue } from "./proto.js";
 import type { Value, Change } from "./proto.js";
-import { readBoard, computeMove, renderBoard, renderMoveHistory, newGameFields } from "./programs/tictactoe.js";
-import { extractMessages, renderChat } from "./programs/chat.js";
+import { loadPrograms, dispatchProgram, type ProgramContext, type ProgramEntry } from "./programs/runtime.js";
 import { randomUUID } from "node:crypto";
 
 const ENDPOINT = process.env.GLON_ENDPOINT ?? "http://localhost:6420";
@@ -58,16 +61,38 @@ const store = client.storeActor.getOrCreate(["root"]);
 /** Resolve an id prefix to a full id. Returns null if not found/ambiguous. */
 async function resolveId(raw: string): Promise<string | null> {
 	if (!raw) return null;
-	// Try exact match first (fast path for full UUIDs)
 	const exact = await store.exists(raw);
 	if (exact) return raw;
-	// Prefix match
 	const resolved = await store.resolvePrefix(raw);
 	if (resolved) return resolved;
 	return null;
 }
 
-// ── Command handlers ─────────────────────────────────────────────
+// ── Program runtime ──────────────────────────────────────────────
+
+let programs: ProgramEntry[] = [];
+
+function buildContext(): ProgramContext {
+	return {
+		client,
+		store,
+		resolveId,
+		stringVal,
+		intVal,
+		floatVal,
+		boolVal,
+		mapVal,
+		listVal,
+		displayValue,
+		listChangeFiles,
+		readChangeByHex,
+		hexEncode,
+		print: (msg: string) => console.log(msg),
+		randomUUID,
+	};
+}
+
+// ── OS command handlers ──────────────────────────────────────────
 
 async function cmdCreate(args: string[]): Promise<void> {
 	const typeKey = args[0];
@@ -127,12 +152,10 @@ async function cmdGet(args: string[]): Promise<void> {
 	console.log(bold("updated:  ") + (state.updatedAt ? new Date(state.updatedAt).toISOString() : "?"));
 	console.log(bold("changes:  ") + String(state.changeCount));
 
-	// Head IDs
 	if (state.headIds.length > 0) {
 		console.log(bold("heads:    ") + state.headIds.map((h: string) => h.slice(0, 12)).join(", "));
 	}
 
-	// Content
 	if (state.content) {
 		const bytes = Buffer.from(state.content, "base64").byteLength;
 		console.log(bold("content:  ") + `${bytes} bytes`);
@@ -140,7 +163,6 @@ async function cmdGet(args: string[]): Promise<void> {
 		console.log(bold("content:  ") + dim("(empty)"));
 	}
 
-	// Fields
 	const fields = state.fields as Record<string, Value> | undefined;
 	if (fields && Object.keys(fields).length > 0) {
 		console.log(bold("fields:"));
@@ -277,8 +299,6 @@ function summarizeOps(change: Change): string {
 async function cmdHistory(args: string[]): Promise<void> {
 	const raw = args[0];
 	if (!raw) { console.log(red("Usage: /history <id>")); return; }
-	// History reads from disk, but we still need the full id for filtering.
-	// Try resolveId; if it fails, use raw as-is (might be a full UUID).
 	const id = (await resolveId(raw)) ?? raw;
 	const hexIds = listChangeFiles();
 	const matches: Change[] = [];
@@ -343,7 +363,7 @@ function cmdDisk(): void {
 	console.log(bold("Bytes:   ") + stats.totalBytes.toLocaleString());
 }
 
-// ── Sync protocol commands ────────────────────────────────────────
+// ── Sync protocol commands ──────────────────────────────────────
 
 async function cmdHeads(args: string[]): Promise<void> {
 	const raw = args[0];
@@ -372,15 +392,6 @@ async function cmdChanges(args: string[]): Promise<void> {
 	}
 }
 
-/**
- * Sync two objects that share the same objectId on different actors.
- * In practice this demonstrates the sync protocol between two peers.
- * 
- * Usage: /sync <idA> <idB>
- * 
- * Both actors advertise their changes, compute the diff, and exchange
- * what each is missing.
- */
 async function cmdSync(args: string[]): Promise<void> {
 	const [rawA, rawB] = args;
 	if (!rawA || !rawB) {
@@ -396,7 +407,6 @@ async function cmdSync(args: string[]): Promise<void> {
 	const actorA = client.objectActor.getOrCreate([idA]);
 	const actorB = client.objectActor.getOrCreate([idB]);
 
-	// Step 1: Gather all change IDs from both sides.
 	const csvA = await actorA.getAllChangeIds(idA);
 	const csvB = await actorB.getAllChangeIds(idB);
 	const setA = new Set(csvA.split(",").filter(Boolean));
@@ -404,10 +414,9 @@ async function cmdSync(args: string[]): Promise<void> {
 
 	console.log(dim(`  A has ${setA.size} changes, B has ${setB.size} changes`));
 
-	// Step 2: Compute diff.
-	const missingInA: string[] = []; // B has, A doesn't
+	const missingInA: string[] = [];
 	for (const id of setB) { if (!setA.has(id)) missingInA.push(id); }
-	const missingInB: string[] = []; // A has, B doesn't
+	const missingInB: string[] = [];
 	for (const id of setA) { if (!setB.has(id)) missingInB.push(id); }
 
 	if (missingInA.length === 0 && missingInB.length === 0) {
@@ -417,21 +426,17 @@ async function cmdSync(args: string[]): Promise<void> {
 
 	console.log(dim(`  A missing ${missingInA.length}, B missing ${missingInB.length}`));
 
-	// Step 3: Exchange missing changes.
 	if (missingInA.length > 0) {
-		// Fetch from B, push to A.
 		const changesB64 = await actorB.getChanges(missingInA.join(","));
 		await actorA.pushChanges(changesB64);
 		console.log(green(`  Pushed ${missingInA.length} change(s) to A`));
 	}
 	if (missingInB.length > 0) {
-		// Fetch from A, push to B.
 		const changesB64 = await actorA.getChanges(missingInB.join(","));
 		await actorB.pushChanges(changesB64);
 		console.log(green(`  Pushed ${missingInB.length} change(s) to B`));
 	}
 
-	// Step 4: Verify.
 	const newHeadsA = await actorA.getHeads();
 	const newHeadsB = await actorB.getHeads();
 	console.log(dim(`  A heads: ${newHeadsA.map((h: string) => h.slice(0, 12)).join(", ")}`));
@@ -439,105 +444,7 @@ async function cmdSync(args: string[]): Promise<void> {
 	console.log(green("  Sync complete."));
 }
 
-// ── Tic-Tac-Toe commands ───────────────────────────────────────────
-
-async function cmdTtt(args: string[]): Promise<void> {
-	const sub = args[0];
-	const rest = args.slice(1);
-
-	switch (sub) {
-		case "new": {
-			const name = rest.join(" ") || "tic-tac-toe";
-			const fields = newGameFields();
-			fields["name"] = stringVal(name);
-			const fieldsJson = JSON.stringify(fields);
-			const id = await store.create("game", fieldsJson);
-			console.log(green("New game: ") + bold(id));
-			console.log(dim("  Use /ttt board " + id.slice(0, 8) + " to see the board"));
-			console.log(dim("  Use /ttt move " + id.slice(0, 8) + " <0-8> to play"));
-			break;
-		}
-
-		case "board": {
-			const raw = rest[0];
-			if (!raw) { console.log(red("Usage: /ttt board <id>")); break; }
-			const id = await resolveId(raw);
-			if (!id) { console.log(red("Not found: ") + raw); break; }
-			const state = await store.get(id);
-			if (!state) { console.log(red("Not found")); break; }
-			const board = readBoard(state.fields as Record<string, any>);
-			console.log(renderBoard(board));
-			break;
-		}
-
-		case "move": {
-			const raw = rest[0];
-			const posStr = rest[1];
-			if (!raw || posStr === undefined) {
-				console.log(red("Usage: /ttt move <id> <position 0-8>"));
-				break;
-			}
-			const id = await resolveId(raw);
-			if (!id) { console.log(red("Not found: ") + raw); break; }
-			const pos = parseInt(posStr, 10);
-			if (isNaN(pos)) { console.log(red("Position must be 0-8")); break; }
-
-			// Read current state from the actor.
-			const state = await store.get(id);
-			if (!state) { console.log(red("Not found")); break; }
-			const board = readBoard(state.fields as Record<string, any>);
-
-			// Validate and compute the move.
-			const result = computeMove(board, pos);
-			if (!result.ok) {
-				console.log(red("  " + result.error));
-				break;
-			}
-
-			// Apply all field updates as a single Change.
-			const actor = client.objectActor.getOrCreate([id]);
-			await actor.setFields(JSON.stringify(result.fields));
-
-			// Re-read and render.
-			const updated = await store.get(id);
-			if (updated) {
-				const newBoard = readBoard(updated.fields as Record<string, any>);
-				console.log(renderBoard(newBoard));
-			}
-			break;
-		}
-
-		case "history": {
-			const raw = rest[0];
-			if (!raw) { console.log(red("Usage: /ttt history <id>")); break; }
-			const id = await resolveId(raw);
-			if (!id) { console.log(red("Not found: ") + raw); break; }
-			console.log(renderMoveHistory(id));
-			break;
-		}
-
-		default:
-			console.log([
-				bold("  Tic-Tac-Toe"),
-				`    ${cyan("/ttt new")} ${dim("[name]")}           start a new game`,
-				`    ${cyan("/ttt board")} ${dim("<id>")}            show the board`,
-				`    ${cyan("/ttt move")} ${dim("<id> <0-8>")}      make a move`,
-				`    ${cyan("/ttt history")} ${dim("<id>")}          move-by-move replay`,
-				"",
-				`  ${dim("Positions:")}`,
-				`    ${dim("0")}|${dim("1")}|${dim("2")}`,
-				`    ${dim("-+-+-")}`,
-				`    ${dim("3")}|${dim("4")}|${dim("5")}`,
-				`    ${dim("-+-+-")}`,
-				`    ${dim("6")}|${dim("7")}|${dim("8")}`,
-				"",
-				`  ${dim("Every move is a content-addressed Change in the DAG.")}`,
-				`  ${dim("Use /history <id> to see the full change log.")}`,
-			].join("\n"));
-	}
-}
-
-// ── Remote sync commands ─────────────────────────────────────────
+// ── Remote sync commands ────────────────────────────────────────
 
 function remoteClient(endpoint: string) {
 	const url = endpoint.startsWith("http") ? endpoint : `http://${endpoint}`;
@@ -557,7 +464,6 @@ async function cmdRemote(args: string[]): Promise<void> {
 				return;
 			}
 
-			// Resolve locally — might not exist yet, that's fine.
 			const objectId = (await resolveId(rawId)) ?? rawId;
 
 			const remote = remoteClient(endpoint);
@@ -572,7 +478,6 @@ async function cmdRemote(args: string[]): Promise<void> {
 			const remoteCSV = await remoteActor.getAllChangeIds(objectId);
 			const remoteIds = new Set(remoteCSV.split(",").filter(Boolean));
 
-			// Local change IDs (empty set if object doesn't exist locally).
 			const localActor = client.objectActor.getOrCreate([objectId]);
 			let localIds = new Set<string>();
 			const localExists = await store.exists(objectId);
@@ -581,7 +486,6 @@ async function cmdRemote(args: string[]): Promise<void> {
 				localIds = new Set(localCSV.split(",").filter(Boolean));
 			}
 
-			// Changes remote has that local doesn't.
 			const missing: string[] = [];
 			for (const id of remoteIds) {
 				if (!localIds.has(id)) missing.push(id);
@@ -619,7 +523,6 @@ async function cmdRemote(args: string[]): Promise<void> {
 			const remote = remoteClient(endpoint);
 			const remoteActor = remote.objectActor.getOrCreate([objectId]);
 
-			// Remote change IDs (may be empty if object doesn't exist there).
 			const remoteStore = remote.storeActor.getOrCreate(["root"]);
 			let remoteIds = new Set<string>();
 			const remoteExists = await remoteStore.exists(objectId);
@@ -628,7 +531,6 @@ async function cmdRemote(args: string[]): Promise<void> {
 				remoteIds = new Set(remoteCSV.split(",").filter(Boolean));
 			}
 
-			// Changes local has that remote doesn't.
 			const missing: string[] = [];
 			for (const id of localIds) {
 				if (!remoteIds.has(id)) missing.push(id);
@@ -655,97 +557,6 @@ async function cmdRemote(args: string[]): Promise<void> {
 				`  ${dim("Run two instances on different ports to test:")}`,
 				`  ${dim("  GLON_DATA=~/.glon-a npx tsx src/index.ts")}`,
 				`  ${dim("  GLON_DATA=~/.glon-b PORT=6421 npx tsx src/index.ts")}`,
-			].join("\n"));
-	}
-}
-
-// ── Chat commands ────────────────────────────────────────────────
-
-async function cmdChat(args: string[]): Promise<void> {
-	const sub = args[0];
-	const rest = args.slice(1);
-
-	switch (sub) {
-		case "new": {
-			const name = rest.join(" ") || undefined;
-			const fieldsJson = name ? JSON.stringify({ name: stringVal(name) }) : undefined;
-			const id = await store.create("chat", fieldsJson);
-			console.log(green("Chat room: ") + bold(id));
-			console.log(dim("  /chat send " + id.slice(0, 8) + " Hello!"));
-			break;
-		}
-
-		case "send": {
-			const raw = rest[0];
-			const messageText = rest.slice(1).join(" ");
-			if (!raw || !messageText) { console.log(red("Usage: /chat send <id> <message...>")); break; }
-			const id = await resolveId(raw);
-			if (!id) { console.log(red("Not found: ") + raw); break; }
-			const actor = client.objectActor.getOrCreate([id]);
-			const blockId = randomUUID();
-			const block = { id: blockId, childrenIds: [] as string[], content: { text: { text: messageText, style: 0 } } };
-			await actor.addBlock(JSON.stringify(block));
-			console.log(dim("sent ") + blockId.slice(0, 8));
-			break;
-		}
-
-		case "read": {
-			const raw = rest[0];
-			if (!raw) { console.log(red("Usage: /chat read <id>")); break; }
-			const id = await resolveId(raw);
-			if (!id) { console.log(red("Not found: ") + raw); break; }
-			const state = await store.get(id);
-			if (!state) { console.log(red("Object not found")); break; }
-			const nameField = state.fields["name"] as { stringValue?: string } | undefined;
-			const roomName = typeof nameField === "string" ? nameField : nameField?.stringValue;
-			const messages = extractMessages(state.blocks, state.blockProvenance, state.fields);
-			console.log(renderChat(messages, roomName));
-			break;
-		}
-
-		case "reply": {
-			const raw = rest[0];
-			const targetBlockId = rest[1];
-			const messageText = rest.slice(2).join(" ");
-			if (!raw || !targetBlockId || !messageText) {
-				console.log(red("Usage: /chat reply <id> <msgBlockId> <message...>"));
-				break;
-			}
-			const id = await resolveId(raw);
-			if (!id) { console.log(red("Not found: ") + raw); break; }
-			const actor = client.objectActor.getOrCreate([id]);
-			const blockId = randomUUID();
-			const block = { id: blockId, childrenIds: [] as string[], content: { text: { text: messageText, style: 0 } } };
-			await actor.addBlock(JSON.stringify(block));
-			await actor.setField(`reply:${blockId}`, JSON.stringify(stringVal(targetBlockId)));
-			console.log(dim("replied ") + blockId.slice(0, 8));
-			break;
-		}
-
-		case "react": {
-			const raw = rest[0];
-			const targetBlockId = rest[1];
-			const emoji = rest[2];
-			if (!raw || !targetBlockId || !emoji) {
-				console.log(red("Usage: /chat react <id> <msgBlockId> <emoji>"));
-				break;
-			}
-			const id = await resolveId(raw);
-			if (!id) { console.log(red("Not found: ") + raw); break; }
-			const actor = client.objectActor.getOrCreate([id]);
-			await actor.setField(`react:${targetBlockId}:${emoji}`, JSON.stringify(stringVal("local")));
-			console.log(dim("reacted ") + emoji);
-			break;
-		}
-
-		default:
-			console.log([
-				bold("  Chat"),
-				`    ${cyan("/chat new")} ${dim("[name]")}                  create a chat room`,
-				`    ${cyan("/chat send")} ${dim("<id> <message...>")}     send a message`,
-				`    ${cyan("/chat read")} ${dim("<id>")}                   read messages`,
-				`    ${cyan("/chat reply")} ${dim("<id> <blockId> <msg>")}  reply to a message`,
-				`    ${cyan("/chat react")} ${dim("<id> <blockId> <emoji>")} react to a message`,
 			].join("\n"));
 	}
 }
@@ -780,8 +591,6 @@ function cmdHelp(): void {
 		["/heads <id>", "Show DAG head change IDs"],
 		["/changes <id>", "List all change IDs for an object"],
 		["/sync <idA> <idB>", "Sync DAG state between two objects"],
-		["/ttt new|board|move|history", "Tic-Tac-Toe (try /ttt for help)"],
-		["/chat new|send|read|reply|react", "Chat rooms (try /chat for help)"],
 		["/snapshot <id>", "Create a state snapshot (speeds up replay)"],
 		["/info", "Store summary"],
 		["/disk", "Disk usage stats"],
@@ -791,6 +600,17 @@ function cmdHelp(): void {
 	];
 	for (const [cmd, desc] of cmds) {
 		console.log(`  ${cyan(cmd.padEnd(42))} ${dim(desc)}`);
+	}
+
+	// Dynamically list loaded programs
+	if (programs.length > 0) {
+		console.log("");
+		console.log(bold("  Programs") + dim(" (loaded from Glon objects)"));
+		for (const p of programs) {
+			const subcmds = Object.keys(p.commands).join("|");
+			const label = `${p.prefix} ${subcmds}`;
+			console.log(`  ${cyan(label.padEnd(42))} ${dim(p.name)}`);
+		}
 	}
 }
 
@@ -807,6 +627,10 @@ async function dispatch(line: string): Promise<boolean> {
 	const [cmd, ...args] = trimmed.split(/\s+/);
 
 	try {
+		// Try program dispatch first — programs are first-class.
+		const handled = await dispatchProgram(programs, trimmed, buildContext());
+		if (handled) return true;
+
 		switch (cmd) {
 			case "/create": await cmdCreate(args); break;
 			case "/list": await cmdList(args); break;
@@ -822,8 +646,6 @@ async function dispatch(line: string): Promise<boolean> {
 			case "/heads": await cmdHeads(args); break;
 			case "/changes": await cmdChanges(args); break;
 			case "/sync": await cmdSync(args); break;
-			case "/ttt": await cmdTtt(args); break;
-			case "/chat": await cmdChat(args); break;
 			case "/remote": await cmdRemote(args); break;
 			case "/snapshot": await cmdSnapshot(args); break;
 			case "/info": await cmdInfo(); break;
@@ -846,6 +668,18 @@ async function dispatch(line: string): Promise<boolean> {
 
 async function main() {
 	console.log(bold("Glon OS") + dim(` — ${ENDPOINT}`));
+
+	// Load programs from Glon objects
+	try {
+		programs = await loadPrograms(store, client);
+		if (programs.length > 0) {
+			console.log(dim(`Loaded ${programs.length} program(s): ${programs.map(p => p.prefix).join(", ")}`));
+		}
+	} catch {
+		// Programs may not be seeded yet; non-fatal.
+		console.log(dim("No programs loaded (run bootstrap to seed)."));
+	}
+
 	console.log(dim("Type /help for commands.\n"));
 
 	const rl = createInterface({
@@ -854,7 +688,6 @@ async function main() {
 		prompt: `${CYAN}glon>${RESET} `,
 	});
 
-	// Queue commands so async handlers don't race with readline close.
 	let pending: Promise<void> = Promise.resolve();
 	let alive = true;
 

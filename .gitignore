@@ -3,3 +3,7 @@ dist/
 *.js
 *.d.ts
 *.map
+
+
+# Program handlers are source (JS by design, not compiled TS)
+!src/programs/handlers/*.js

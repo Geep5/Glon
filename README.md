@@ -189,8 +189,6 @@ chat with 10,000 messages compacts to a single checkpoint.
 | `/sync <idA> <idB>` | Sync two objects |
 | `/send <from> <to> <action>` | IPC between objects |
 | `/inbox <id>` / `/outbox <id>` | Message queues |
-| `/ttt new\|board\|move\|history` | Tic-Tac-Toe |
-| `/chat new\|send\|read\|reply\|react` | Chat |
 | `/remote pull\|push <endpoint> <id>` | Cross-instance sync |
 | `/snapshot <id>` | Checkpoint state (speeds up replay) |
 | `/info` / `/disk` / `/help` | System info |
@@ -208,11 +206,13 @@ glon/
       dag.ts                  topological sort + state computation
     disk.ts                   raw .pb file storage
     index.ts                  actor definitions + registry
-    bootstrap.ts              seed source files as objects
-    client.ts                 CLI shell
+    bootstrap.ts              seed source files + programs as objects
+    client.ts                 CLI shell (discovers programs at startup)
     programs/
-      tictactoe.ts            tic-tac-toe game
-      chat.ts                 chat / messaging
+      runtime.ts              program loader + dispatcher + ProgramContext
+      handlers/
+        ttt.js                tic-tac-toe (self-contained handler)
+        chat.js               chat / messaging (self-contained handler)
   package.json
   tsconfig.json
 ```

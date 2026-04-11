@@ -133,14 +133,42 @@ fresh from disk.
 
 ## Programs
 
-Programs are protocol consumers. They read object state, validate
-logic, write changes through the standard DAG protocol. No special
-actor types, no framework hooks.
+Programs are Glon objects. They sync between instances, have full
+change history, and are individually addressable -- just like any
+other object on the OS.
 
-Tic-tac-toe (`src/programs/tictactoe.ts`) demonstrates this:
-the board is a regular object with fields (`cell_0`..`cell_8`,
-`turn`, `status`). Game logic validates moves and writes field
-changes. Every move is a content-addressed Change in the DAG.
+A program object has type `program` and three key fields:
+
+| Field | Type | Purpose |
+|---|---|---|
+| `name` | string | Display name ("Tic-Tac-Toe") |
+| `prefix` | string | Shell command prefix ("/ttt") |
+| `commands` | ValueMap | Subcommand names to descriptions |
+
+The program's source code is stored as `ContentSet` on the object.
+It's a self-contained JavaScript function body that receives three
+arguments: `cmd` (subcommand), `args` (remaining tokens), and `ctx`
+(a runtime context providing proto helpers, actor access, disk, I/O).
+
+**Discovery.** The shell calls `store.list("program")` at startup,
+reads each program object's content, and compiles handlers via
+`AsyncFunction`. Zero hardcoded program commands in the shell.
+
+**Execution.** When you type `/ttt move a3f8 4`, the shell matches
+the `/ttt` prefix, calls the handler with `("move", ["a3f8", "4"], ctx)`.
+The handler validates, calls actor actions, and prints output.
+
+**Distribution.** Push a program object to a remote peer and they
+can run it. The handler source travels in the Change DAG like any
+other content.
+
+```
+src/programs/
+  runtime.ts                 loader + dispatcher + ProgramContext
+  handlers/
+    ttt.js                   tic-tac-toe handler (function body)
+    chat.js                  chat handler (function body)
+```
 
 ## Data Flow
 
