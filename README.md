@@ -236,11 +236,13 @@ HTTP endpoint via Rivet. Sync is peer-to-peer between actors.
 **Content-addressed.** Same mutation produces the same SHA-256 hash.
 Tamper-evident. Deduplication is free.
 
-**Programs are protocol consumers.** Tic-tac-toe uses no special APIs.
-It reads fields, validates a move, writes fields. Any program on this
-OS works the same way. Programs can be single-file (legacy eval) or
-multi-module (esbuild-bundled at load time) with actor definitions
-for persistent state, tick loops, and named RPC actions.
+**Programs are protocol consumers.** Every program is a module that
+`export default`s a `ProgramDef` — a handler for CLI commands and,
+optionally, an actor definition for persistent state, tick loops, and
+named RPC actions. Simple programs have one module; complex ones have
+many. The runtime bundles them via esbuild at load time. Programs
+live in the DAG as regular objects — push one to a peer and they can
+run it.
 
 **Programs don't change the OS.** `Value` is recursive — `ValueMap` and
 `ValueList` contain `Value`s, so programs express arbitrarily complex state
@@ -294,6 +296,84 @@ The OS stores, content-addresses, syncs, and replays all of it
 through the standard Change DAG. No custom operations. No custom
 reducers. No program needs to touch the kernel to be arbitrarily
 complex.
+
+
+## Programs
+
+Programs are Glon objects. Their source code lives in the DAG, syncs
+between peers, and is discoverable at runtime. The shell has zero
+hardcoded commands — it loads every program from the store at startup.
+
+### Shape
+
+Every program `export default`s a `ProgramDef`:
+
+```typescript
+export default {
+  // Required: handles CLI subcommands
+  handler: async (cmd, args, ctx) => { ... },
+
+  // Optional: persistent state + RPC actions + tick loop
+  actor: {
+    createState: () => ({ count: 0 }),
+    actions: {
+      increment: (ctx) => { ctx.state.count++; },
+    },
+    tickMs: 5000,
+    onTick: (ctx) => { /* periodic work */ },
+  },
+
+  // Optional: validate synced changes before they hit disk
+  validator: (changes) => { /* throw to reject */ },
+  validatedTypes: ["character", "item"],
+};
+```
+
+A program with just a `handler` is a stateless command (tic-tac-toe, chat).
+Add an `actor` and it gets persistent state, named RPC actions, and a tick
+loop. Add a `validator` and it gates the DAG — synced changes for the
+listed types are rejected before writing to disk if validation fails.
+
+### Modules
+
+A program's `manifest` maps filenames to source strings. At load time,
+the runtime feeds them into esbuild's virtual filesystem plugin and
+produces a single CJS bundle. The entry module's default export is the
+`ProgramDef`.
+
+Simple programs have one module:
+
+```
+manifest: { "ttt.ts": <source> }    entry: "ttt.ts"
+```
+
+Complex programs have many:
+
+```
+manifest: {                          entry: "index.ts"
+  "index.ts":     <source>,
+  "combat.ts":    <source>,
+  "character.ts": <source>,
+  "validate.ts":  <source>,
+  ...                               
+}
+```
+
+Same compilation path either way. No special cases.
+
+### Context
+
+Every handler and actor action receives a `ProgramContext`:
+
+| Field | Purpose |
+|---|---|
+| `store` | Actor client for CRUD, list, search |
+| `state` | Program's persistent state (read/write) |
+| `emit(channel, data)` | Broadcast structured events |
+| `programId` | This program's Glon object ID |
+| `objectActor(id)` | Typed access to any object actor |
+| `proto` | Encode/decode helpers (`stringVal`, `mapVal`, etc.) |
+| `print(msg)` | Output to the shell |
 
 
 ## License

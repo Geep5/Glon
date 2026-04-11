@@ -145,54 +145,42 @@ A program object has type `program` and three key fields:
 | `prefix` | string | Shell command prefix ("/ttt") |
 | `commands` | ValueMap | Subcommand names to descriptions |
 
-The program's source code is stored as `ContentSet` on the object.
-It's a self-contained JavaScript function body that receives three
-arguments: `cmd` (subcommand), `args` (remaining tokens), and `ctx`
-(a runtime context providing proto helpers, actor access, disk, I/O).
+A program object has type `program` and a `manifest` field (ValueMap) that
+maps filenames to base64-encoded source strings. The runtime bundles them
+at load time via esbuild's virtual filesystem plugin, producing a single
+evaluable CJS bundle. The entry module `export default`s a `ProgramDef`:
+
+```typescript
+export default {
+  handler: async (cmd, args, ctx) => { ... },  // CLI handler
+  actor: { ... },                                // stateful actor (optional)
+  validator: (changes) => { ... },               // DAG validator (optional)
+  validatedTypes: ["character", "item"],         // types to validate (optional)
+};
+```
+
+Simple programs (ttt, chat) have one module in their manifest. Complex
+programs (godly) have many. Same path either way — no special cases.
 
 **Discovery.** The shell calls `store.list("program")` at startup,
-reads each program object's content, and compiles handlers via
-`AsyncFunction`. Zero hardcoded program commands in the shell.
+extracts each program's manifest, bundles the modules, and compiles
+handlers. Zero hardcoded program commands in the shell.
 
 **Execution.** When you type `/ttt move a3f8 4`, the shell matches
 the `/ttt` prefix, calls the handler with `("move", ["a3f8", "4"], ctx)`.
 The handler validates, calls actor actions, and prints output.
 
-**Distribution.** Push a program object to a remote peer and they
-can run it. The handler source travels in the Change DAG like any
+### Actors, Modules, Validators
+
 other content.
 
 ```
 src/programs/
-  runtime.ts                 loader + dispatcher + ProgramContext
+  runtime.ts                 module bundler, actor lifecycle, validators
   handlers/
-    ttt.js                   tic-tac-toe handler (function body)
-    chat.js                  chat handler (function body)
+    ttt.ts                   tic-tac-toe (single-module program)
+    chat.ts                  chat / messaging (single-module program)
 ```
-
-### Program Model v2: Actors, Modules, Validators (Implemented)
-
-All programs are module programs. Each program's manifest maps filenames
-to source; esbuild bundles them into a single CJS module that exports a
-`ProgramDef` with handler, actor, validator, and typed output channels.
-
-#### Multi-Module Programs
-
-A program's `manifest` field (ValueMap) maps filenames to source strings.
-The runtime bundles them at load time via esbuild's virtual filesystem
-plugin, producing a single evaluable CJS bundle. The entry module
-`export default`s a `ProgramDef`:
-
-```typescript
-export default {
-  handler: async (cmd, args, ctx) => { ... },  // CLI handler
-  actor: { ... },                                // stateful actor
-  validator: (changes) => { ... },               // DAG validator
-  validatedTypes: ["character", "item"],         // types to validate
-};
-```
-
-Single-file programs (no manifest) still work unchanged via function eval.
 
 #### Program Actors
 
@@ -207,9 +195,9 @@ The runtime creates one actor instance per program. Programs manage their
 own sub-instances (e.g. active fights) in state. The kernel's `programActor`
 provides RPC dispatch and event broadcast.
 
-#### ProgramContext v2
+#### ProgramContext
 
-The context object passed to all program code now includes:
+The context object passed to all program code includes:
 
 - `state` — program's persistent state (read/write)
 - `emit(channel, data)` — broadcast structured data to subscribers
