@@ -18,6 +18,8 @@
  */
 
 import type { Value, Change, ObjectRef } from "../proto.js";
+import * as proto from "../proto.js";
+import * as cryptoMod from "../crypto.js";
 import * as esbuild from "esbuild";
 
 // ── AsyncFunction constructor ───────────────────────────────────
@@ -253,11 +255,19 @@ async function bundleModuleSet(ms: ModuleSet): Promise<string> {
 
 	const bundled = result.outputFiles[0].text;
 
-	// Wrap: the bundled CJS code sets module.exports. We create a
-	// function that provides module/exports and returns the exports.
+	// Wrap: the bundled CJS code uses `require()` for external imports.
+	// We inject a `require` shim that maps kernel module paths to actual
+	// modules provided at eval-time via `arguments[0]` (the externals map).
 	return `
+		var __externals = arguments[0];
 		var module = { exports: {} };
 		var exports = module.exports;
+		var require = function(id) {
+			var key = id.replace(/^(\\.\\.\\/)+/, "").replace(/^\\.\\//, "");
+			if (__externals[key]) return __externals[key];
+			if (__externals[id]) return __externals[id];
+			throw new Error("Cannot resolve module: " + id);
+		};
 		${bundled}
 		return module.exports;
 	`;
@@ -295,8 +305,13 @@ function compileLegacy(source: string, name: string): ProgramDef | null {
 async function compileModuleProgram(ms: ModuleSet, name: string): Promise<ProgramDef | null> {
 	try {
 		const bundled = await bundleModuleSet(ms);
+		// Provide kernel modules so bundled CJS `require()` calls resolve.
+		const externals: Record<string, unknown> = {
+			"proto.js": proto,
+			"crypto.js": cryptoMod,
+		};
 		const factory = new Function(bundled);
-		const exports = factory();
+		const exports = factory(externals);
 		const def: ProgramDef = exports.default ?? exports;
 
 		// Validate shape
