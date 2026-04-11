@@ -236,10 +236,54 @@ Tamper-evident. Deduplication is free.
 It reads fields, validates a move, writes fields. Any program on this
 OS works the same way.
 
+**Programs don't change the OS.** `Value` is recursive — `ValueMap` and
+`ValueList` contain `Value`s, so programs express arbitrarily complex state
+(nested config, typed lists, object graphs) using only `FieldSet` ops.
+`BlockContent` has a `CustomContent` escape hatch for program-defined block
+types (images, tables, embeds) the OS carries without interpreting.
+The protocol is stable; the complexity lives in programs, not the kernel.
+
 **Snapshots for scale.** Every change is preserved, but replay doesn't
 start from genesis. A snapshot checkpoints the full state into the DAG.
 Future reads skip everything before it. History is never lost — the
 old changes are still on disk — but you don't pay the replay cost.
+
+## Extensibility
+
+Programs define their own data conventions on top of two composable
+primitives — without modifying `glon.proto`:
+
+**Recursive Value** — nest maps and lists to any depth:
+
+```
+// A browser tab stores complex state as standard FieldSet ops
+fields:
+  url:       string("https://example.com")
+  history:   values_value([string("url1"), string("url2"), ...])
+  cookies:   map_value({
+               "session": string("abc"),
+               "prefs": map_value({ "theme": string("dark") })
+             })
+```
+
+**Custom blocks** — program-defined visual content:
+
+```
+// A document editor adds image blocks; the OS syncs them unchanged
+BlockContent {
+  custom {
+    content_type: "image"
+    data: <png bytes>
+    meta: { "alt": "diagram of system", "width": "800" }
+  }
+}
+```
+
+The OS stores, content-addresses, syncs, and replays all of it
+through the standard Change DAG. No custom operations. No custom
+reducers. No program needs to touch the kernel to be arbitrarily
+complex.
+
 
 ## License
 

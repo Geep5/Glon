@@ -34,6 +34,8 @@ export interface Value {
 	boolValue?: boolean;
 	bytesValue?: Uint8Array;
 	listValue?: { values: string[] };
+	mapValue?: { entries: Record<string, Value> };
+	valuesValue?: { items: Value[] };
 }
 
 export interface TextContent {
@@ -41,8 +43,15 @@ export interface TextContent {
 	style: number;
 }
 
+export interface CustomContent {
+	contentType: string;
+	data: Uint8Array;
+	meta: Record<string, string>;
+}
+
 export interface BlockContent {
 	text?: TextContent;
+	custom?: CustomContent;
 }
 
 export interface Block {
@@ -205,17 +214,41 @@ export function floatVal(n: number): Value { return { floatValue: n }; }
 export function boolVal(b: boolean): Value { return { boolValue: b }; }
 export function bytesVal(b: Uint8Array): Value { return { bytesValue: b }; }
 
-export function unwrapValue(v: Value): string | number | boolean | Uint8Array | string[] | null {
+/** Create a Value containing a nested map of Values. */
+export function mapVal(entries: Record<string, Value>): Value {
+	return { mapValue: { entries } };
+}
+
+/** Create a Value containing a heterogeneous list of Values. */
+export function listVal(items: Value[]): Value {
+	return { valuesValue: { items } };
+}
+
+export type UnwrappedValue = string | number | boolean | Uint8Array | string[] | Record<string, Value> | Value[] | null;
+
+export function unwrapValue(v: Value): UnwrappedValue {
 	if (v.stringValue !== undefined && v.stringValue !== "") return v.stringValue;
 	if (v.intValue !== undefined && v.intValue !== 0) return v.intValue;
 	if (v.floatValue !== undefined && v.floatValue !== 0) return v.floatValue;
 	if (v.boolValue !== undefined && v.boolValue !== false) return v.boolValue;
 	if (v.bytesValue !== undefined && v.bytesValue.length > 0) return v.bytesValue;
 	if (v.listValue !== undefined) return v.listValue.values;
+	if (v.mapValue !== undefined) return v.mapValue.entries;
+	if (v.valuesValue !== undefined) return v.valuesValue.items;
 	return null;
 }
 
 export function displayValue(v: Value): string {
+	if (v.mapValue !== undefined) {
+		const entries = Object.entries(v.mapValue.entries);
+		if (entries.length === 0) return "{}";
+		const inner = entries.map(([k, val]) => `${k}: ${displayValue(val)}`).join(", ");
+		return `{${inner}}`;
+	}
+	if (v.valuesValue !== undefined) {
+		if (v.valuesValue.items.length === 0) return "[]";
+		return `[${v.valuesValue.items.map(displayValue).join(", ")}]`;
+	}
 	const raw = unwrapValue(v);
 	if (raw === null) return "(empty)";
 	if (Array.isArray(raw)) return raw.join(", ");

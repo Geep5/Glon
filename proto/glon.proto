@@ -231,9 +231,21 @@ message Block {
 
 message BlockContent {
   oneof content {
-    TextContent text = 1;
-    // Future: media, embed, relation, divider, table
+    TextContent   text   = 1;
+    CustomContent custom = 2;
   }
+}
+
+// Program-defined block content. The OS stores, syncs, and
+// content-addresses it without interpreting the payload.
+// Programs encode their domain-specific block data into `data`
+// and declare the type via `content_type`. The `meta` map lets
+// the OS display a fallback (title, description) for blocks
+// whose type it doesn't understand.
+message CustomContent {
+  string content_type          = 1;  // e.g. "image", "table", "embed"
+  bytes  data                  = 2;  // program-encoded payload
+  map<string, string> meta     = 3;  // fallback display metadata
 }
 
 message TextContent {
@@ -258,18 +270,36 @@ enum TextStyle {
 //
 // Typed values for fields. The oneof enforces type safety at the
 // protobuf level — no stringly-typed maps.
+//
+// Value is recursive: ValueMap and ValueList contain Values,
+// so programs can express arbitrarily nested structures without
+// modifying glon.proto. A browser stores cookie jars as nested
+// maps. A spreadsheet stores cell metadata as typed lists.
+// The OS carries it all through the same Change DAG.
 
 message Value {
   oneof kind {
-    string     string_value = 1;
-    int64      int_value    = 2;
-    double     float_value  = 3;
-    bool       bool_value   = 4;
-    bytes      bytes_value  = 5;
-    StringList list_value   = 6;
+    string     string_value  = 1;
+    int64      int_value     = 2;
+    double     float_value   = 3;
+    bool       bool_value    = 4;
+    bytes      bytes_value   = 5;
+    StringList list_value    = 6;
+    ValueMap   map_value     = 7;   // nested key-value
+    ValueList  values_value  = 8;   // heterogeneous typed list
   }
 }
 
 message StringList {
   repeated string values = 1;
+}
+
+// Recursive map: string keys to typed Values.
+message ValueMap {
+  map<string, Value> entries = 1;
+}
+
+// Recursive list: ordered sequence of typed Values.
+message ValueList {
+  repeated Value items = 1;
 }

@@ -56,11 +56,11 @@ operations in order:
 | Operation | Effect |
 |---|---|
 | `ObjectCreate` | Set type key, created timestamp |
-| `FieldSet` | Set a typed field |
+| `FieldSet` | Set a typed field (values can nest via ValueMap/ValueList) |
 | `FieldDelete` | Remove a field |
 | `ContentSet` | Set raw byte content |
 | `ObjectDelete` | Tombstone flag |
-| `BlockAdd/Remove/Update` | Block tree mutations |
+| `BlockAdd/Remove/Update` | Block tree mutations (TextContent or CustomContent) |
 
 ## Sync Protocol
 
@@ -155,3 +155,90 @@ disk for this object → replays DAG → vars populated → ready
 
 **Sync:** Actor A.getAllChangeIds() → Actor B.getAllChangeIds() →
 set difference → exchange missing changes → both reload vars
+
+
+## Program Extensibility
+
+Programs on Glon don't need to modify `glon.proto` to express complex
+state. Two primitives make this possible:
+
+### Recursive Values
+
+`Value` is recursive. `ValueMap` and `ValueList` contain `Value`s,
+so programs can express arbitrarily nested structures using only
+`FieldSet` operations:
+
+```
+Value {
+  oneof kind {
+    string     string_value  = 1;
+    int64      int_value     = 2;
+    double     float_value   = 3;
+    bool       bool_value    = 4;
+    bytes      bytes_value   = 5;
+    StringList list_value    = 6;
+    ValueMap   map_value     = 7;   // nested key-value
+    ValueList  values_value  = 8;   // heterogeneous typed list
+  }
+}
+```
+
+A browser program stores tab state as flat and nested fields:
+
+```
+fields:
+  url:       string("https://example.com")
+  title:     string("Example")
+  history:   values_value([string("url1"), string("url2")])
+  cookies:   map_value({
+               "session": string("abc123"),
+               "prefs":   map_value({ "theme": string("dark") })
+             })
+```
+
+The OS never interprets these structures. The DAG replay code does
+`state.fields.set(key, value)` -- it doesn't look inside the Value.
+Programs define their own conventions on top of the typed primitives.
+
+### Custom Block Content
+
+`BlockContent` has an escape hatch for program-defined block types:
+
+```
+BlockContent {
+  oneof content {
+    TextContent   text   = 1;
+    CustomContent custom = 2;
+  }
+}
+
+CustomContent {
+  string content_type          = 1;  // e.g. "image", "table", "embed"
+  bytes  data                  = 2;  // program-encoded payload
+  map<string, string> meta     = 3;  // fallback display metadata
+}
+```
+
+A document editor adds image blocks. A spreadsheet adds cell blocks.
+The OS stores them in the block tree, syncs them, content-addresses
+them. If a peer doesn't know how to render a `CustomContent` block,
+it falls back to displaying the `meta` map.
+
+### Why not program-defined protobufs?
+
+Two approaches were considered and rejected:
+
+**Custom Operations (programs bring their own reducers).** The OS
+would need each program's code to replay the DAG and compute state.
+A peer without the program installed couldn't compute state. This
+breaks "any peer can recompute from changes alone" -- Glon's core
+property.
+
+**Custom Value schemas (opaque bytes with type URLs).** The OS
+could carry but not inspect the data. Loses the ability to index
+fields, query values, or diff state.
+
+Recursive Value avoids both traps: the OS always replays the DAG
+(Operations are unchanged), always inspects values (typed all the
+way down), and programs compose arbitrary structures from a fixed
+set of primitives. `glon.proto` is modified once, then stable.
