@@ -1,13 +1,24 @@
 /**
- * Program runtime — loads program objects from the store and dispatches
- * commands to their dynamically-evaluated handlers.
+ * Program runtime — loads, compiles, and manages program objects.
  *
- * Programs are Glon objects of type "program" whose content (ContentSet)
- * holds a JavaScript function body. The body receives (cmd, args, ctx)
- * as free variables via AsyncFunction constructor.
+ * Programs are Glon objects of type "program". They can be:
+ *
+ *   1. **Legacy (single-file):** Content is a JS function body evaluated via
+ *      AsyncFunction("cmd", "args", "ctx", source). Receives (cmd, args, ctx).
+ *
+ *   2. **Module programs:** A `manifest` field (ValueMap) maps filenames to
+ *      source strings. The `entry` field names the module that `export default`s
+ *      the program definition. Bundled at load time via esbuild.
+ *
+ * Programs may export:
+ *   - `handler(cmd, args, ctx)` — command handler (legacy + new)
+ *   - `actor` — actor definition with state, actions, lifecycle, tick
+ *   - `validator(changes)` — DAG change validator per object type
+ *   - `validatedTypes` — array of type keys the validator applies to
  */
 
 import type { Value, Change, ObjectRef } from "../proto.js";
+import * as esbuild from "esbuild";
 
 // ── AsyncFunction constructor ───────────────────────────────────
 
@@ -17,7 +28,7 @@ const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor as
 
 // ── Types ───────────────────────────────────────────────────────
 
-/** Typed context object passed to program handlers as `ctx`. */
+/** Context passed to all program code (handlers, actor actions, ticks). */
 export interface ProgramContext {
 	// Rivet client for actor calls
 	client: unknown;
@@ -43,19 +54,80 @@ export interface ProgramContext {
 
 	// Utils
 	randomUUID: () => string;
+
+	// ── v2: Program actor extensions ──
+
+	/** Program's persistent state (read/write, survives restarts). */
+	state: Record<string, any>;
+
+	/** Emit structured data to subscribers (web frontend, CLI). */
+	emit: (channel: string, data: any) => void;
+
+	/** Program identity. */
+	programId: string;
+
+	/** Get an object actor handle by ID. */
+	objectActor: (id: string) => unknown;
+}
+
+/** Validation result returned by program validators. */
+export interface ValidationResult {
+	valid: boolean;
+	error?: string;
+}
+
+/** A program validator function. */
+export type ValidatorFn = (changes: Change[]) => ValidationResult;
+
+/** Shape of a program's actor definition (exported from module programs). */
+export interface ProgramActorDef {
+	createState?: () => Record<string, any>;
+	onCreate?: (ctx: ProgramContext) => Promise<void> | void;
+	onDestroy?: (ctx: ProgramContext) => Promise<void> | void;
+	actions?: Record<string, (ctx: ProgramContext, ...args: any[]) => any>;
+	tickMs?: number;
+	onTick?: (ctx: ProgramContext) => Promise<void> | void;
+}
+
+/** Full program definition (exported from module programs via `export default`). */
+export interface ProgramDef {
+	handler?: (cmd: string, args: string[], ctx: ProgramContext) => Promise<void> | void;
+	actor?: ProgramActorDef;
+	validator?: ValidatorFn;
+	validatedTypes?: string[];
 }
 
 /** A loaded program ready for dispatch. */
 export interface ProgramEntry {
+	id: string;
 	prefix: string;
 	name: string;
 	commands: Record<string, string>;
+	/** Legacy handler — called directly for single-file programs. */
 	handler: (cmd: string, args: string[], ctx: ProgramContext) => Promise<void>;
+	/** Full definition (null for legacy single-file programs). */
+	def: ProgramDef | null;
+}
+
+/** Live state of a running program actor. */
+export interface ProgramActorInstance {
+	programId: string;
+	prefix: string;
+	def: ProgramActorDef;
+	state: Record<string, any>;
+	tickHandle: ReturnType<typeof setInterval> | null;
+}
+
+// ── Module set types ────────────────────────────────────────────
+
+interface ModuleSet {
+	entry: string;
+	modules: Map<string, string>; // filename → source
 }
 
 // ── Field extraction helpers ────────────────────────────────────
 
-/** Extract a plain string from a proto field that may be a raw string or a Value wrapper. */
+/** Extract a plain string from a proto field (raw string or Value wrapper). */
 function extractString(field: unknown): string | undefined {
 	if (field == null) return undefined;
 	if (typeof field === "string") return field;
@@ -65,14 +137,9 @@ function extractString(field: unknown): string | undefined {
 	return undefined;
 }
 
-/**
- * Extract a commands map from a field that is either:
- * - a plain Record<string, string>
- * - a proto Value with mapValue.entries containing Value wrappers
- */
+/** Extract a commands map from a field (plain object or proto ValueMap). */
 function extractCommands(field: unknown): Record<string, string> {
 	if (field == null) return {};
-	// Proto Value shape: { mapValue: { entries: Record<string, Value> } }
 	if (typeof field === "object" && "mapValue" in (field as any)) {
 		const entries = (field as any).mapValue?.entries;
 		if (!entries || typeof entries !== "object") return {};
@@ -83,20 +150,341 @@ function extractCommands(field: unknown): Record<string, string> {
 		}
 		return result;
 	}
-	// Plain object of strings
 	if (typeof field === "object") {
 		const result: Record<string, string> = {};
 		for (const [key, val] of Object.entries(field as Record<string, unknown>)) {
-			if (typeof val === "string") {
-				result[key] = val;
-			} else {
-				const s = extractString(val);
-				if (s !== undefined) result[key] = s;
-			}
+			const s = typeof val === "string" ? val : extractString(val);
+			if (s !== undefined) result[key] = s;
 		}
 		return result;
 	}
 	return {};
+}
+
+/** Extract a string→string map from a ValueMap field. */
+function extractStringMap(field: unknown): Map<string, string> {
+	const result = new Map<string, string>();
+	if (field == null) return result;
+	if (typeof field === "object" && "mapValue" in (field as any)) {
+		const entries = (field as any).mapValue?.entries;
+		if (entries && typeof entries === "object") {
+			for (const [key, val] of Object.entries(entries)) {
+				const s = extractString(val);
+				if (s !== undefined) result.set(key, s);
+			}
+		}
+	}
+	return result;
+}
+
+/** Extract a string array from a ValueList field. */
+function extractStringArray(field: unknown): string[] {
+	if (field == null) return [];
+	if (Array.isArray(field)) return field.filter(v => typeof v === "string");
+	if (typeof field === "object" && "listValue" in (field as any)) {
+		const items = (field as any).listValue?.values;
+		if (Array.isArray(items)) {
+			return items.map((v: any) => extractString(v)).filter((s): s is string => s !== undefined);
+		}
+	}
+	return [];
+}
+
+// ── Module bundler ──────────────────────────────────────────────
+
+/**
+ * Bundle a module set into a single evaluable string using esbuild.
+ *
+ * The entry module's `export default` becomes `module.exports.default`
+ * after bundling. We wrap the bundle in a function that returns the exports.
+ */
+async function bundleModuleSet(ms: ModuleSet): Promise<string> {
+	// esbuild virtual filesystem plugin
+	const virtualPlugin: esbuild.Plugin = {
+		name: "glon-virtual",
+		setup(build) {
+			// Resolve bare specifiers to virtual paths
+			build.onResolve({ filter: /.*/ }, (args) => {
+				if (args.kind === "entry-point") {
+					return { path: args.path, namespace: "glon" };
+				}
+				// Resolve relative imports within the module set
+				const resolved = args.path.replace(/^\.\//, "");
+				if (ms.modules.has(resolved)) {
+					return { path: resolved, namespace: "glon" };
+				}
+				// Try with .ts/.js extensions
+				for (const ext of [".ts", ".js"]) {
+					const withExt = resolved + ext;
+					if (ms.modules.has(withExt)) {
+						return { path: withExt, namespace: "glon" };
+					}
+				}
+				// External — let it pass through (will be available at runtime via ctx)
+				return { external: true };
+			});
+
+			build.onLoad({ filter: /.*/, namespace: "glon" }, (args) => {
+				const source = ms.modules.get(args.path);
+				if (source === undefined) {
+					return { errors: [{ text: `Module not found: ${args.path}` }] };
+				}
+				const loader = args.path.endsWith(".ts") ? "ts" as const : "js" as const;
+				return { contents: source, loader };
+			});
+		},
+	};
+
+	const result = await esbuild.build({
+		entryPoints: [ms.entry],
+		bundle: true,
+		write: false,
+		format: "cjs",
+		platform: "node",
+		target: "es2022",
+		plugins: [virtualPlugin],
+		// Don't fail on missing externals — they're runtime-provided
+		logLevel: "silent",
+	});
+
+	if (result.errors.length > 0) {
+		throw new Error(`esbuild errors: ${result.errors.map(e => e.text).join(", ")}`);
+	}
+
+	const bundled = result.outputFiles[0].text;
+
+	// Wrap: the bundled CJS code sets module.exports. We create a
+	// function that provides module/exports and returns the exports.
+	return `
+		var module = { exports: {} };
+		var exports = module.exports;
+		${bundled}
+		return module.exports;
+	`;
+}
+
+// ── Compilation ─────────────────────────────────────────────────
+
+/**
+ * Compile a legacy single-file program (function body eval).
+ * Returns a ProgramDef with just a handler.
+ */
+function compileLegacy(source: string, name: string): ProgramDef | null {
+	try {
+		const rawHandler = new AsyncFunction("cmd", "args", "ctx", source) as
+			(cmd: string, args: string[], ctx: ProgramContext) => Promise<void>;
+		return {
+			handler: async (cmd, args, ctx) => {
+				try {
+					await rawHandler(cmd, args, ctx);
+				} catch (err: any) {
+					ctx.print("Error: " + (err.message ?? String(err)));
+				}
+			},
+		};
+	} catch (err: any) {
+		console.warn(`[program] Failed to compile "${name}": ${err.message}`);
+		return null;
+	}
+}
+
+/**
+ * Compile a module-set program (esbuild bundle + eval).
+ * The entry module must `export default` a ProgramDef.
+ */
+async function compileModuleProgram(ms: ModuleSet, name: string): Promise<ProgramDef | null> {
+	try {
+		const bundled = await bundleModuleSet(ms);
+		const factory = new Function(bundled);
+		const exports = factory();
+		const def: ProgramDef = exports.default ?? exports;
+
+		// Validate shape
+		if (!def || (typeof def !== "object")) {
+			console.warn(`[program] "${name}" does not export a valid program definition`);
+			return null;
+		}
+		return def;
+	} catch (err: any) {
+		console.warn(`[program] Failed to bundle "${name}": ${err.message}`);
+		return null;
+	}
+}
+
+// ── Manifest extraction ─────────────────────────────────────────
+
+/**
+ * Extract a ModuleSet from a program object's fields.
+ * Returns null if no manifest or manifest is invalid.
+ */
+async function extractModuleSet(
+	fields: Record<string, unknown>,
+	store: { get: (...args: any[]) => any },
+): Promise<ModuleSet | null> {
+	const manifestField = fields.manifest;
+	if (!manifestField) return null;
+
+	const entry = extractString(
+		typeof manifestField === "object" && "mapValue" in (manifestField as any)
+			? (manifestField as any).mapValue?.entries?.entry
+			: (manifestField as any)?.entry
+	);
+	if (!entry) return null;
+
+	// Extract modules map
+	const modulesField =
+		typeof manifestField === "object" && "mapValue" in (manifestField as any)
+			? (manifestField as any).mapValue?.entries?.modules
+			: (manifestField as any)?.modules;
+
+	const moduleRefs = extractStringMap(modulesField);
+	if (moduleRefs.size === 0) return null;
+
+	const modules = new Map<string, string>();
+
+	for (const [filename, ref] of moduleRefs) {
+		// ref is either inline base64 source or a Glon object ID
+		if (ref.length > 40) {
+			// Likely base64 inline source
+			try {
+				modules.set(filename, Buffer.from(ref, "base64").toString("utf-8"));
+			} catch {
+				modules.set(filename, ref); // treat as raw source
+			}
+		} else {
+			// Object ID reference — load content from store
+			try {
+				const obj = await store.get(ref);
+				if (obj?.content) {
+					modules.set(filename, Buffer.from(obj.content, "base64").toString("utf-8"));
+				}
+			} catch {
+				console.warn(`[program] Failed to load module "${filename}" (ref: ${ref})`);
+			}
+		}
+	}
+
+	if (!modules.has(entry)) {
+		console.warn(`[program] Entry module "${entry}" not found in manifest`);
+		return null;
+	}
+
+	return { entry, modules };
+}
+
+// ── Validator registry ──────────────────────────────────────────
+
+const validators = new Map<string, ValidatorFn>();
+
+/** Register a validator for one or more type keys. */
+function registerValidator(typeKeys: string[], fn: ValidatorFn): void {
+	for (const key of typeKeys) {
+		validators.set(key, fn);
+	}
+}
+
+/** Get the validator for a given type key (if any). */
+export function getValidator(typeKey: string): ValidatorFn | undefined {
+	return validators.get(typeKey);
+}
+
+// ── Program actor instances ─────────────────────────────────────
+
+const actorInstances = new Map<string, ProgramActorInstance>();
+
+/** Get a running program actor instance by program ID. */
+export function getProgramActor(programId: string): ProgramActorInstance | undefined {
+	return actorInstances.get(programId);
+}
+
+/** Get a running program actor instance by prefix. */
+export function getProgramActorByPrefix(prefix: string): ProgramActorInstance | undefined {
+	for (const inst of actorInstances.values()) {
+		if (inst.prefix === prefix) return inst;
+	}
+	return undefined;
+}
+
+/** Start a program actor instance. */
+export async function startProgramActor(
+	entry: ProgramEntry,
+	makeCtx: (state: Record<string, any>) => ProgramContext,
+): Promise<ProgramActorInstance | null> {
+	const actorDef = entry.def?.actor;
+	if (!actorDef) return null;
+
+	const state = actorDef.createState?.() ?? {};
+	const instance: ProgramActorInstance = {
+		programId: entry.id,
+		prefix: entry.prefix,
+		def: actorDef,
+		state,
+		tickHandle: null,
+	};
+
+	// Run onCreate
+	if (actorDef.onCreate) {
+		try {
+			await actorDef.onCreate(makeCtx(state));
+		} catch (err: any) {
+			console.warn(`[program] "${entry.name}" onCreate failed: ${err.message}`);
+		}
+	}
+
+	// Start tick loop
+	if (actorDef.tickMs && actorDef.onTick) {
+		const tickFn = actorDef.onTick;
+		instance.tickHandle = setInterval(async () => {
+			try {
+				await tickFn(makeCtx(state));
+			} catch (err: any) {
+				console.warn(`[program] "${entry.name}" onTick error: ${err.message}`);
+			}
+		}, actorDef.tickMs);
+	}
+
+	actorInstances.set(entry.id, instance);
+	return instance;
+}
+
+/** Stop a program actor instance. */
+export async function stopProgramActor(
+	programId: string,
+	makeCtx: (state: Record<string, any>) => ProgramContext,
+): Promise<void> {
+	const instance = actorInstances.get(programId);
+	if (!instance) return;
+
+	if (instance.tickHandle) {
+		clearInterval(instance.tickHandle);
+		instance.tickHandle = null;
+	}
+
+	if (instance.def.onDestroy) {
+		try {
+			await instance.def.onDestroy(makeCtx(instance.state));
+		} catch (err: any) {
+			console.warn(`[program] onDestroy failed: ${err.message}`);
+		}
+	}
+
+	actorInstances.delete(programId);
+}
+
+/** Dispatch an action to a program actor. */
+export async function dispatchActorAction(
+	programId: string,
+	action: string,
+	args: any[],
+	makeCtx: (state: Record<string, any>) => ProgramContext,
+): Promise<any> {
+	const instance = actorInstances.get(programId);
+	if (!instance) throw new Error(`No running program actor: ${programId}`);
+
+	const actionFn = instance.def.actions?.[action];
+	if (!actionFn) throw new Error(`Unknown action "${action}" on program ${instance.prefix}`);
+
+	return await actionFn(makeCtx(instance.state), ...args);
 }
 
 // ── Loader ──────────────────────────────────────────────────────
@@ -104,7 +492,10 @@ function extractCommands(field: unknown): Record<string, string> {
 /**
  * Load all program objects from the store and compile their handlers.
  *
- * Skips programs that have no content or whose source fails to compile.
+ * - Legacy programs (no manifest): eval'd as function body
+ * - Module programs (manifest field): bundled via esbuild, export default
+ *
+ * Also registers validators and prepares actor definitions.
  */
 export async function loadPrograms(
 	store: { list: (...args: any[]) => any; get: (...args: any[]) => any },
@@ -112,6 +503,9 @@ export async function loadPrograms(
 ): Promise<ProgramEntry[]> {
 	const refs = await store.list("program");
 	const programs: ProgramEntry[] = [];
+
+	// Clear previous validator registrations
+	validators.clear();
 
 	for (const ref of refs) {
 		let obj: any;
@@ -125,42 +519,61 @@ export async function loadPrograms(
 		const fields: Record<string, unknown> = obj.fields ?? {};
 
 		const prefix = extractString(fields.prefix);
-		if (!prefix) continue; // program must have a prefix
+		if (!prefix) continue;
 
 		const name = extractString(fields.name) ?? prefix;
 		const commands = extractCommands(fields.commands);
 
-		// Content is base64-encoded source
-		const contentB64: string | undefined = obj.content;
-		if (!contentB64) continue;
+		// Try module-set path first (manifest field)
+		const moduleSet = await extractModuleSet(fields, store);
+		let def: ProgramDef | null = null;
 
-		let source: string;
-		try {
-			source = Buffer.from(contentB64, "base64").toString("utf-8");
-		} catch {
-			continue;
-		}
-		if (!source.trim()) continue;
+		if (moduleSet) {
+			// Module program: bundle and eval
+			def = await compileModuleProgram(moduleSet, name);
+		} else {
+			// Legacy single-file: eval function body from content
+			const contentB64: string | undefined = obj.content;
+			if (!contentB64) continue;
 
-		// Compile handler
-		let rawHandler: (cmd: string, args: string[], ctx: ProgramContext) => Promise<void>;
-		try {
-			rawHandler = new AsyncFunction("cmd", "args", "ctx", source) as any;
-		} catch (err: any) {
-			console.warn(`[program] Failed to compile "${name}" (${ref.id}): ${err.message}`);
-			continue;
-		}
-
-		// Wrap in error boundary so a broken handler doesn't crash the shell
-		const handler = async (cmd: string, args: string[], ctx: ProgramContext): Promise<void> => {
+			let source: string;
 			try {
-				await rawHandler(cmd, args, ctx);
-			} catch (err: any) {
-				ctx.print("Error: " + (err.message ?? String(err)));
+				source = Buffer.from(contentB64, "base64").toString("utf-8");
+			} catch {
+				continue;
 			}
-		};
+			if (!source.trim()) continue;
 
-		programs.push({ prefix, name, commands, handler });
+			def = compileLegacy(source, name);
+		}
+
+		if (!def) continue;
+
+		// Register validator if present
+		if (def.validator && def.validatedTypes?.length) {
+			registerValidator(def.validatedTypes, def.validator);
+		}
+
+		// Build the handler: prefer def.handler, fall back to actor dispatch help text
+		const handler = def.handler
+			? async (cmd: string, args: string[], ctx: ProgramContext) => {
+					try {
+						await def!.handler!(cmd, args, ctx);
+					} catch (err: any) {
+						ctx.print("Error: " + (err.message ?? String(err)));
+					}
+				}
+			: async (_cmd: string, _args: string[], ctx: ProgramContext) => {
+					// Actor-only program with no CLI handler — list available actions
+					const actions = def?.actor?.actions;
+					if (actions) {
+						ctx.print(`Actions: ${Object.keys(actions).join(", ")}`);
+					} else {
+						ctx.print(`Program "${name}" has no CLI handler.`);
+					}
+				};
+
+		programs.push({ id: ref.id, prefix, name, commands, handler, def });
 	}
 
 	return programs;
@@ -169,7 +582,10 @@ export async function loadPrograms(
 // ── Dispatcher ──────────────────────────────────────────────────
 
 /**
- * Dispatch a raw command line to the matching program handler.
+ * Dispatch a raw command line to the matching program.
+ *
+ * For programs with an actor definition, routes subcommand to the actor's
+ * named actions. For legacy programs, calls the handler directly.
  *
  * Returns true if a program handled the input, false otherwise.
  */
@@ -187,6 +603,29 @@ export async function dispatchProgram(
 	const program = programs.find((p) => p.prefix === cmd);
 	if (!program) return false;
 
+	// If program has a running actor and the subcommand matches an action, dispatch to actor
+	const instance = getProgramActorByPrefix(cmd);
+	if (instance) {
+		const subCmd = allArgs[0];
+		if (subCmd && instance.def.actions?.[subCmd]) {
+			try {
+				const result = await dispatchActorAction(
+					instance.programId,
+					subCmd,
+					allArgs.slice(1),
+					(state) => ({ ...ctx, state, programId: instance.programId }),
+				);
+				if (result !== undefined) {
+					ctx.print(typeof result === "string" ? result : JSON.stringify(result, null, 2));
+				}
+			} catch (err: any) {
+				ctx.print("Error: " + (err.message ?? String(err)));
+			}
+			return true;
+		}
+	}
+
+	// Fall through to handler
 	await program.handler(allArgs[0] ?? "", allArgs.slice(1), ctx);
 	return true;
 }

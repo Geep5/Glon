@@ -18,7 +18,7 @@ import { diskStats, readChangeByHex, listChangeFiles } from "./disk.js";
 import { hexEncode } from "./crypto.js";
 import { stringVal, intVal, floatVal, boolVal, mapVal, listVal, displayValue } from "./proto.js";
 import type { Value, Change } from "./proto.js";
-import { loadPrograms, dispatchProgram, type ProgramContext, type ProgramEntry } from "./programs/runtime.js";
+import { loadPrograms, dispatchProgram, startProgramActor, type ProgramContext, type ProgramEntry } from "./programs/runtime.js";
 import { randomUUID } from "node:crypto";
 
 const ENDPOINT = process.env.GLON_ENDPOINT ?? "http://localhost:6420";
@@ -72,7 +72,7 @@ async function resolveId(raw: string): Promise<string | null> {
 
 let programs: ProgramEntry[] = [];
 
-function buildContext(): ProgramContext {
+function buildContext(overrides?: Partial<ProgramContext>): ProgramContext {
 	return {
 		client,
 		store,
@@ -89,6 +89,12 @@ function buildContext(): ProgramContext {
 		hexEncode,
 		print: (msg: string) => console.log(msg),
 		randomUUID,
+		// v2 defaults (overridden by program actors)
+		state: {},
+		emit: () => {},
+		programId: "",
+		objectActor: (id: string) => client.objectActor.getOrCreate([id]),
+		...overrides,
 	};
 }
 
@@ -674,6 +680,13 @@ async function main() {
 		programs = await loadPrograms(store, client);
 		if (programs.length > 0) {
 			console.log(dim(`Loaded ${programs.length} program(s): ${programs.map(p => p.prefix).join(", ")}`));
+		}
+		// Start program actors for programs that define them
+		for (const prog of programs) {
+			if (prog.def?.actor) {
+				await startProgramActor(prog, (state) => buildContext({ state, programId: prog.id }));
+				console.log(dim(`  → ${prog.prefix} actor started`));
+			}
 		}
 	} catch {
 		// Programs may not be seeded yet; non-fatal.

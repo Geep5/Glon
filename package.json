@@ -10,12 +10,13 @@
     "test": "npx tsx --test test/*.test.ts"
   },
   "dependencies": {
-    "rivetkit": "^2.0.0",
-    "protobufjs": "^7.5.3"
+    "esbuild": "^0.28.0",
+    "protobufjs": "^7.5.3",
+    "rivetkit": "^2.0.0"
   },
   "devDependencies": {
-    "typescript": "^5.8.0",
     "@types/node": "^22.0.0",
-    "tsx": "^4.19.0"
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.0"
   }
 }

@@ -1,10 +1,10 @@
 /**
  * Glon OS — actor registry.
  *
- * Two actors: objectActor (one per object, sync peer) and storeActor
- * (singleton coordinator with SQLite index). Changes live on disk as
- * .pb files; actors compute state from disk on every wake.
- *
+ * Three actors: objectActor (one per object, sync peer), storeActor
+ * (singleton coordinator with SQLite index), and programActor
+ * (one per running program, manages state + tick loops).
+ * Changes live on disk as .pb files; actors compute state from disk on every wake.
  * Architecture (per Rivet best practices):
  *   state  → minimal persistent data (id, inbox/outbox)
  *   vars   → computed from disk on every wake (fields, blocks, heads, etc.)
@@ -17,7 +17,7 @@
 import { actor, event, setup } from "rivetkit";
 import { db } from "rivetkit/db";
 import type { Change, Operation, Value, ObjectRef, Block } from "./proto.js";
-import { encodeChange, encodeChangeForHashing, decodeChange, stringVal, displayValue } from "./proto.js";
+import { encodeChange, encodeChangeForHashing, decodeChange, stringVal, intVal, floatVal, boolVal, mapVal, listVal, displayValue } from "./proto.js";
 import { sha256, hexEncode, hexDecode, generateObjectId } from "./crypto.js";
 import {
 	createChange,
@@ -29,6 +29,7 @@ import {
 } from "./dag/change.js";
 import { computeState, findHeads, toSnapshot, type ObjectState, type BlockProvenance } from "./dag/dag.js";
 import { initDisk, writeChange, readChangeByHex, listChangeFilesForObject, deleteChangesForObject, diskStats } from "./disk.js";
+import { getValidator } from "./programs/runtime.js";
 
 // ── Types ────────────────────────────────────────────────────────
 
@@ -288,9 +289,21 @@ const objectActor = actor({
 			const decoded: Change[] = [];
 			for (const b64 of parts) {
 				const bytes = Buffer.from(b64, "base64");
-				const change = decodeChange(new Uint8Array(bytes));
+				decoded.push(decodeChange(new Uint8Array(bytes)));
+			}
+
+			// Run program validator if registered for this object type
+			const validator = getValidator(c.vars.typeKey);
+			if (validator) {
+				const result = validator(decoded);
+				if (!result.valid) {
+					throw new Error(`Validation rejected: ${result.error}`);
+				}
+			}
+
+			// Validation passed — write to disk
+			for (const change of decoded) {
 				writeChange(change);
-				decoded.push(change);
 			}
 			const result = loadFromDisk(c.state.id);
 			if (result) {
@@ -604,10 +617,75 @@ async function indexObject(c: any, computed: ObjectState): Promise<void> {
 	);
 }
 
+// ── Program Actor ─────────────────────────────────────────────────
+//
+// One instance per running program. Manages program-defined state,
+// action dispatch, and tick loops. The kernel treats program state as
+// an opaque JSON blob — programs own their own serialization.
+
+interface ProgramActorState {
+	programId: string;
+	programState: string; // JSON-serialized program state
+}
+
+const programActor = actor({
+	createState: (_c, input?: { programId: string }): ProgramActorState => ({
+		programId: input?.programId ?? "",
+		programState: "{}",
+	}),
+
+	events: {
+		programEvent: event<{ programId: string; channel: string; data: string }>(),
+	},
+
+	actions: {
+		/** Generic action dispatch: route to the program's named action. */
+		dispatch: async (c, action: string, argsJson: string): Promise<string> => {
+			const { dispatchActorAction } = await import("./programs/runtime.js");
+			const args: any[] = JSON.parse(argsJson);
+			const makeCtx = (state: Record<string, any>) => ({
+				client: c.client<typeof app>(),
+				store: c.client<typeof app>().storeActor.getOrCreate(["root"]),
+				resolveId: async (prefix: string) => {
+					const store = c.client<typeof app>().storeActor.getOrCreate(["root"]);
+					const resolved = await store.resolvePrefix(prefix);
+					return resolved || null;
+				},
+				stringVal, intVal, floatVal, boolVal, mapVal, listVal, displayValue,
+				listChangeFiles: () => [],
+				readChangeByHex: () => null,
+				hexEncode,
+				print: (msg: string) => console.log(msg),
+				randomUUID: () => generateObjectId(),
+				state,
+				emit: (channel: string, data: any) => {
+					c.broadcast("programEvent", {
+						programId: c.state.programId,
+						channel,
+						data: JSON.stringify(data),
+					});
+				},
+				programId: c.state.programId,
+				objectActor: (id: string) => c.client<typeof app>().objectActor.getOrCreate([id]),
+			});
+			const result = await dispatchActorAction(c.state.programId, action, args, makeCtx);
+			return JSON.stringify(result ?? null);
+		},
+
+		/** Get the program's current state (for diagnostics). */
+		getState: (c): string => c.state.programState,
+
+		/** Update persisted state (called by runtime after mutations). */
+		saveState: (c, stateJson: string) => {
+			c.state.programState = stateJson;
+		},
+	},
+});
+
 // ── Registry ─────────────────────────────────────────────────────
 
 export const app = setup({
-	use: { objectActor, storeActor },
+	use: { objectActor, storeActor, programActor },
 });
 
 app.start();

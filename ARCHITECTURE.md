@@ -170,47 +170,64 @@ src/programs/
     chat.js                  chat handler (function body)
 ```
 
-### Program Model: Current Limits and Next Tier
+### Program Model v2: Actors, Modules, Validators
 
-The current program model handles simple command handlers (ttt, chat)
-well: single JS function bodies, stateless per-call, discovered at
-startup. But real applications (GlonGodly, a party RPG built on Glon)
-expose gaps that will need to be closed:
+Programs can now be single-file (legacy) or multi-module with actor
+definitions, validators, and typed output channels.
 
-| Capability | Current | Needed |
-|---|---|---|
-| Module system | Single function body (eval) | Multi-file programs with imports |
-| State | Stateless per-call | Persistent per-program state (tick loops, sessions) |
-| Scheduling | None | Timers, periodic ticks (e.g. combat at 100ms) |
-| Events | None | Subscribe to object changes, fight completion |
-| Structured output | `print(string)` | Typed snapshots for web UIs |
-| Actor access | Untyped (`client` as unknown) | Typed program-level actor actions |
+#### Multi-Module Programs
 
-**Design direction (not yet implemented):**
+A program's `manifest` field (ValueMap) maps filenames to source strings.
+The runtime bundles them at load time via esbuild's virtual filesystem
+plugin, producing a single evaluable CJS bundle. The entry module
+`export default`s a `ProgramDef`:
 
-Programs should be able to register *actor actions* on the store or
-object actors without forking `index.ts`. A program object with
-a `handlers` map could declare named actions; the runtime loads
-them and installs them as callable endpoints. This keeps the kernel
-generic while letting programs extend the RPC surface.
+```typescript
+export default {
+  handler: async (cmd, args, ctx) => { ... },  // CLI handler
+  actor: { ... },                                // stateful actor
+  validator: (changes) => { ... },               // DAG validator
+  validatedTypes: ["character", "item"],         // types to validate
+};
+```
 
-For stateful programs (combat, lobbies), the natural Rivet pattern
-is a per-instance actor: the program declares an actor shape, the
-runtime creates instances as needed. State lives in Rivet's durable
-storage; the program code runs as the actor's action handlers.
+Single-file programs (no manifest) still work unchanged via function eval.
 
-For browser compatibility, programs that need to run on both server
-and client should separate pure logic (combat engine) from Glon I/O
-(field reads, change writes). The pure module imports nothing from
-Glon and can be loaded in any environment. The Glon bindings live
-in a separate module that the server runtime wires up.
+#### Program Actors
 
-**Validation.** GlonGodly's `validate.ts` demonstrates DAG-level
-validation of player-submitted changes: whitelist allowed fields,
-verify game rules, reject illegal mutations. This pattern should be
-generalized as *program validators* — functions that gate change
-acceptance per object type. The runtime would call the validator
-before writing a synced change to disk.
+Programs that export an `actor` definition get a managed lifecycle:
+
+- `createState()` — initial persistent state
+- `onCreate(ctx)` / `onDestroy(ctx)` — lifecycle hooks
+- `actions: { name: (ctx, ...args) => result }` — RPC endpoints
+- `tickMs` + `onTick(ctx)` — periodic tick loop
+
+The runtime creates one actor instance per program. Programs manage their
+own sub-instances (e.g. active fights) in state. The kernel's `programActor`
+provides RPC dispatch and event broadcast.
+
+#### ProgramContext v2
+
+The context object passed to all program code now includes:
+
+- `state` — program's persistent state (read/write)
+- `emit(channel, data)` — broadcast structured data to subscribers
+- `programId` — this program's Glon object ID
+- `objectActor(id)` — typed access to object actors
+
+#### Program Validators
+
+Programs register validators for specific object types. When `pushChanges`
+receives synced changes, the validator runs **before** writing to disk.
+Rejected changes throw and are not persisted. This generalizes GlonGodly's
+anti-cheat validation pattern.
+
+#### Typed Output (Events)
+
+The kernel's `programActor` has a `programEvent` Rivet event. Programs
+call `ctx.emit(channel, data)` which broadcasts `{ programId, channel,
+data }` to all subscribers. The CLI and web frontends subscribe
+independently and render the structured data.
 
 ## Data Flow
 

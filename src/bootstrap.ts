@@ -33,8 +33,24 @@ const SOURCES = [
 	"tsconfig.json",
 ];
 
-// Program definitions: handler file → object fields
-const PROGRAMS: { file: string; prefix: string; name: string; commands: Record<string, string> }[] = [
+// Single-file program definitions: handler file → object fields
+interface SingleFileProgram {
+	file: string;
+	prefix: string;
+	name: string;
+	commands: Record<string, string>;
+}
+
+// Multi-module program definitions: manifest → entry + modules
+interface ManifestProgram {
+	prefix: string;
+	name: string;
+	commands: Record<string, string>;
+	entry: string;
+	modules: Record<string, string>; // filename → relative file path
+}
+
+const PROGRAMS: SingleFileProgram[] = [
 	{
 		file: "src/programs/handlers/ttt.js",
 		prefix: "/ttt",
@@ -58,6 +74,20 @@ const PROGRAMS: { file: string; prefix: string; name: string; commands: Record<s
 			react: "React to a message",
 		},
 	},
+];
+
+const MANIFEST_PROGRAMS: ManifestProgram[] = [
+	// Example: multi-module programs go here.
+	// {
+	//   prefix: "/godly",
+	//   name: "GlonGodly",
+	//   commands: { fight: "Start a fight", char: "Show character" },
+	//   entry: "godly.ts",
+	//   modules: {
+	//     "godly.ts": "src/programs/godly/index.ts",
+	//     "combat.ts": "src/programs/godly/combat.ts",
+	//   },
+	// },
 ];
 
 const KIND_MAP: Record<string, string> = {
@@ -181,6 +211,61 @@ async function main() {
 		try {
 			const id = await store.create("program", fieldsJson, contentBase64);
 			console.log(`  OK    ${prog.prefix.padEnd(10)} ${prog.name.padEnd(16)} ${id.slice(0, 12)}...`);
+			created++;
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			console.log(`  ERR   ${prog.name} \u2014 ${msg}`);
+			skipped++;
+		}
+	}
+
+	// ── Manifest Programs ───────────────────────────────────────
+	if (MANIFEST_PROGRAMS.length > 0) {
+		console.log("\nSeeding manifest programs...\n");
+	}
+
+	for (const prog of MANIFEST_PROGRAMS) {
+		if (existingByKey.has(`program::${prog.prefix}`)) {
+			console.log(`  EXIST ${prog.prefix.padEnd(10)} ${prog.name.padEnd(16)} ${existingByKey.get(`program::${prog.prefix}`)!.slice(0, 12)}...`);
+			skipped++;
+			continue;
+		}
+
+		// Load all module files and build the manifest
+		const moduleEntries: Record<string, ReturnType<typeof stringVal>> = {};
+		let allOk = true;
+		for (const [filename, relPath] of Object.entries(prog.modules)) {
+			const absPath = resolve(projectRoot, relPath);
+			try {
+				const raw = readFileSync(absPath);
+				// Store module source as base64 in the manifest map
+				moduleEntries[filename] = stringVal(raw.toString("base64"));
+			} catch {
+				console.log(`  SKIP  ${prog.prefix} (missing ${relPath})`);
+				allOk = false;
+				break;
+			}
+		}
+		if (!allOk) { skipped++; continue; }
+
+		const commandEntries: Record<string, ReturnType<typeof stringVal>> = {};
+		for (const [k, v] of Object.entries(prog.commands)) {
+			commandEntries[k] = stringVal(v);
+		}
+
+		const fieldsJson = JSON.stringify({
+			name: stringVal(prog.name),
+			prefix: stringVal(prog.prefix),
+			commands: mapVal(commandEntries),
+			manifest: mapVal({
+				entry: stringVal(prog.entry),
+				modules: mapVal(moduleEntries),
+			}),
+		});
+
+		try {
+			const id = await store.create("program", fieldsJson);
+			console.log(`  OK    ${prog.prefix.padEnd(10)} ${prog.name.padEnd(16)} ${id.slice(0, 12)}... (${Object.keys(prog.modules).length} modules)`);
 			created++;
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
