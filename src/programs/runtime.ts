@@ -47,7 +47,7 @@ export interface ProgramContext {
 	// Utils
 	randomUUID: () => string;
 
-	// ── v2: Program actor extensions ──
+	// ── Program actor extensions ──
 
 	/** Program's persistent state (read/write, survives restarts). */
 	state: Record<string, any>;
@@ -95,9 +95,9 @@ export interface ProgramEntry {
 	prefix: string;
 	name: string;
 	commands: Record<string, string>;
-	/** Legacy handler — called directly for single-file programs. */
+	/** CLI handler. */
 	handler: (cmd: string, args: string[], ctx: ProgramContext) => Promise<void>;
-	/** Full definition (null for legacy single-file programs). */
+	/** Full definition. */
 	def: ProgramDef | null;
 }
 

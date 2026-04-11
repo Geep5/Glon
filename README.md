@@ -214,6 +214,7 @@ glon/
       handlers/
         ttt.ts                tic-tac-toe (single-module program)
         chat.ts               chat / messaging (single-module program)
+        agent.ts              LLM agent with DAG-backed conversation
   test/
     dag.test.ts               DAG replay determinism, falsy values, snapshots
     runtime.test.ts           program actor lifecycle, tick, emit

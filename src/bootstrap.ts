@@ -2,8 +2,8 @@
  * Bootstrap — seed Glon OS with its own source files and programs.
  *
  * Each source file becomes a Glon object created through the store actor.
- * Program handler files (src/programs/handlers/*.js) are created as
- * type=program objects with the handler source as content.
+ * Programs (src/programs/handlers/*.ts) are created as type=program objects
+ * with manifest fields mapping module filenames to source strings.
  *
  * Usage: npm run bootstrap / npx tsx src/bootstrap.ts
  */
@@ -29,6 +29,7 @@ const SOURCES = [
 	"src/programs/runtime.ts",
 	"src/programs/handlers/ttt.ts",
 	"src/programs/handlers/chat.ts",
+	"src/programs/handlers/agent.ts",
 	"package.json",
 	"tsconfig.json",
 ];
@@ -67,6 +68,20 @@ const PROGRAMS: ProgramDef[] = [
 		},
 		entry: "chat.ts",
 		modules: { "chat.ts": "src/programs/handlers/chat.ts" },
+	},
+	{
+		prefix: "/agent",
+		name: "Agent",
+		commands: {
+			new: "Create an agent",
+			ask: "Chat with agent",
+			history: "Conversation history",
+			config: "Set model/system/name",
+			read: "Peek at agent conversation",
+			inject: "Inject context from another agent",
+		},
+		entry: "agent.ts",
+		modules: { "agent.ts": "src/programs/handlers/agent.ts" },
 	},
 ];
 
