@@ -81,6 +81,23 @@ async function main() {
 
 	console.log("Bootstrapping Glon OS...\n");
 
+	// Build lookup of existing objects by type+name for idempotency.
+	const existingByKey = new Map<string, string>();
+	try {
+		const allRefs = await store.list() as { id: string; typeKey: string }[];
+		for (const ref of allRefs) {
+			const obj = await store.get(ref.id) as { fields?: Record<string, any> } | null;
+			if (!obj?.fields?.name?.stringValue) continue;
+			// Key: "type::name" for source files, "type::prefix" for programs
+			existingByKey.set(`${ref.typeKey}::${obj.fields.name.stringValue}`, ref.id);
+			if (obj.fields.prefix?.stringValue) {
+				existingByKey.set(`program::${obj.fields.prefix.stringValue}`, ref.id);
+			}
+		}
+	} catch {
+		// Store may be empty or not ready; proceed with creates.
+	}
+
 	let created = 0;
 	let skipped = 0;
 
@@ -88,6 +105,13 @@ async function main() {
 		const absPath = resolve(projectRoot, relPath);
 		const name = basename(relPath);
 		const kind = kindOf(relPath);
+
+		// Idempotency: skip if an object of this type+name already exists.
+		if (existingByKey.has(`${kind}::${name}`)) {
+			console.log(`  EXIST ${relPath.padEnd(28)} ${kind.padEnd(12)} ${existingByKey.get(`${kind}::${name}`)!.slice(0, 12)}...`);
+			skipped++;
+			continue;
+		}
 
 		let raw: Buffer;
 		try {
@@ -101,7 +125,6 @@ async function main() {
 		const lineCount = raw.toString("utf-8").split("\n").length;
 		const contentBase64 = raw.toString("base64");
 
-		// Fields: name, path, lines, size — serialized as JSON Record<string, Value>
 		const fieldsJson = JSON.stringify({
 			name: stringVal(name),
 			path: stringVal(relPath),
@@ -124,6 +147,13 @@ async function main() {
 	console.log("\nSeeding programs...\n");
 
 	for (const prog of PROGRAMS) {
+		// Idempotency: skip if a program with this prefix already exists.
+		if (existingByKey.has(`program::${prog.prefix}`)) {
+			console.log(`  EXIST ${prog.prefix.padEnd(10)} ${prog.name.padEnd(16)} ${existingByKey.get(`program::${prog.prefix}`)!.slice(0, 12)}...`);
+			skipped++;
+			continue;
+		}
+
 		const absPath = resolve(projectRoot, prog.file);
 		let raw: Buffer;
 		try {
@@ -154,7 +184,7 @@ async function main() {
 			created++;
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
-			console.log(`  ERR   ${prog.name} — ${msg}`);
+			console.log(`  ERR   ${prog.name} \u2014 ${msg}`);
 			skipped++;
 		}
 	}

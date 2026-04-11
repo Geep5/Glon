@@ -28,7 +28,7 @@ import {
 	changeId,
 } from "./dag/change.js";
 import { computeState, findHeads, toSnapshot, type ObjectState, type BlockProvenance } from "./dag/dag.js";
-import { initDisk, writeChange, readChangeByHex, listChangeFiles, diskStats } from "./disk.js";
+import { initDisk, writeChange, readChangeByHex, listChangeFilesForObject, deleteChangesForObject, diskStats } from "./disk.js";
 
 // ── Types ────────────────────────────────────────────────────────
 
@@ -71,11 +71,11 @@ export interface ObjectInput {
 
 /** Load all changes for an object from disk and compute state. */
 function loadFromDisk(objectId: string): { state: ObjectState; changeCount: number } | null {
-	const allHexIds = listChangeFiles();
+	const hexIds = listChangeFilesForObject(objectId);
 	const changes: Change[] = [];
-	for (const hexId of allHexIds) {
-		const change = readChangeByHex(hexId);
-		if (change && change.objectId === objectId) changes.push(change);
+	for (const hexId of hexIds) {
+		const change = readChangeByHex(hexId, objectId);
+		if (change) changes.push(change);
 	}
 	if (changes.length === 0) return null;
 	return { state: computeState(changes), changeCount: changes.length };
@@ -251,23 +251,13 @@ const objectActor = actor({
 		getHeads: (c): string[] => c.vars.headIds,
 
 		getAllChangeIds: (_c, objectId: string): string => {
-			const allHex = listChangeFiles();
-			const matching: string[] = [];
-			for (const hexId of allHex) {
-				const ch = readChangeByHex(hexId);
-				if (ch && ch.objectId === objectId) matching.push(hexId);
-			}
-			return matching.join(",");
+			return listChangeFilesForObject(objectId).join(",");
 		},
 
 		advertiseHeads: (_c, objectId: string, remoteChangeHexIds: string): string => {
 			const remoteSet = new Set(remoteChangeHexIds.split(",").filter(Boolean));
-			const allHex = listChangeFiles();
-			const localSet = new Set<string>();
-			for (const hexId of allHex) {
-				const ch = readChangeByHex(hexId);
-				if (ch && ch.objectId === objectId) localSet.add(hexId);
-			}
+			const localIds = listChangeFilesForObject(objectId);
+			const localSet = new Set(localIds);
 			const missingLocally: string[] = [];
 			for (const id of remoteSet) {
 				if (!localSet.has(id)) missingLocally.push(id);
@@ -279,11 +269,11 @@ const objectActor = actor({
 			return missingLocally.join(",") + "|" + missingRemotely.join(",");
 		},
 
-		getChanges: (_c, hexIds: string): string => {
+		getChanges: (c, hexIds: string): string => {
 			const ids = hexIds.split(",").filter(Boolean);
 			const results: string[] = [];
 			for (const hexId of ids) {
-				const change = readChangeByHex(hexId);
+				const change = readChangeByHex(hexId, c.state.id);
 				if (change) {
 					const encoded = encodeChange(change);
 					results.push(Buffer.from(encoded).toString("base64"));
@@ -292,17 +282,39 @@ const objectActor = actor({
 			return results.join(",");
 		},
 
-		pushChanges: (c, changesBase64: string) => {
+		pushChanges: async (c, changesBase64: string) => {
 			initDisk();
 			const parts = changesBase64.split(",").filter(Boolean);
+			const decoded: Change[] = [];
 			for (const b64 of parts) {
 				const bytes = Buffer.from(b64, "base64");
 				const change = decodeChange(new Uint8Array(bytes));
 				writeChange(change);
+				decoded.push(change);
 			}
 			const result = loadFromDisk(c.state.id);
 			if (result) {
 				Object.assign(c.vars, computedToVars(result.state, result.changeCount));
+			}
+			// Index synced changes in store's SQLite
+			const client = c.client<typeof app>();
+			const store = client.storeActor.getOrCreate(["root"]);
+			for (const change of decoded) {
+				await store.indexSyncedChange(
+					hexEncode(change.id),
+					change.objectId,
+					change.timestamp,
+					change.parentIds.map(p => hexEncode(p)),
+				);
+			}
+			if (result) {
+				await store.indexSyncedObject(
+					result.state.id,
+					result.state.typeKey,
+					result.state.deleted,
+					result.state.createdAt,
+					result.state.updatedAt,
+				);
 			}
 			c.broadcast("synced", { id: c.state.id, headIds: c.vars.headIds });
 		},
@@ -475,7 +487,15 @@ const storeActor = actor({
 			} catch {
 				// Actor already gone.
 			}
+			// Clean up SQLite (parents before changes due to FK-like dependency)
+			await c.db.execute(
+				"DELETE FROM change_parents WHERE change_id IN (SELECT id FROM changes WHERE object_id = ?)",
+				id,
+			);
+			await c.db.execute("DELETE FROM changes WHERE object_id = ?", id);
 			await c.db.execute("UPDATE objects SET deleted = 1 WHERE id = ?", id);
+			// Clean up disk
+			deleteChangesForObject(id);
 			c.state.objectCount = Math.max(0, c.state.objectCount - 1);
 			return true;
 		},
@@ -521,6 +541,33 @@ const storeActor = actor({
 				"SELECT id FROM changes WHERE object_id = ? AND is_head = 1", objectId,
 			)) as unknown as { id: string }[];
 			return rows.map(r => r.id);
+		},
+
+		indexSyncedChange: async (c, hexId: string, objectId: string, timestamp: number, parentHexIds: string[]): Promise<void> => {
+			await c.db.execute(
+				"INSERT OR IGNORE INTO changes (id, object_id, timestamp, is_head) VALUES (?, ?, ?, 1)",
+				hexId, objectId, timestamp,
+			);
+			for (const parentHex of parentHexIds) {
+				await c.db.execute(
+					"INSERT OR IGNORE INTO change_parents (change_id, parent_id) VALUES (?, ?)",
+					hexId, parentHex,
+				);
+				await c.db.execute("UPDATE changes SET is_head = 0 WHERE id = ?", parentHex);
+			}
+		},
+
+		indexSyncedObject: async (c, id: string, typeKey: string, deleted: boolean, createdAt: number, updatedAt: number): Promise<void> => {
+			await c.db.execute(
+				`INSERT INTO objects (id, type_key, deleted, created_at, updated_at)
+				 VALUES (?, ?, ?, ?, ?)
+				 ON CONFLICT(id) DO UPDATE SET
+				   type_key = excluded.type_key,
+				   deleted = excluded.deleted,
+				   created_at = excluded.created_at,
+				   updated_at = excluded.updated_at`,
+				id, typeKey, deleted ? 1 : 0, createdAt, updatedAt,
+			);
 		},
 	},
 });

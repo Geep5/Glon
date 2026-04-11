@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "npx tsx --watch src/index.ts",
     "bootstrap": "npx tsx src/bootstrap.ts",
-    "client": "npx tsx src/client.ts"
+    "client": "npx tsx src/client.ts",
+    "test": "npx tsx --test test/*.test.ts"
   },
   "dependencies": {
     "rivetkit": "^2.0.0",

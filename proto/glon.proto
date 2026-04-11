@@ -40,6 +40,10 @@ message Change {
   repeated Operation ops    = 4;  // mutations in this change
   int64  timestamp  = 5;    // unix ms
   string author     = 6;    // author/device identifier
+
+  // Snapshots are never source of truth — they are a replay optimization.
+  // The DAG of ops remains canonical; snapshots just let us skip prefix replay.
+  ObjectSnapshot snapshot = 7;  // optional state checkpoint (speeds up replay)
 }
 
 // Atomic mutation within a Change. Applied in order during replay.

@@ -28,6 +28,7 @@ const ObjectSnapshotType = root.lookupType("glon.ObjectSnapshot");
 // ── TypeScript interfaces ───────────────────────────────────────
 
 export interface Value {
+	kind?: string;
 	stringValue?: string;
 	intValue?: number;
 	floatValue?: number;
@@ -163,7 +164,7 @@ export interface Envelope {
 
 // ── Codec options ───────────────────────────────────────────────
 
-const DECODE_OPTS = { bytes: Uint8Array, longs: Number, defaults: true } as const;
+const DECODE_OPTS = { bytes: Uint8Array, longs: Number, defaults: true, oneofs: true } as const;
 
 // ── Change codec ────────────────────────────────────────────────
 
@@ -227,14 +228,28 @@ export function listVal(items: Value[]): Value {
 export type UnwrappedValue = string | number | boolean | Uint8Array | string[] | Record<string, Value> | Value[] | null;
 
 export function unwrapValue(v: Value): UnwrappedValue {
-	if (v.stringValue !== undefined && v.stringValue !== "") return v.stringValue;
-	if (v.intValue !== undefined && v.intValue !== 0) return v.intValue;
-	if (v.floatValue !== undefined && v.floatValue !== 0) return v.floatValue;
-	if (v.boolValue !== undefined && v.boolValue !== false) return v.boolValue;
-	if (v.bytesValue !== undefined && v.bytesValue.length > 0) return v.bytesValue;
-	if (v.listValue !== undefined) return v.listValue.values;
+	// Decoded values have a 'kind' discriminator from protobufjs oneofs:true
+	if (v.kind) {
+		switch (v.kind) {
+			case "stringValue": return v.stringValue!;
+			case "intValue": return v.intValue!;
+			case "floatValue": return v.floatValue!;
+			case "boolValue": return v.boolValue!;
+			case "bytesValue": return v.bytesValue!;
+			case "listValue": return v.listValue!.values;
+			case "mapValue": return v.mapValue!.entries;
+			case "valuesValue": return v.valuesValue!.items;
+		}
+	}
+	// Constructed values (via stringVal/intVal/etc.) — only one field is set
 	if (v.mapValue !== undefined) return v.mapValue.entries;
 	if (v.valuesValue !== undefined) return v.valuesValue.items;
+	if (v.listValue !== undefined) return v.listValue.values;
+	if (v.bytesValue !== undefined) return v.bytesValue;
+	if (v.stringValue !== undefined) return v.stringValue;
+	if (v.intValue !== undefined) return v.intValue;
+	if (v.floatValue !== undefined) return v.floatValue;
+	if (v.boolValue !== undefined) return v.boolValue;
 	return null;
 }
 

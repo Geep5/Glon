@@ -170,6 +170,48 @@ src/programs/
     chat.js                  chat handler (function body)
 ```
 
+### Program Model: Current Limits and Next Tier
+
+The current program model handles simple command handlers (ttt, chat)
+well: single JS function bodies, stateless per-call, discovered at
+startup. But real applications (GlonGodly, a party RPG built on Glon)
+expose gaps that will need to be closed:
+
+| Capability | Current | Needed |
+|---|---|---|
+| Module system | Single function body (eval) | Multi-file programs with imports |
+| State | Stateless per-call | Persistent per-program state (tick loops, sessions) |
+| Scheduling | None | Timers, periodic ticks (e.g. combat at 100ms) |
+| Events | None | Subscribe to object changes, fight completion |
+| Structured output | `print(string)` | Typed snapshots for web UIs |
+| Actor access | Untyped (`client` as unknown) | Typed program-level actor actions |
+
+**Design direction (not yet implemented):**
+
+Programs should be able to register *actor actions* on the store or
+object actors without forking `index.ts`. A program object with
+a `handlers` map could declare named actions; the runtime loads
+them and installs them as callable endpoints. This keeps the kernel
+generic while letting programs extend the RPC surface.
+
+For stateful programs (combat, lobbies), the natural Rivet pattern
+is a per-instance actor: the program declares an actor shape, the
+runtime creates instances as needed. State lives in Rivet's durable
+storage; the program code runs as the actor's action handlers.
+
+For browser compatibility, programs that need to run on both server
+and client should separate pure logic (combat engine) from Glon I/O
+(field reads, change writes). The pure module imports nothing from
+Glon and can be loaded in any environment. The Glon bindings live
+in a separate module that the server runtime wires up.
+
+**Validation.** GlonGodly's `validate.ts` demonstrates DAG-level
+validation of player-submitted changes: whitelist allowed fields,
+verify game rules, reject illegal mutations. This pattern should be
+generalized as *program validators* — functions that gate change
+acceptance per object type. The runtime would call the validator
+before writing a synced change to disk.
+
 ## Data Flow
 
 **Write:** Shell → Object Actor → create Change → write .pb to disk
