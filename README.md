@@ -8,9 +8,9 @@ Raw protobuf on disk, sync protocol over HTTP. Two primitives, nothing else.
 
 ```
 Disk                         Actors                        Shell
-~/.glon/changes/*.pb  ───>   durable Rivet actors   ───>   glon> /ttt move a3f 4
+~/.glon/changes/<oid>/*.pb   durable Rivet actors   ───>   glon> /ttt move a3f 4
 content-addressed            globally addressable           CLI commands
-protobuf binary              sync peers over HTTP
+per-object subdirectories    sync peers over HTTP
 ```
 
 **Changes, not state.** Every mutation is a `Change` — an immutable protobuf
@@ -19,8 +19,9 @@ state is computed by replaying the DAG from genesis to heads. Nothing is
 overwritten. The full history of every object is preserved.
 
 **Actors, not databases.** Each object is a [Rivet actor](https://rivet.gg/docs/actors) —
-durable, globally addressable over HTTP, hibernatable. Two actors in
-different regions sync by exchanging DAG heads and pushing missing changes.
+durable, globally addressable over HTTP, hibernatable. Three actor types:
+objectActor (one per object, sync peer), storeActor (singleton index),
+and programActor (manages program state, tick loops, and RPC dispatch).
 
 **Self-describing.** On bootstrap, the OS loads its own source files as
 objects. You can query the OS for the code that built it.
@@ -204,15 +205,18 @@ glon/
     dag/
       change.ts               change creation + content-address
       dag.ts                  topological sort + state computation
-    disk.ts                   raw .pb file storage
-    index.ts                  actor definitions + registry
+    disk.ts                   per-object .pb file storage
+    index.ts                  actor definitions (object, store, program)
     bootstrap.ts              seed source files + programs as objects
     client.ts                 CLI shell (discovers programs at startup)
     programs/
-      runtime.ts              program loader + dispatcher + ProgramContext
+      runtime.ts              module bundler, actor lifecycle, validators
       handlers/
         ttt.js                tic-tac-toe (self-contained handler)
         chat.js               chat / messaging (self-contained handler)
+  test/
+    dag.test.ts               DAG replay determinism, falsy values, snapshots
+    runtime.test.ts           program actor lifecycle, tick, emit
   package.json
   tsconfig.json
 ```
@@ -234,7 +238,9 @@ Tamper-evident. Deduplication is free.
 
 **Programs are protocol consumers.** Tic-tac-toe uses no special APIs.
 It reads fields, validates a move, writes fields. Any program on this
-OS works the same way.
+OS works the same way. Programs can be single-file (legacy eval) or
+multi-module (esbuild-bundled at load time) with actor definitions
+for persistent state, tick loops, and named RPC actions.
 
 **Programs don't change the OS.** `Value` is recursive — `ValueMap` and
 `ValueList` contain `Value`s, so programs express arbitrarily complex state
@@ -242,6 +248,11 @@ OS works the same way.
 `BlockContent` has a `CustomContent` escape hatch for program-defined block
 types (images, tables, embeds) the OS carries without interpreting.
 The protocol is stable; the complexity lives in programs, not the kernel.
+
+**Validators gate the DAG.** Programs register validator functions per
+object type. Synced changes are validated before writing to disk —
+rejected changes are never persisted. This enables DAG-level anti-cheat
+without modifying the sync protocol.
 
 **Snapshots for scale.** Every change is preserved, but replay doesn't
 start from genesis. A snapshot checkpoints the full state into the DAG.

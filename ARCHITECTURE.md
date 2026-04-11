@@ -170,7 +170,7 @@ src/programs/
     chat.js                  chat handler (function body)
 ```
 
-### Program Model v2: Actors, Modules, Validators
+### Program Model v2: Actors, Modules, Validators (Implemented)
 
 Programs can now be single-file (legacy) or multi-module with actor
 definitions, validators, and typed output channels.
