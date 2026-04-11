@@ -172,8 +172,9 @@ src/programs/
 
 ### Program Model v2: Actors, Modules, Validators (Implemented)
 
-Programs can now be single-file (legacy) or multi-module with actor
-definitions, validators, and typed output channels.
+All programs are module programs. Each program's manifest maps filenames
+to source; esbuild bundles them into a single CJS module that exports a
+`ProgramDef` with handler, actor, validator, and typed output channels.
 
 #### Multi-Module Programs
 
