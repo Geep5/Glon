@@ -27,22 +27,14 @@ const SOURCES = [
 	"src/bootstrap.ts",
 	"src/client.ts",
 	"src/programs/runtime.ts",
-	"src/programs/handlers/ttt.js",
-	"src/programs/handlers/chat.js",
+	"src/programs/handlers/ttt.ts",
+	"src/programs/handlers/chat.ts",
 	"package.json",
 	"tsconfig.json",
 ];
 
-// Single-file program definitions: handler file → object fields
-interface SingleFileProgram {
-	file: string;
-	prefix: string;
-	name: string;
-	commands: Record<string, string>;
-}
-
-// Multi-module program definitions: manifest → entry + modules
-interface ManifestProgram {
+// Program definitions: manifest → entry + modules
+interface ProgramDef {
 	prefix: string;
 	name: string;
 	commands: Record<string, string>;
@@ -50,9 +42,8 @@ interface ManifestProgram {
 	modules: Record<string, string>; // filename → relative file path
 }
 
-const PROGRAMS: SingleFileProgram[] = [
+const PROGRAMS: ProgramDef[] = [
 	{
-		file: "src/programs/handlers/ttt.js",
 		prefix: "/ttt",
 		name: "Tic-Tac-Toe",
 		commands: {
@@ -61,9 +52,10 @@ const PROGRAMS: SingleFileProgram[] = [
 			move: "Make a move",
 			history: "Move-by-move replay",
 		},
+		entry: "ttt.ts",
+		modules: { "ttt.ts": "src/programs/handlers/ttt.ts" },
 	},
 	{
-		file: "src/programs/handlers/chat.js",
 		prefix: "/chat",
 		name: "Chat",
 		commands: {
@@ -73,21 +65,9 @@ const PROGRAMS: SingleFileProgram[] = [
 			reply: "Reply to a message",
 			react: "React to a message",
 		},
+		entry: "chat.ts",
+		modules: { "chat.ts": "src/programs/handlers/chat.ts" },
 	},
-];
-
-const MANIFEST_PROGRAMS: ManifestProgram[] = [
-	// Example: multi-module programs go here.
-	// {
-	//   prefix: "/godly",
-	//   name: "GlonGodly",
-	//   commands: { fight: "Start a fight", char: "Show character" },
-	//   entry: "godly.ts",
-	//   modules: {
-	//     "godly.ts": "src/programs/godly/index.ts",
-	//     "combat.ts": "src/programs/godly/combat.ts",
-	//   },
-	// },
 ];
 
 const KIND_MAP: Record<string, string> = {
@@ -177,54 +157,6 @@ async function main() {
 	console.log("\nSeeding programs...\n");
 
 	for (const prog of PROGRAMS) {
-		// Idempotency: skip if a program with this prefix already exists.
-		if (existingByKey.has(`program::${prog.prefix}`)) {
-			console.log(`  EXIST ${prog.prefix.padEnd(10)} ${prog.name.padEnd(16)} ${existingByKey.get(`program::${prog.prefix}`)!.slice(0, 12)}...`);
-			skipped++;
-			continue;
-		}
-
-		const absPath = resolve(projectRoot, prog.file);
-		let raw: Buffer;
-		try {
-			raw = readFileSync(absPath);
-		} catch {
-			console.log(`  SKIP  ${prog.file} (not found)`);
-			skipped++;
-			continue;
-		}
-
-		const contentBase64 = raw.toString("base64");
-
-		// Build commands as a mapVal of string values
-		const commandEntries: Record<string, ReturnType<typeof stringVal>> = {};
-		for (const [k, v] of Object.entries(prog.commands)) {
-			commandEntries[k] = stringVal(v);
-		}
-
-		const fieldsJson = JSON.stringify({
-			name: stringVal(prog.name),
-			prefix: stringVal(prog.prefix),
-			commands: mapVal(commandEntries),
-		});
-
-		try {
-			const id = await store.create("program", fieldsJson, contentBase64);
-			console.log(`  OK    ${prog.prefix.padEnd(10)} ${prog.name.padEnd(16)} ${id.slice(0, 12)}...`);
-			created++;
-		} catch (err) {
-			const msg = err instanceof Error ? err.message : String(err);
-			console.log(`  ERR   ${prog.name} \u2014 ${msg}`);
-			skipped++;
-		}
-	}
-
-	// ── Manifest Programs ───────────────────────────────────────
-	if (MANIFEST_PROGRAMS.length > 0) {
-		console.log("\nSeeding manifest programs...\n");
-	}
-
-	for (const prog of MANIFEST_PROGRAMS) {
 		if (existingByKey.has(`program::${prog.prefix}`)) {
 			console.log(`  EXIST ${prog.prefix.padEnd(10)} ${prog.name.padEnd(16)} ${existingByKey.get(`program::${prog.prefix}`)!.slice(0, 12)}...`);
 			skipped++;

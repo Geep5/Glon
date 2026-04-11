@@ -212,8 +212,8 @@ glon/
     programs/
       runtime.ts              module bundler, actor lifecycle, validators
       handlers/
-        ttt.js                tic-tac-toe (self-contained handler)
-        chat.js               chat / messaging (self-contained handler)
+        ttt.ts                tic-tac-toe (single-module program)
+        chat.ts               chat / messaging (single-module program)
   test/
     dag.test.ts               DAG replay determinism, falsy values, snapshots
     runtime.test.ts           program actor lifecycle, tick, emit

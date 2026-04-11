@@ -1,17 +1,13 @@
 /**
  * Program runtime — loads, compiles, and manages program objects.
  *
- * Programs are Glon objects of type "program". They can be:
- *
- *   1. **Legacy (single-file):** Content is a JS function body evaluated via
- *      AsyncFunction("cmd", "args", "ctx", source). Receives (cmd, args, ctx).
- *
- *   2. **Module programs:** A `manifest` field (ValueMap) maps filenames to
- *      source strings. The `entry` field names the module that `export default`s
- *      the program definition. Bundled at load time via esbuild.
+ * Programs are Glon objects of type "program" with a `manifest` field
+ * (ValueMap) mapping filenames to source strings. The `entry` field names
+ * the module that `export default`s the program definition. Bundled at
+ * load time via esbuild.
  *
  * Programs may export:
- *   - `handler(cmd, args, ctx)` — command handler (legacy + new)
+ *   - `handler(cmd, args, ctx)` — CLI command handler
  *   - `actor` — actor definition with state, actions, lifecycle, tick
  *   - `validator(changes)` — DAG change validator per object type
  *   - `validatedTypes` — array of type keys the validator applies to
@@ -21,12 +17,6 @@ import type { Value, Change, ObjectRef } from "../proto.js";
 import * as proto from "../proto.js";
 import * as cryptoMod from "../crypto.js";
 import * as esbuild from "esbuild";
-
-// ── AsyncFunction constructor ───────────────────────────────────
-
-const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor as new (
-	...args: string[]
-) => (...args: any[]) => Promise<any>;
 
 // ── Types ───────────────────────────────────────────────────────
 
@@ -276,29 +266,6 @@ async function bundleModuleSet(ms: ModuleSet): Promise<string> {
 // ── Compilation ─────────────────────────────────────────────────
 
 /**
- * Compile a legacy single-file program (function body eval).
- * Returns a ProgramDef with just a handler.
- */
-function compileLegacy(source: string, name: string): ProgramDef | null {
-	try {
-		const rawHandler = new AsyncFunction("cmd", "args", "ctx", source) as
-			(cmd: string, args: string[], ctx: ProgramContext) => Promise<void>;
-		return {
-			handler: async (cmd, args, ctx) => {
-				try {
-					await rawHandler(cmd, args, ctx);
-				} catch (err: any) {
-					ctx.print("Error: " + (err.message ?? String(err)));
-				}
-			},
-		};
-	} catch (err: any) {
-		console.warn(`[program] Failed to compile "${name}": ${err.message}`);
-		return null;
-	}
-}
-
-/**
  * Compile a module-set program (esbuild bundle + eval).
  * The entry module must `export default` a ProgramDef.
  */
@@ -539,28 +506,12 @@ export async function loadPrograms(
 		const name = extractString(fields.name) ?? prefix;
 		const commands = extractCommands(fields.commands);
 
-		// Try module-set path first (manifest field)
+		// Extract and compile the module set
 		const moduleSet = await extractModuleSet(fields, store);
-		let def: ProgramDef | null = null;
+		if (!moduleSet) continue;
 
-		if (moduleSet) {
-			// Module program: bundle and eval
-			def = await compileModuleProgram(moduleSet, name);
-		} else {
-			// Legacy single-file: eval function body from content
-			const contentB64: string | undefined = obj.content;
-			if (!contentB64) continue;
-
-			let source: string;
-			try {
-				source = Buffer.from(contentB64, "base64").toString("utf-8");
-			} catch {
-				continue;
-			}
-			if (!source.trim()) continue;
-
-			def = compileLegacy(source, name);
-		}
+		const def = await compileModuleProgram(moduleSet, name);
+		if (!def) continue;
 
 		if (!def) continue;
 
