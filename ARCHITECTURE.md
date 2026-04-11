@@ -1,11 +1,11 @@
-# Glon OS -- Architecture
+# Glon OS — Architecture
 
 ## Layers
 
 ```
 +---------------------------------------------------------------+
 |  Programs (src/programs/)                                     |
-|  Tic-tac-toe, future apps. Pure logic on objects.             |
+|  Agent, tic-tac-toe, chat, games. Pure logic on objects.      |
 +------------------------------+--------------------------------+
 |  Shell (src/client.ts)       |  Bootstrap (src/bootstrap.ts)  |
 |  CLI over Rivet HTTP         |  Seed OS source as objects     |
@@ -15,7 +15,7 @@
 |  Creates/destroys object actors                               |
 +------------------------------+--------------------------------+
 |  Object Actors (one per entity)                               |
-  Ephemeral vars: recomputed from disk on every wake             |
+|  Ephemeral vars: recomputed from disk on every wake           |
 |  Sync protocol: advertiseHeads, pushChanges, getChanges       |
 |  IPC: sendMessage, receiveMessage                             |
 +------------------------------+--------------------------------+
@@ -23,7 +23,7 @@
 |  Topological sort, state computation, content-addressing      |
 +------------------------------+--------------------------------+
 |  Disk (src/disk.ts)          |  Proto (src/proto.ts)          |
-|  ~/.glon/changes/<hash>.pb   |  Typed encode/decode           |
+|  ~/.glon/changes/<oid>/*.pb  |  Typed encode/decode           |
 +------------------------------+--------------------------------+
 ```
 
@@ -87,13 +87,17 @@ The sync handshake:
 
 ```
 ~/.glon/
-  changes/              one .pb file per change
-    <sha256-hex>.pb     raw protobuf wire bytes
+  changes/
+    <object-id>/            one subdirectory per object
+      <sha256-hex>.pb       raw protobuf wire bytes
 ```
 
 The `.pb` files are the source of truth. The SQLite index in the
 store actor is derived — it tracks objects, changes, and DAG edges
 for efficient queries. Delete the index and it rebuilds from disk.
+
+Per-object subdirectories keep actor wake O(own changes) — an actor
+reads only its own directory, not the full change set.
 
 ## Actor State Model
 
@@ -133,22 +137,24 @@ fresh from disk.
 
 ## Programs
 
-Programs are Glon objects. They sync between instances, have full
-change history, and are individually addressable -- just like any
-other object on the OS.
+Programs are Glon objects with type `program`. They sync between
+instances, have full change history, and are individually addressable.
 
-A program object has type `program` and three key fields:
+### Object Shape
 
 | Field | Type | Purpose |
 |---|---|---|
-| `name` | string | Display name ("Tic-Tac-Toe") |
-| `prefix` | string | Shell command prefix ("/ttt") |
+| `name` | string | Display name ("Agent") |
+| `prefix` | string | Shell command prefix ("/agent") |
 | `commands` | ValueMap | Subcommand names to descriptions |
+| `manifest` | ValueMap | Module filenames → base64 source |
 
-A program object has type `program` and a `manifest` field (ValueMap) that
-maps filenames to base64-encoded source strings. The runtime bundles them
-at load time via esbuild's virtual filesystem plugin, producing a single
-evaluable CJS bundle. The entry module `export default`s a `ProgramDef`:
+### Compilation
+
+The `manifest` maps filenames to source strings. At load time,
+the runtime feeds them into esbuild's virtual filesystem plugin and
+produces a single CJS bundle. The entry module `export default`s
+a `ProgramDef`:
 
 ```typescript
 export default {
@@ -159,30 +165,19 @@ export default {
 };
 ```
 
-Simple programs (ttt, chat) have one module in their manifest. Complex
-programs (godly) have many. Same path either way — no special cases.
+Simple programs (ttt, chat, agent) have one module. Complex programs
+(godly) have many. Same compilation path — no special cases.
 
 **Discovery.** The shell calls `store.list("program")` at startup,
 extracts each program's manifest, bundles the modules, and compiles
 handlers. Zero hardcoded program commands in the shell.
 
-**Execution.** When you type `/ttt move a3f8 4`, the shell matches
-the `/ttt` prefix, calls the handler with `("move", ["a3f8", "4"], ctx)`.
-The handler validates, calls actor actions, and prints output.
+**Execution.** When you type `/agent ask 9b2e Hello`, the shell
+matches the `/agent` prefix, calls the handler with
+`("ask", ["9b2e", "Hello"], ctx)`. The handler validates, calls
+actor actions, and prints output.
 
-### Actors, Modules, Validators
-
-other content.
-
-```
-src/programs/
-  runtime.ts                 module bundler, actor lifecycle, validators
-  handlers/
-    ttt.ts                   tic-tac-toe (single-module program)
-    chat.ts                  chat / messaging (single-module program)
-```
-
-#### Program Actors
+### Program Actors
 
 Programs that export an `actor` definition get a managed lifecycle:
 
@@ -191,32 +186,46 @@ Programs that export an `actor` definition get a managed lifecycle:
 - `actions: { name: (ctx, ...args) => result }` — RPC endpoints
 - `tickMs` + `onTick(ctx)` — periodic tick loop
 
-The runtime creates one actor instance per program. Programs manage their
-own sub-instances (e.g. active fights) in state. The kernel's `programActor`
-provides RPC dispatch and event broadcast.
+The runtime creates one actor instance per program. Programs manage
+their own sub-instances (e.g. active fights) in state. The kernel's
+`programActor` provides RPC dispatch and event broadcast.
 
-#### ProgramContext
+### ProgramContext
 
-The context object passed to all program code includes:
+The context object passed to all program code:
 
-- `state` — program's persistent state (read/write)
-- `emit(channel, data)` — broadcast structured data to subscribers
-- `programId` — this program's Glon object ID
-- `objectActor(id)` — typed access to object actors
+| Field | Purpose |
+|---|---|
+| `store` | Actor client for CRUD, list, search |
+| `state` | Program's persistent state (read/write) |
+| `emit(channel, data)` | Broadcast structured events |
+| `programId` | This program's Glon object ID |
+| `objectActor(id)` | Typed access to any object actor |
+| `proto` | Encode/decode helpers (`stringVal`, `mapVal`, etc.) |
+| `print(msg)` | Output to the shell |
 
-#### Program Validators
+### Validators
 
-Programs register validators for specific object types. When `pushChanges`
-receives synced changes, the validator runs **before** writing to disk.
-Rejected changes throw and are not persisted. This generalizes GlonGodly's
-anti-cheat validation pattern.
+Programs register validators for specific object types. When
+`pushChanges` receives synced changes, the validator runs **before**
+writing to disk. Rejected changes throw and are not persisted.
 
-#### Typed Output (Events)
+### Typed Output (Events)
 
-The kernel's `programActor` has a `programEvent` Rivet event. Programs
-call `ctx.emit(channel, data)` which broadcasts `{ programId, channel,
-data }` to all subscribers. The CLI and web frontends subscribe
-independently and render the structured data.
+The kernel's `programActor` has a `programEvent` Rivet event.
+Programs call `ctx.emit(channel, data)` which broadcasts
+`{ programId, channel, data }` to all subscribers.
+
+### Source Layout
+
+```
+src/programs/
+  runtime.ts                 module bundler, actor lifecycle, validators
+  handlers/
+    ttt.ts                   tic-tac-toe
+    chat.ts                  chat / messaging
+    agent.ts                 LLM agent with DAG-backed conversation
+```
 
 ## Data Flow
 
@@ -232,11 +241,9 @@ disk for this object → replays DAG → vars populated → ready
 **Sync:** Actor A.getAllChangeIds() → Actor B.getAllChangeIds() →
 set difference → exchange missing changes → both reload vars
 
+## Extensibility
 
-## Program Extensibility
-
-Programs on Glon don't need to modify `glon.proto` to express complex
-state. Two primitives make this possible:
+Programs express complex state without modifying `glon.proto`:
 
 ### Recursive Values
 
@@ -259,21 +266,8 @@ Value {
 }
 ```
 
-A browser program stores tab state as flat and nested fields:
-
-```
-fields:
-  url:       string("https://example.com")
-  title:     string("Example")
-  history:   values_value([string("url1"), string("url2")])
-  cookies:   map_value({
-               "session": string("abc123"),
-               "prefs":   map_value({ "theme": string("dark") })
-             })
-```
-
 The OS never interprets these structures. The DAG replay code does
-`state.fields.set(key, value)` -- it doesn't look inside the Value.
+`state.fields.set(key, value)` — it doesn't look inside the Value.
 Programs define their own conventions on top of the typed primitives.
 
 ### Custom Block Content
@@ -281,13 +275,6 @@ Programs define their own conventions on top of the typed primitives.
 `BlockContent` has an escape hatch for program-defined block types:
 
 ```
-BlockContent {
-  oneof content {
-    TextContent   text   = 1;
-    CustomContent custom = 2;
-  }
-}
-
 CustomContent {
   string content_type          = 1;  // e.g. "image", "table", "embed"
   bytes  data                  = 2;  // program-encoded payload
@@ -295,26 +282,22 @@ CustomContent {
 }
 ```
 
-A document editor adds image blocks. A spreadsheet adds cell blocks.
-The OS stores them in the block tree, syncs them, content-addresses
-them. If a peer doesn't know how to render a `CustomContent` block,
-it falls back to displaying the `meta` map.
+The OS stores, content-addresses, syncs, and replays custom blocks
+through the standard Change DAG. Peers that don't understand a
+`CustomContent` block fall back to displaying the `meta` map.
 
-### Why not program-defined protobufs?
+### Why Not Program-Defined Protobufs?
 
-Two approaches were considered and rejected:
+**Custom Operations (programs bring their own reducers):** The OS
+would need each program's code to replay the DAG. A peer without
+the program couldn't compute state. Breaks "any peer can recompute
+from changes alone."
 
-**Custom Operations (programs bring their own reducers).** The OS
-would need each program's code to replay the DAG and compute state.
-A peer without the program installed couldn't compute state. This
-breaks "any peer can recompute from changes alone" -- Glon's core
-property.
-
-**Custom Value schemas (opaque bytes with type URLs).** The OS
-could carry but not inspect the data. Loses the ability to index
-fields, query values, or diff state.
+**Custom Value schemas (opaque bytes with type URLs):** The OS
+could carry but not inspect the data. Loses field indexing, value
+queries, and state diffing.
 
 Recursive Value avoids both traps: the OS always replays the DAG
 (Operations are unchanged), always inspects values (typed all the
 way down), and programs compose arbitrary structures from a fixed
-set of primitives. `glon.proto` is modified once, then stable.
+set of primitives. `glon.proto` is stable.
