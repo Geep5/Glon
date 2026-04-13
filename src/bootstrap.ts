@@ -27,6 +27,9 @@ const SOURCES = [
 	"src/bootstrap.ts",
 	"src/client.ts",
 	"src/programs/runtime.ts",
+	"src/programs/handlers/crud.ts",
+	"src/programs/handlers/inspect.ts",
+	"src/programs/handlers/ipc.ts",
 	"src/programs/handlers/ttt.ts",
 	"src/programs/handlers/chat.ts",
 	"src/programs/handlers/agent.ts",
@@ -47,6 +50,49 @@ interface ProgramDef {
 }
 
 const PROGRAMS: ProgramDef[] = [
+	{
+		prefix: "/crud",
+		name: "CRUD Operations",
+		commands: {
+			create: "Create an object",
+			list: "List objects",
+			get: "Get object details",
+			set: "Set a field value",
+			delete: "Delete an object",
+			search: "Search objects",
+		},
+		entry: "crud.ts",
+		modules: { "crud.ts": "src/programs/handlers/crud.ts" },
+	},
+	{
+		prefix: "/inspect",
+		name: "DAG Inspector",
+		commands: {
+			history: "Object change history",
+			change: "Inspect a change",
+			heads: "Current DAG heads",
+			changes: "List all changes",
+			snapshot: "Create snapshot",
+			sync: "Sync two objects",
+			remote: "Push/pull remote",
+			info: "Store info",
+			disk: "Disk usage",
+		},
+		entry: "inspect.ts",
+		modules: { "inspect.ts": "src/programs/handlers/inspect.ts" },
+	},
+	{
+		prefix: "/ipc",
+		name: "Inter-Process Comm",
+		commands: {
+			send: "Send a message",
+			inbox: "View inbox",
+			outbox: "View outbox",
+			clear: "Clear messages",
+		},
+		entry: "ipc.ts",
+		modules: { "ipc.ts": "src/programs/handlers/ipc.ts" },
+	},
 	{
 		prefix: "/ttt",
 		name: "Tic-Tac-Toe",

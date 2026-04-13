@@ -130,6 +130,90 @@ glon> /agent inject c41a 9b2e
 glon> /agent ask c41a What did the analyst get wrong?
 ```
 
+### Garbage Collection
+
+Programs declare retention policies for their objects. The GC system
+respects these while cleaning up old changes to manage disk space.
+
+```
+glon> /gc policies
+  chat:     30d (keep if referenced)
+  agent:    forever
+  game:     7d or 100 objects max
+
+glon> /gc stats
+  Total: 23,847 changes (142 MB)
+  By age:
+    < 1d:   1,234 changes
+    < 7d:   5,678 changes
+    < 30d:  12,456 changes
+    > 30d:  4,479 changes (eligible for GC)
+
+glon> /gc run --dry-run
+  Would remove:
+    chat:    234 objects (> 30 days)
+    game:    45 objects (> 100 count)
+    unknown: 89 objects (no policy)
+
+glon> /gc protect a3f8b2c1
+  Protected object from garbage collection
+```
+
+### Accounts & Permissions
+
+Multi-user support with role-based access control. Programs can only
+modify objects they own or have permission to access.
+
+```
+glon> /accounts whoami
+  Not logged in (anonymous)
+
+glon> /accounts create alice --role user
+  Created account: alice
+
+glon> /accounts login alice
+  Logged in as: alice (user)
+
+glon> /accounts grant bob read a3f8b2c1
+  Granted read permission to bob for object a3f8b2c1
+
+glon> /accounts check write 9b2e4f17
+  ✗ No write permission for object 9b2e4f17
+```
+
+### P2P Sync
+
+Peer-to-peer synchronization without central servers. Uses mDNS for
+local discovery and HTTP for cross-network sync.
+
+```
+# Instance 1 (port 6420)
+glon> /sync discover
+  Starting mDNS discovery...
+  Found peer: glon-b.local:6421
+
+glon> /sync peers
+  glon-b.local:6421  (reputation: 95, last: 2s ago)
+  192.168.1.5:6422   (reputation: 82, last: 5m ago)
+
+glon> /sync broadcast
+  Broadcasting changes to 2 peers...
+  Sent 45 changes to glon-b.local:6421
+  Sent 12 changes to 192.168.1.5:6422
+
+# Instance 2 (port 6421)
+glon> /sync add http://localhost:6420
+  Added peer: localhost:6420
+
+glon> /sync sync a3f8b2c1
+  Syncing object a3f8b2c1...
+  Received 23 new changes from localhost:6420
+  Object is now up to date
+```
+
+Peers maintain reputation scores and exchange Bloom filters for
+efficient selective sync. Objects automatically sync when accessed.
+
 ## The Protocol
 
 **1. Change DAG** — every mutation is a `Change` protobuf message,
@@ -183,6 +267,8 @@ primitives.
 
 ## Shell Commands
 
+Core commands built into the shell:
+
 | Command | Description |
 |---|---|
 | `/create <type> [name]` | Create an object |
@@ -200,6 +286,22 @@ primitives.
 | `/remote pull\|push <endpoint> <id>` | Cross-instance sync |
 | `/snapshot <id>` | Checkpoint state (speeds up replay) |
 | `/info` / `/disk` / `/help` | System info |
+
+## Program Commands
+
+Programs loaded dynamically from the store (use `/help` to see all):
+
+| Program | Commands | Description |
+|---|---|---|
+| `/ttt` | `new`, `board`, `move`, `history` | Tic-Tac-Toe game |
+| `/chat` | `new`, `send`, `read`, `reply`, `react` | Chat rooms and messaging |
+| `/agent` | `new`, `ask`, `history`, `config`, `inject` | LLM agents with memory |
+| `/gc` | `run`, `policies`, `set`, `protect`, `stats` | Garbage collection |
+| `/accounts` | `whoami`, `login`, `create`, `grant`, `check` | User authentication |
+| `/sync` | `discover`, `peers`, `add`, `sync`, `broadcast` | P2P synchronization |
+
+Programs are Glon objects that sync between instances. Add new programs
+by creating objects with type `program`.
 
 ## Project Structure
 
@@ -222,6 +324,9 @@ glon/
         ttt.ts                tic-tac-toe
         chat.ts               chat / messaging
         agent.ts              LLM agent with DAG-backed conversation
+        gc.ts                 garbage collection with retention policies
+        accounts.ts           multi-user authentication & permissions
+        sync.ts               P2P synchronization & discovery
   test/
     dag.test.ts               DAG replay determinism, falsy values, snapshots
     runtime.test.ts           program actor lifecycle, tick, emit

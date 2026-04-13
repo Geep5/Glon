@@ -5,7 +5,8 @@
 ```
 +---------------------------------------------------------------+
 |  Programs (src/programs/)                                     |
-|  Agent, tic-tac-toe, chat, games. Pure logic on objects.      |
+|  Agent, tic-tac-toe, chat, games, GC, accounts, P2P sync.     |
+|  Pure logic on objects with security and retention policies.   |
 +------------------------------+--------------------------------+
 |  Shell (src/client.ts)       |  Bootstrap (src/bootstrap.ts)  |
 |  CLI over Rivet HTTP         |  Seed OS source as objects     |
@@ -64,7 +65,16 @@ operations in order:
 
 ## Sync Protocol
 
-Typed protobuf `Envelope` messages between actors:
+### P2P Architecture
+
+The sync system operates peer-to-peer without central servers:
+
+**Discovery:** mDNS for local network, manual addition for cross-network
+**Transport:** HTTP with protobuf `Envelope` messages
+**Selection:** Bloom filters for efficient content advertising
+**Trust:** Reputation scoring based on successful syncs
+
+### Messages
 
 | Message | Purpose |
 |---|---|
@@ -75,13 +85,32 @@ Typed protobuf `Envelope` messages between actors:
 | `ObjectSubscribe` | "Notify me when this object changes" |
 | `ObjectEvent` | "This object changed, here are the new heads + changes" |
 | `AppMessage` | Free-form IPC between objects |
+| `BloomFilter` | "Here's what content I have" (space-efficient) |
+| `PeerAnnounce` | "I'm a Glon peer at this endpoint" (mDNS) |
 
-The sync handshake:
-1. Both sides exchange their full change ID sets
-2. Compute set difference (what each is missing)
-3. Fetch missing changes from the peer
-4. Push missing changes to the peer
+### Sync Handshake
+
+1. Peers exchange Bloom filters (probabilistic content sets)
+2. Compute likely differences (what each might be missing)
+3. Request specific missing changes by hash
+4. Push confirmed missing changes to the peer
 5. Both recompute state from the merged DAG
+6. Update peer reputation based on sync success
+
+### Peer Management
+
+```typescript
+interface Peer {
+  id: string;           // SHA-256 of endpoint
+  endpoint: string;     // HTTP URL
+  lastSeen: number;     // Unix timestamp
+  reputation: number;   // 0-100 score
+  bloomFilter: Uint8Array;  // Compressed content set
+}
+```
+
+Peers track reputation: successful syncs increase score, failures
+decrease. High-reputation peers are preferred for sync operations.
 
 ## Storage
 
@@ -225,7 +254,95 @@ src/programs/
     ttt.ts                   tic-tac-toe
     chat.ts                  chat / messaging
     agent.ts                 LLM agent with DAG-backed conversation
+    gc.ts                    garbage collection with retention policies
+    accounts.ts              multi-user authentication & permissions
+    sync.ts                  P2P synchronization & discovery
 ```
+
+## Security Model
+
+### Accounts & Authentication
+
+Users authenticate with username/password, stored as bcrypt hashes.
+Sessions use JWT tokens with configurable expiry.
+
+```typescript
+interface Account {
+  id: string;              // UUID
+  username: string;        // Unique identifier
+  passwordHash: string;    // bcrypt hash
+  role: "admin" | "user" | "guest";
+  createdAt: number;       // Unix timestamp
+  permissions: Permission[];
+}
+```
+
+### Permissions
+
+Object access is controlled by ownership and explicit permissions:
+
+| Permission | Scope | Effect |
+|---|---|---|
+| `read` | Per-object | View object state and history |
+| `write` | Per-object | Modify fields and content |
+| `delete` | Per-object | Soft-delete the object |
+| `admin` | Global | All operations on all objects |
+
+Programs can only modify objects they created or have permission
+to access. The store actor enforces permissions before mutations.
+
+### Object Ownership
+
+Every object tracks its owner (the account that created it):
+
+```typescript
+interface ObjectMetadata {
+  ownerId: string;         // Account ID
+  createdBy: string;       // Program that created it
+  sharedWith: string[];    // Account IDs with access
+}
+```
+
+## Garbage Collection
+
+### Retention Policies
+
+Programs declare how long their objects should be kept:
+
+```typescript
+interface RetentionPolicy {
+  maxAge?: string;         // "30d", "1y", "forever"
+  maxCount?: number;       // Keep N most recent
+  maxSize?: number;        // Total size in bytes
+  keepIfReferenced?: boolean;  // Preserve if other objects link
+}
+```
+
+The GC program (`/gc`) enforces these policies, cleaning up old
+changes while preserving object integrity.
+
+### GC Algorithm
+
+1. **Scan:** Enumerate all objects and their retention policies
+2. **Mark:** Identify changes eligible for deletion based on:
+   - Age exceeds `maxAge`
+   - Count exceeds `maxCount` (keep newest)
+   - Total size exceeds `maxSize`
+3. **Sweep:** Delete eligible changes unless:
+   - Object is protected (`/gc protect`)
+   - Object is referenced by active objects
+   - Change is part of current heads
+
+### Protected Objects
+
+Users can protect important objects from GC:
+
+```
+/gc protect <id>    # Never delete this object
+/gc unprotect <id>  # Allow normal GC rules
+```
+
+Bootstrap source files and core programs are auto-protected.
 
 ## Data Flow
 
