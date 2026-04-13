@@ -1,9 +1,9 @@
 /**
- * Glon OS CLI shell — minimal program loader.
+ * Glon OS CLI shell — pure program loader.
  *
- * The shell has no built-in commands except /help. Everything else is
- * a program loaded from the store. Programs are Glon objects that can
- * be created, modified, synced, and versioned like any other object.
+ * The shell has ZERO built-in commands. Everything is a program loaded
+ * from the store, even /help. Programs are Glon objects that can be
+ * created, modified, synced, and versioned like any other object.
  *
  * Usage: npm run client / npx tsx src/client.ts
  */
@@ -76,31 +76,6 @@ function buildContext(overrides?: Partial<ProgramContext>): ProgramContext {
 	};
 }
 
-/** The only built-in command: show available programs. */
-async function cmdHelp(): Promise<void> {
-	if (programs.length === 0) {
-		console.log(red("No programs loaded!"));
-		console.log(dim("Run 'npm run bootstrap' to seed the initial programs."));
-		console.log(dim("Store actor is at: ") + ENDPOINT);
-		return;
-	}
-
-	console.log(bold("Available programs:"));
-	console.log("");
-
-	for (const prog of programs) {
-		console.log(cyan(prog.prefix.padEnd(14)) + prog.name);
-		if (prog.commands && Object.keys(prog.commands).length > 0) {
-			for (const [cmd, desc] of Object.entries(prog.commands)) {
-				console.log("  " + dim(cmd.padEnd(12)) + desc);
-			}
-		}
-	}
-
-	console.log("");
-	console.log(dim("Type a program prefix to see its commands."));
-	console.log(dim("Example: /crud create page MyPage"));
-}
 
 // ── Main REPL ────────────────────────────────────────────────────
 async function main() {
@@ -149,25 +124,18 @@ async function main() {
 			return;
 		}
 
-		// Special case: /help is the only built-in
-		if (input === "/help" || input === "/h" || input === "help") {
-			await cmdHelp();
-			rl.prompt();
-			return;
-		}
-
-		// Special case: exit/quit
+		// Special case: exit/quit (the ONLY special case)
 		if (input === "exit" || input === "quit" || input === "/exit" || input === "/quit") {
 			process.exit(0);
 		}
 
 		// Everything else goes to programs
 		const ctx = buildContext();
-		const handled = await dispatchProgram(input, programs, ctx);
+		const handled = await dispatchProgram(programs, input, ctx);
 
 		if (!handled) {
 			console.log(red("Unknown command: ") + input);
-			console.log(dim("Type /help to see available programs."));
+			console.log(dim("Available programs: " + programs.map(p => p.prefix).join(", ")));
 		}
 
 		rl.prompt();

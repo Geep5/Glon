@@ -560,6 +560,11 @@ export async function dispatchProgram(
 	input: string,
 	ctx: ProgramContext,
 ): Promise<boolean> {
+	// Ensure input is a string (fix for piped/scripted input)
+	if (typeof input !== 'string') {
+		console.error(`[dispatch] Invalid input type: ${typeof input}`);
+		return false;
+	}
 	const tokens = input.split(/\s+/);
 	const cmd = tokens[0];
 	if (!cmd) return false;

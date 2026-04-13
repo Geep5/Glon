@@ -5,11 +5,13 @@
 ```
 +---------------------------------------------------------------+
 |  Programs (src/programs/)                                     |
-|  Agent, tic-tac-toe, chat, games, GC, accounts, P2P sync.     |
-|  Pure logic on objects with security and retention policies.   |
+|  EVERYTHING is a program: help, CRUD, inspect, IPC, agent,    |
+|  tic-tac-toe, chat, GC, accounts, P2P sync.                   |
+|  Even /help is just a program loaded from the store!          |
 +------------------------------+--------------------------------+
 |  Shell (src/client.ts)       |  Bootstrap (src/bootstrap.ts)  |
-|  CLI over Rivet HTTP         |  Seed OS source as objects     |
+|  Pure program loader         |  Seed OS source & programs     |
+|  ZERO built-in commands      |  as Glon objects               |
 +------------------------------+--------------------------------+
 |  Store Actor (coordinator)                                    |
 |  SQLite index: objects, changes, DAG edges                    |
@@ -199,7 +201,8 @@ Simple programs (ttt, chat, agent) have one module. Complex programs
 
 **Discovery.** The shell calls `store.list("program")` at startup,
 extracts each program's manifest, bundles the modules, and compiles
-handlers. Zero hardcoded program commands in the shell.
+handlers. **ZERO hardcoded commands** — even `/help` is just another
+program loaded from the store. The shell is a pure program loader.
 
 **Execution.** When you type `/agent ask 9b2e Hello`, the shell
 matches the `/agent` prefix, calls the handler with
@@ -251,6 +254,10 @@ Programs call `ctx.emit(channel, data)` which broadcasts
 src/programs/
   runtime.ts                 module bundler, actor lifecycle, validators
   handlers/
+    help.ts                  list available programs (even this is a program!)
+    crud.ts                  CRUD operations (create, list, get, set, delete)
+    inspect.ts               DAG inspection (history, changes, heads, sync)
+    ipc.ts                   inter-process communication (send, inbox, outbox)
     ttt.ts                   tic-tac-toe
     chat.ts                  chat / messaging
     agent.ts                 LLM agent with DAG-backed conversation

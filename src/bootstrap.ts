@@ -27,6 +27,7 @@ const SOURCES = [
 	"src/bootstrap.ts",
 	"src/client.ts",
 	"src/programs/runtime.ts",
+	"src/programs/handlers/help.ts",
 	"src/programs/handlers/crud.ts",
 	"src/programs/handlers/inspect.ts",
 	"src/programs/handlers/ipc.ts",
@@ -50,6 +51,15 @@ interface ProgramDef {
 }
 
 const PROGRAMS: ProgramDef[] = [
+	{
+		prefix: "/help",
+		name: "Help",
+		commands: {
+			"": "Show all available programs",
+		},
+		entry: "help.ts",
+		modules: { "help.ts": "src/programs/handlers/help.ts" },
+	},
 	{
 		prefix: "/crud",
 		name: "CRUD Operations",

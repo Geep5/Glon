@@ -26,6 +26,10 @@ and programActor (manages program state, tick loops, and RPC dispatch).
 **Self-describing.** On bootstrap, the OS loads its own source files as
 objects. You can query the OS for the code that built it.
 
+**Zero built-in commands.** The shell is a pure program loader. Everything —
+even `/help` — is just a program stored as a Glon object that can be created,
+modified, versioned, and synced like any other data.
+
 ## Quick Start
 
 ```bash
@@ -236,8 +240,9 @@ stay on disk — but you don't pay the replay cost.
 ## Programs
 
 Programs are Glon objects. Their source code lives in the DAG, syncs
-between peers, and is discoverable at runtime. The shell has zero
-hardcoded commands — it loads every program from the store at startup.
+between peers, and is discoverable at runtime. **The shell has ZERO
+built-in commands** — it loads every program from the store at startup.
+Everything is a program, even `/help`.
 
 Every program `export default`s a `ProgramDef`:
 
@@ -265,34 +270,18 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for internals: DAG replay,
 actor state model, sync handshake, program context, and extensibility
 primitives.
 
-## Shell Commands
+## Commands
 
-Core commands built into the shell:
-
-| Command | Description |
-|---|---|
-| `/create <type> [name]` | Create an object |
-| `/list [type]` | List objects |
-| `/get <id>` | Full object state from live actor |
-| `/set <id> <key> <value>` | Set a field (creates a Change) |
-| `/delete <id>` | Soft-delete |
-| `/search <query>` | Search objects |
-| `/history <id>` | Change DAG for an object |
-| `/change <hex>` | Inspect a single change |
-| `/heads <id>` | Current DAG heads |
-| `/sync <idA> <idB>` | Sync two objects |
-| `/send <from> <to> <action>` | IPC between objects |
-| `/inbox <id>` / `/outbox <id>` | Message queues |
-| `/remote pull\|push <endpoint> <id>` | Cross-instance sync |
-| `/snapshot <id>` | Checkpoint state (speeds up replay) |
-| `/info` / `/disk` / `/help` | System info |
-
-## Program Commands
-
-Programs loaded dynamically from the store (use `/help` to see all):
+**All commands are programs** loaded dynamically from the store. The shell has
+**ZERO built-in commands** — even `/help` is just a program. Use `/help` to
+see all available programs.
 
 | Program | Commands | Description |
 |---|---|---|
+| `/help` | — | Show all available programs |
+| `/crud` | `create`, `list`, `get`, `set`, `delete`, `search` | CRUD operations on objects |
+| `/inspect` | `history`, `change`, `heads`, `changes`, `snapshot`, `sync`, `remote`, `info`, `disk` | DAG inspection and debugging |
+| `/ipc` | `send`, `inbox`, `outbox`, `clear` | Inter-process communication |
 | `/ttt` | `new`, `board`, `move`, `history` | Tic-Tac-Toe game |
 | `/chat` | `new`, `send`, `read`, `reply`, `react` | Chat rooms and messaging |
 | `/agent` | `new`, `ask`, `history`, `config`, `inject` | LLM agents with memory |
@@ -317,10 +306,14 @@ glon/
     disk.ts                   per-object .pb file storage
     index.ts                  actor definitions (object, store, program)
     bootstrap.ts              seed source files + programs as objects
-    client.ts                 CLI shell (discovers programs at startup)
+    client.ts                 CLI shell (pure program loader, ZERO built-in commands)
     programs/
       runtime.ts              module bundler, actor lifecycle, validators
       handlers/
+        help.ts               show available programs (even this is just a program!)
+        crud.ts               basic CRUD operations
+        inspect.ts            DAG inspection and debugging
+        ipc.ts                inter-process communication
         ttt.ts                tic-tac-toe
         chat.ts               chat / messaging
         agent.ts              LLM agent with DAG-backed conversation
