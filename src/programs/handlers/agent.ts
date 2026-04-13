@@ -73,13 +73,15 @@ interface InferenceResult {
 }
 
 /**
- * Call the Anthropic Messages API.
+ * Call the Anthropic Messages API with streaming support.
  * API key from ANTHROPIC_API_KEY env var.
  */
 async function callAnthropic(
 	messages: { role: string; content: string }[],
 	system: string | undefined,
 	model: string,
+	temperature?: number,
+	onChunk?: (text: string) => void,
 ): Promise<InferenceResult> {
 	const apiKey = process.env.ANTHROPIC_API_KEY;
 	if (!apiKey) throw new Error("ANTHROPIC_API_KEY not set");
@@ -88,6 +90,8 @@ async function callAnthropic(
 		model,
 		max_tokens: 4096,
 		messages,
+		stream: !!onChunk,
+		temperature: temperature ?? 0.7,
 	};
 	if (system) body.system = system;
 
@@ -106,6 +110,52 @@ async function callAnthropic(
 		throw new Error(`Anthropic API ${res.status}: ${text}`);
 	}
 
+	// Handle streaming response
+	if (onChunk) {
+		let content = "";
+		let inputTokens = 0;
+		let outputTokens = 0;
+
+		const decoder = new TextDecoder();
+		const reader = res.body!.getReader();
+
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+
+			const chunk = decoder.decode(value, { stream: true });
+			const lines = chunk.split('\n');
+
+			for (const line of lines) {
+				if (line.startsWith('data: ')) {
+					const data = line.slice(6);
+					if (data === '[DONE]') continue;
+
+					try {
+						const parsed = JSON.parse(data);
+
+						if (parsed.type === 'content_block_delta') {
+							const text = parsed.delta?.text;
+							if (text) {
+								content += text;
+								onChunk(text);
+							}
+						} else if (parsed.type === 'message_start') {
+							inputTokens = parsed.message?.usage?.input_tokens ?? 0;
+						} else if (parsed.type === 'message_delta') {
+							outputTokens = parsed.usage?.output_tokens ?? 0;
+						}
+					} catch (e) {
+						// Ignore parse errors
+					}
+				}
+			}
+		}
+
+		return { content, model, inputTokens, outputTokens };
+	}
+
+	// Non-streaming response
 	const data = await res.json() as any;
 	const content = data.content?.[0]?.text ?? "";
 	return {
@@ -183,11 +233,37 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 				content: { text: { text: prompt, style: 0 } }, // style 0 = user
 			}));
 
-			// Call the LLM
+			// Get temperature setting if configured
+			const temperature = extractString(state.fields["temperature"]);
+			const temp = temperature ? parseFloat(temperature) : undefined;
+
+			// Call the LLM with streaming
 			print(dim(`  thinking (${model})...`));
+			print("");
+			print(magenta(bold("  assistant")) + dim(" streaming..."));
+			print("");
+
+			let streamedContent = "";
+			let lineBuffer = "";
+			const onChunk = (text: string) => {
+				streamedContent += text;
+				lineBuffer += text;
+
+				// Print complete lines as they arrive
+				const lines = lineBuffer.split("\n");
+				for (let i = 0; i < lines.length - 1; i++) {
+					print(`  ${lines[i]}`);
+				}
+				lineBuffer = lines[lines.length - 1];
+			};
+
 			let result: InferenceResult;
 			try {
-				result = await callAnthropic(messages, system, model);
+				result = await callAnthropic(messages, system, model, temp, onChunk);
+				// Print any remaining partial line
+				if (lineBuffer) {
+					print(`  ${lineBuffer}`);
+				}
 			} catch (err: any) {
 				print(red("  Error: ") + err.message);
 				break;
@@ -201,13 +277,9 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 				content: { text: { text: result.content, style: 1 } }, // style 1 = assistant
 			}));
 
-			// Print the response
+			// Print token usage
 			print("");
-			print(magenta(bold("  assistant")) + dim(` (${result.inputTokens}+${result.outputTokens} tokens)`));
-			print("");
-			for (const line of result.content.split("\n")) {
-				print(`  ${line}`);
-			}
+			print(dim(`  (${result.inputTokens} input + ${result.outputTokens} output = ${result.inputTokens + result.outputTokens} total tokens)`));
 			print("");
 			break;
 		}
@@ -260,14 +332,23 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 			const value = args.slice(2).join(" ");
 			if (!raw || !key || !value) {
 				print(red("Usage: agent config <id> <key> <value>"));
-				print(dim("  Keys: model, system, name"));
+				print(dim("  Keys: model, system, name, temperature"));
 				break;
 			}
 
-			const allowed = ["model", "system", "name"];
+			const allowed = ["model", "system", "name", "temperature"];
 			if (!allowed.includes(key)) {
 				print(red(`Unknown config key: ${key}. Use: ${allowed.join(", ")}`));
 				break;
+			}
+
+			// Validate temperature value if specified
+			if (key === "temperature") {
+				const temp = parseFloat(value);
+				if (isNaN(temp) || temp < 0 || temp > 2) {
+					print(red("Temperature must be a number between 0 and 2"));
+					break;
+				}
 			}
 
 			const id = await resolveId(raw);
