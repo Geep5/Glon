@@ -3,10 +3,11 @@
 A distributed operating environment inspired by
 [Anytype](https://anytype.io)'s philosophy — no hierarchy, just objects and
 the links between them — built on two primitives that hold up at scale:
-[Rivet](https://rivet.gg) actors (how games and large distributed systems
-manage state) and content-addressed protobuf (how large systems store and
-sync data). Every object is a durable actor, every mutation is an immutable change
-in a DAG, and the graph of relations between objects is the only structure.
+[Rivet](https://rivet.gg) actors (how games, telecom, and Discord avoid
+shared-state problems) and content-addressed protobuf (how Git and IPFS make
+data self-verifying and conflict-free). Every object is a durable actor, every
+mutation is an immutable change in a DAG, and the graph of relations between
+objects is the only structure.
 
 ## How It Works
 
