@@ -6,7 +6,7 @@
 +---------------------------------------------------------------+
 |  Programs (src/programs/)                                     |
 |  EVERYTHING is a program: help, CRUD, inspect, IPC, agent,    |
-|  tic-tac-toe, chat, GC, accounts, P2P sync.                   |
+|  tic-tac-toe, chat, GC, accounts, P2P sync, graph.            |
 |  Even /help is just a program loaded from the store!          |
 +------------------------------+--------------------------------+
 |  Shell (src/client.ts)       |  Bootstrap (src/bootstrap.ts)  |
@@ -14,7 +14,7 @@
 |  ZERO built-in commands      |  as Glon objects               |
 +------------------------------+--------------------------------+
 |  Store Actor (coordinator)                                    |
-|  SQLite index: objects, changes, DAG edges                    |
+|  SQLite index: objects, changes, DAG edges, links             |
 |  Creates/destroys object actors                               |
 +------------------------------+--------------------------------+
 |  Object Actors (one per entity)                               |
@@ -59,7 +59,7 @@ operations in order:
 | Operation | Effect |
 |---|---|
 | `ObjectCreate` | Set type key, created timestamp |
-| `FieldSet` | Set a typed field (values can nest via ValueMap/ValueList) |
+| `FieldSet` | Set a typed field (values can nest via ValueMap/ValueList/ObjectLink) |
 | `FieldDelete` | Remove a field |
 | `ContentSet` | Set raw byte content |
 | `ObjectDelete` | Tombstone flag |
@@ -124,8 +124,9 @@ decrease. High-reputation peers are preferred for sync operations.
 ```
 
 The `.pb` files are the source of truth. The SQLite index in the
-store actor is derived — it tracks objects, changes, and DAG edges
-for efficient queries. Delete the index and it rebuilds from disk.
+store actor is derived — it tracks objects, changes, DAG edges,
+and inter-object links for efficient queries. Delete the index
+and it rebuilds from disk.
 
 Per-object subdirectories keep actor wake O(own changes) — an actor
 reads only its own directory, not the full change set.
@@ -163,6 +164,8 @@ fresh from disk.
 
 **Store actor:**
 - SQLite index for cross-object queries
+- Link index: scans fields for `ObjectLink` values, maintains `links` table
+  for forward/reverse link queries and graph traversal
 - Creates/destroys object actors via `c.client()`
 - Validates existence for IPC routing
 
@@ -264,6 +267,7 @@ src/programs/
     gc.ts                    garbage collection with retention policies
     accounts.ts              multi-user authentication & permissions
     sync.ts                  P2P synchronization & discovery
+    graph.ts                  object graph traversal and link queries
 ```
 
 ## Security Model
