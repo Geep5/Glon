@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="GlonLogo.png" alt="Glon" width="200">
+</p>
+
 # Glon
 
 A distributed operating environment inspired by
