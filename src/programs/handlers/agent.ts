@@ -1,4 +1,4 @@
-// Agent — an LLM-powered conversational agent that runs on Glon OS.
+// Agent — an LLM-powered conversational agent that runs on Glon.
 //
 // Each agent is a regular Glon object (type "agent"). Conversation turns
 // are stored as blocks in the DAG — every prompt and response is a
@@ -171,7 +171,7 @@ async function callAnthropic(
 const DEFAULT_MODEL = "claude-sonnet-4-20250514";
 
 const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
-	const { client, store, resolveId, stringVal, print, randomUUID } = ctx as any;
+	const { client, store, resolveId, stringVal, linkVal, print, randomUUID } = ctx as any;
 
 	switch (cmd) {
 		// /agent new [name] [--model X] [--system "prompt"]
@@ -431,6 +431,9 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 				childrenIds: [],
 				content: { text: { text: contextLines.join("\n"), style: 0 } },
 			}));
+
+			// Store a link from target → source so the graph shows context provenance
+			await actor.setField("context_source", JSON.stringify(linkVal(sourceId, "context_source")));
 
 			print(green(`  Injected ${sourceTurns.length} turns from "${sourceName}" into target`));
 			print(dim(`  block ${blockId.slice(0, 8)}`));

@@ -27,6 +27,11 @@ const ObjectSnapshotType = root.lookupType("glon.ObjectSnapshot");
 
 // ── TypeScript interfaces ───────────────────────────────────────
 
+export interface ObjectLink {
+	targetId: string;
+	relationKey: string;
+}
+
 export interface Value {
 	kind?: string;
 	stringValue?: string;
@@ -37,6 +42,7 @@ export interface Value {
 	listValue?: { values: string[] };
 	mapValue?: { entries: Record<string, Value> };
 	valuesValue?: { items: Value[] };
+	linkValue?: ObjectLink;
 }
 
 export interface TextContent {
@@ -214,6 +220,9 @@ export function intVal(n: number): Value { return { intValue: n }; }
 export function floatVal(n: number): Value { return { floatValue: n }; }
 export function boolVal(b: boolean): Value { return { boolValue: b }; }
 export function bytesVal(b: Uint8Array): Value { return { bytesValue: b }; }
+export function linkVal(targetId: string, relationKey: string): Value {
+	return { linkValue: { targetId, relationKey } };
+}
 
 /** Create a Value containing a nested map of Values. */
 export function mapVal(entries: Record<string, Value>): Value {
@@ -225,7 +234,7 @@ export function listVal(items: Value[]): Value {
 	return { valuesValue: { items } };
 }
 
-export type UnwrappedValue = string | number | boolean | Uint8Array | string[] | Record<string, Value> | Value[] | null;
+export type UnwrappedValue = string | number | boolean | Uint8Array | string[] | Record<string, Value> | Value[] | ObjectLink | null;
 
 export function unwrapValue(v: Value): UnwrappedValue {
 	// Decoded values have a 'kind' discriminator from protobufjs oneofs:true
@@ -239,6 +248,7 @@ export function unwrapValue(v: Value): UnwrappedValue {
 			case "listValue": return v.listValue!.values;
 			case "mapValue": return v.mapValue!.entries;
 			case "valuesValue": return v.valuesValue!.items;
+			case "linkValue": return v.linkValue!;
 		}
 	}
 	// Constructed values (via stringVal/intVal/etc.) — only one field is set
@@ -250,10 +260,15 @@ export function unwrapValue(v: Value): UnwrappedValue {
 	if (v.intValue !== undefined) return v.intValue;
 	if (v.floatValue !== undefined) return v.floatValue;
 	if (v.boolValue !== undefined) return v.boolValue;
+	if (v.linkValue !== undefined) return v.linkValue;
 	return null;
 }
 
 export function displayValue(v: Value): string {
+	if (v.linkValue !== undefined) {
+		const short = v.linkValue.targetId.length > 12 ? v.linkValue.targetId.slice(0, 12) + "..." : v.linkValue.targetId;
+		return `→ ${short} (${v.linkValue.relationKey})`;
+	}
 	if (v.mapValue !== undefined) {
 		const entries = Object.entries(v.mapValue.entries);
 		if (entries.length === 0) return "{}";

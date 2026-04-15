@@ -1,5 +1,5 @@
 /**
- * Accounts & Permissions System for Glon OS
+ * Accounts & Permissions System for Glon
  *
  * Manages user accounts, authentication, and object permissions.
  * Programs run with user permissions and can only modify their own objects.
@@ -432,18 +432,24 @@ const program: ProgramDef = {
         return c.state.value.accounts[session.accountId];
       },
 
-      // Record object ownership
-      recordOwnership: async (c: any, objectId: string, ownerId: string) => {
-        c.state.value.ownership[objectId] = {
-          objectId,
-          ownerId,
-          created: Date.now(),
-          permissions: {
-            owner: ["read", "write", "delete"],
-            others: ["read"]
-          }
-        };
-      },
+			// Record object ownership
+			// TODO: When recordOwnership is called from a CLI handler with ProgramContext,
+			// add a link on the owned object for graph visibility:
+			//   const objActor = ctx.objectActor(objectId);
+			//   await objActor.setField("owner", JSON.stringify(ctx.linkVal(ownerId, "owner")));
+			// Currently this action is not invoked from any handler, so the link cannot be
+			// added here (actor actions lack ProgramContext).
+			recordOwnership: async (c: any, objectId: string, ownerId: string) => {
+				c.state.value.ownership[objectId] = {
+					objectId,
+					ownerId,
+					created: Date.now(),
+					permissions: {
+						owner: ["read", "write", "delete"],
+						others: ["read"]
+					}
+				};
+			},
 
       // Check if action is allowed
       checkPermission: async (c: any, accountId: string, objectId: string, action: Action) => {

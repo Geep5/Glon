@@ -1,5 +1,5 @@
 /**
- * P2P Sync Program for Glon OS
+ * P2P Sync Program for Glon
  *
  * Enables peer-to-peer synchronization using mDNS discovery
  * and direct HTTP connections between Glon instances.

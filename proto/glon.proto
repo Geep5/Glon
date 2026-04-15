@@ -279,7 +279,7 @@ enum TextStyle {
 // so programs can express arbitrarily nested structures without
 // modifying glon.proto. A browser stores cookie jars as nested
 // maps. A spreadsheet stores cell metadata as typed lists.
-// The OS carries it all through the same Change DAG.
+// Glon carries it all through the same Change DAG.
 
 message Value {
   oneof kind {
@@ -291,7 +291,17 @@ message Value {
     StringList list_value    = 6;
     ValueMap   map_value     = 7;   // nested key-value
     ValueList  values_value  = 8;   // heterogeneous typed list
+    ObjectLink link_value    = 9;   // typed link to another object
   }
+}
+
+// A typed link from this object to another.
+// Links are field values — they participate in FieldSet/FieldDelete like any
+// other Value kind. A Task's "assignee" field is a link to a Person object.
+// Links in a ValueList express one-to-many (a Project's "tasks" field).
+message ObjectLink {
+  string target_id    = 1;  // the linked object's UUID
+  string relation_key = 2;  // e.g. "assignee", "parent", "blocks"
 }
 
 message StringList {

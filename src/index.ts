@@ -1,5 +1,5 @@
 /**
- * Glon OS — actor registry.
+ * Glon — actor registry.
  *
  * Three actors: objectActor (one per object, sync peer), storeActor
  * (singleton coordinator with SQLite index), and programActor
@@ -16,8 +16,8 @@
 
 import { actor, event, setup } from "rivetkit";
 import { db } from "rivetkit/db";
-import type { Change, Operation, Value, ObjectRef, Block } from "./proto.js";
-import { encodeChange, encodeChangeForHashing, decodeChange, stringVal, intVal, floatVal, boolVal, mapVal, listVal, displayValue } from "./proto.js";
+import type { Change, Operation, Value, ObjectRef, Block, ObjectLink } from "./proto.js";
+import { encodeChange, encodeChangeForHashing, decodeChange, stringVal, intVal, floatVal, boolVal, mapVal, listVal, linkVal, displayValue } from "./proto.js";
 import { sha256, hexEncode, hexDecode, generateObjectId } from "./crypto.js";
 import {
 	createChange,
@@ -403,6 +403,17 @@ const storeActor = actor({
 			`);
 			await database.execute("CREATE INDEX IF NOT EXISTS idx_changes_object ON changes(object_id)");
 			await database.execute("CREATE INDEX IF NOT EXISTS idx_objects_type ON objects(type_key)");
+			await database.execute(`
+				CREATE TABLE IF NOT EXISTS links (
+					source_id TEXT NOT NULL,
+					target_id TEXT NOT NULL,
+					relation_key TEXT NOT NULL,
+					field_key TEXT NOT NULL,
+					PRIMARY KEY (source_id, field_key)
+				)
+			`);
+			await database.execute("CREATE INDEX IF NOT EXISTS idx_links_target ON links(target_id)");
+			await database.execute("CREATE INDEX IF NOT EXISTS idx_links_relation ON links(relation_key)");
 		},
 	}),
 
@@ -582,6 +593,80 @@ const storeActor = actor({
 				id, typeKey, deleted ? 1 : 0, createdAt, updatedAt,
 			);
 		},
+
+		// ── Link queries ─────────────────────────────────────────
+
+		getLinks: async (c, objectId: string): Promise<{ targetId: string; relationKey: string; fieldKey: string }[]> => {
+			return (await c.db.execute(
+				"SELECT target_id AS targetId, relation_key AS relationKey, field_key AS fieldKey FROM links WHERE source_id = ?",
+				objectId,
+			)) as unknown as { targetId: string; relationKey: string; fieldKey: string }[];
+		},
+
+		getBacklinks: async (c, objectId: string): Promise<{ sourceId: string; relationKey: string; fieldKey: string }[]> => {
+			return (await c.db.execute(
+				"SELECT source_id AS sourceId, relation_key AS relationKey, field_key AS fieldKey FROM links WHERE target_id = ?",
+				objectId,
+			)) as unknown as { sourceId: string; relationKey: string; fieldKey: string }[];
+		},
+
+		getLinkedObjects: async (c, objectId: string, relationKey: string): Promise<{ targetId: string; fieldKey: string }[]> => {
+			return (await c.db.execute(
+				"SELECT target_id AS targetId, field_key AS fieldKey FROM links WHERE source_id = ? AND relation_key = ?",
+				objectId, relationKey,
+			)) as unknown as { targetId: string; fieldKey: string }[];
+		},
+
+		neighbors: async (c, objectId: string): Promise<{ outbound: any[]; inbound: any[] }> => {
+			const outbound = (await c.db.execute(
+				`SELECT l.target_id AS id, l.relation_key AS relationKey, l.field_key AS fieldKey, o.type_key AS typeKey
+				 FROM links l LEFT JOIN objects o ON o.id = l.target_id WHERE l.source_id = ?`,
+				objectId,
+			)) as unknown as any[];
+			const inbound = (await c.db.execute(
+				`SELECT l.source_id AS id, l.relation_key AS relationKey, l.field_key AS fieldKey, o.type_key AS typeKey
+				 FROM links l LEFT JOIN objects o ON o.id = l.source_id WHERE l.target_id = ?`,
+				objectId,
+			)) as unknown as any[];
+			return { outbound, inbound };
+		},
+
+		getTypeDefinition: async (c, typeKey: string): Promise<any | null> => {
+			const refs = (await c.db.execute(
+				"SELECT id FROM objects WHERE type_key = 'type' AND deleted = 0",
+			)) as unknown as { id: string }[];
+			for (const ref of refs) {
+				const client = c.client<typeof app>();
+				const objActor = client.objectActor.getOrCreate([ref.id]);
+				const obj = await objActor.read();
+				if (obj?.fields?.key?.stringValue === typeKey) return obj;
+			}
+			return null;
+		},
+
+		graphQuery: async (c, rootId: string, depth: number, relationKey?: string): Promise<any[]> => {
+			const visited = new Set<string>();
+			const result: any[] = [];
+			const queue: { id: string; depth: number }[] = [{ id: rootId, depth: 0 }];
+			while (queue.length > 0) {
+				const { id, depth: d } = queue.shift()!;
+				if (visited.has(id) || d > depth) continue;
+				visited.add(id);
+				const ref = (await c.db.execute(
+					"SELECT id, type_key AS typeKey FROM objects WHERE id = ? AND deleted = 0", id,
+				)) as unknown as { id: string; typeKey: string }[];
+				if (ref.length === 0) continue;
+				let sql = "SELECT target_id AS targetId, relation_key AS relationKey, field_key AS fieldKey FROM links WHERE source_id = ?";
+				const params: any[] = [id];
+				if (relationKey) { sql += " AND relation_key = ?"; params.push(relationKey); }
+				const links = (await c.db.execute(sql, ...params)) as unknown as any[];
+				result.push({ id, typeKey: ref[0].typeKey, depth: d, links });
+				for (const link of links) {
+					if (!visited.has(link.targetId)) queue.push({ id: link.targetId, depth: d + 1 });
+				}
+			}
+			return result;
+		},
 	},
 });
 
@@ -603,6 +688,20 @@ async function indexChange(c: any, change: Change): Promise<void> {
 	}
 }
 
+/** Recursively extract ObjectLinks from a Value (handles ValueList nesting). */
+function extractLinks(fieldKey: string, v: Value): { targetId: string; relationKey: string; fieldKey: string }[] {
+	if (v.linkValue) {
+		return [{ targetId: v.linkValue.targetId, relationKey: v.linkValue.relationKey, fieldKey }];
+	}
+	if (v.valuesValue) {
+		return v.valuesValue.items.flatMap(item => extractLinks(fieldKey, item));
+	}
+	if (v.mapValue) {
+		return Object.entries(v.mapValue.entries).flatMap(([k, val]) => extractLinks(`${fieldKey}.${k}`, val));
+	}
+	return [];
+}
+
 async function indexObject(c: any, computed: ObjectState): Promise<void> {
 	await c.db.execute(
 		`INSERT INTO objects (id, type_key, deleted, created_at, updated_at)
@@ -615,6 +714,17 @@ async function indexObject(c: any, computed: ObjectState): Promise<void> {
 		computed.id, computed.typeKey, computed.deleted ? 1 : 0,
 		computed.createdAt, computed.updatedAt,
 	);
+
+	// Reindex links: clear stale, scan fields for ObjectLink values
+	await c.db.execute("DELETE FROM links WHERE source_id = ?", computed.id);
+	for (const [key, value] of computed.fields) {
+		for (const link of extractLinks(key, value)) {
+			await c.db.execute(
+				`INSERT OR REPLACE INTO links (source_id, target_id, relation_key, field_key) VALUES (?, ?, ?, ?)`,
+				computed.id, link.targetId, link.relationKey, link.fieldKey,
+			);
+		}
+	}
 }
 
 // ── Program Actor ─────────────────────────────────────────────────
@@ -651,7 +761,7 @@ const programActor = actor({
 					const resolved = await store.resolvePrefix(prefix);
 					return resolved || null;
 				},
-				stringVal, intVal, floatVal, boolVal, mapVal, listVal, displayValue,
+				stringVal, intVal, floatVal, boolVal, mapVal, listVal, linkVal, displayValue,
 				listChangeFiles: () => [],
 				readChangeByHex: () => null,
 				hexEncode,

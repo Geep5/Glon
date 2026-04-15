@@ -1,5 +1,5 @@
 /**
- * Bootstrap — seed Glon OS with its own source files and programs.
+ * Bootstrap — seed Glon with its own source files and programs.
  *
  * Each source file becomes a Glon object created through the store actor.
  * Programs (src/programs/handlers/*.ts) are created as type=program objects
@@ -37,6 +37,7 @@ const SOURCES = [
 	"src/programs/handlers/gc.ts",
 	"src/programs/handlers/accounts.ts",
 	"src/programs/handlers/sync.ts",
+	"src/programs/handlers/graph.ts",
 	"package.json",
 	"tsconfig.json",
 ];
@@ -186,6 +187,17 @@ const PROGRAMS: ProgramDef[] = [
 		entry: "sync.ts",
 		modules: { "sync.ts": "src/programs/handlers/sync.ts" },
 	},
+	{
+		prefix: "/graph",
+		name: "Object Graph",
+		commands: {
+			links: "Show links for an object",
+			traverse: "BFS graph traversal",
+			neighbors: "Immediate neighbors with types",
+		},
+		entry: "graph.ts",
+		modules: { "graph.ts": "src/programs/handlers/graph.ts" },
+	},
 ];
 
 const KIND_MAP: Record<string, string> = {
@@ -207,7 +219,7 @@ async function main() {
 	const client = createClient<typeof app>(ENDPOINT);
 	const store = client.storeActor.getOrCreate(["root"]);
 
-	console.log("Bootstrapping Glon OS...\n");
+	console.log("Bootstrapping Glon...\n");
 
 	// Build lookup of existing objects by type+name for idempotency.
 	const existingByKey = new Map<string, string>();

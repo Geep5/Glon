@@ -34,6 +34,7 @@ export interface ProgramContext {
 	boolVal: (b: boolean) => Value;
 	mapVal: (entries: Record<string, Value>) => Value;
 	listVal: (items: Value[]) => Value;
+	linkVal: (targetId: string, relationKey: string) => Value;
 	displayValue: (v: Value) => string;
 
 	// Disk (read-only)

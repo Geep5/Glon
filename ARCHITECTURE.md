@@ -1,4 +1,4 @@
-# Glon OS — Architecture
+# Glon — Architecture
 
 ## Layers
 
@@ -10,7 +10,7 @@
 |  Even /help is just a program loaded from the store!          |
 +------------------------------+--------------------------------+
 |  Shell (src/client.ts)       |  Bootstrap (src/bootstrap.ts)  |
-|  Pure program loader         |  Seed OS source & programs     |
+|  Pure program loader         |  Seed source & programs        |
 |  ZERO built-in commands      |  as Glon objects               |
 +------------------------------+--------------------------------+
 |  Store Actor (coordinator)                                    |
@@ -390,7 +390,7 @@ Value {
 }
 ```
 
-The OS never interprets these structures. The DAG replay code does
+Glon never interprets these structures. The DAG replay code does
 `state.fields.set(key, value)` — it doesn't look inside the Value.
 Programs define their own conventions on top of the typed primitives.
 
@@ -406,22 +406,22 @@ CustomContent {
 }
 ```
 
-The OS stores, content-addresses, syncs, and replays custom blocks
+Glon stores, content-addresses, syncs, and replays custom blocks
 through the standard Change DAG. Peers that don't understand a
 `CustomContent` block fall back to displaying the `meta` map.
 
 ### Why Not Program-Defined Protobufs?
 
-**Custom Operations (programs bring their own reducers):** The OS
+**Custom Operations (programs bring their own reducers):** Glon
 would need each program's code to replay the DAG. A peer without
 the program couldn't compute state. Breaks "any peer can recompute
 from changes alone."
 
-**Custom Value schemas (opaque bytes with type URLs):** The OS
+**Custom Value schemas (opaque bytes with type URLs):** Glon
 could carry but not inspect the data. Loses field indexing, value
 queries, and state diffing.
 
-Recursive Value avoids both traps: the OS always replays the DAG
+Recursive Value avoids both traps: Glon always replays the DAG
 (Operations are unchanged), always inspects values (typed all the
 way down), and programs compose arbitrary structures from a fixed
 set of primitives. `glon.proto` is stable.

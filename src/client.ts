@@ -1,5 +1,5 @@
 /**
- * Glon OS CLI shell — pure program loader.
+ * Glon CLI shell — pure program loader.
  *
  * The shell has ZERO built-in commands. Everything is a program loaded
  * from the store, even /help. Programs are Glon objects that can be
@@ -13,7 +13,7 @@ import type { app } from "./index.js";
 import { createInterface } from "node:readline";
 import { diskStats, readChangeByHex, listChangeFiles } from "./disk.js";
 import { hexEncode } from "./crypto.js";
-import { stringVal, intVal, floatVal, boolVal, mapVal, listVal, displayValue } from "./proto.js";
+import { stringVal, intVal, floatVal, boolVal, mapVal, listVal, linkVal, displayValue } from "./proto.js";
 import { loadPrograms, dispatchProgram, startProgramActor, type ProgramContext, type ProgramEntry } from "./programs/runtime.js";
 import { randomUUID } from "node:crypto";
 
@@ -61,6 +61,7 @@ function buildContext(overrides?: Partial<ProgramContext>): ProgramContext {
 		boolVal,
 		mapVal,
 		listVal,
+		linkVal,
 		displayValue,
 		listChangeFiles,
 		readChangeByHex,
@@ -79,7 +80,7 @@ function buildContext(overrides?: Partial<ProgramContext>): ProgramContext {
 
 // ── Main REPL ────────────────────────────────────────────────────
 async function main() {
-	console.log(dim("Glon OS — connecting to " + ENDPOINT));
+	console.log(dim("Glon — connecting to " + ENDPOINT));
 
 	// Load programs from store
 	try {

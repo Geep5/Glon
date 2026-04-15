@@ -1,12 +1,19 @@
 # Glon
 
-A protobuf-native operating system built on the two primitives that scale
-to the extreme: [Rivet](https://rivet.gg) actors (how games and massive
-distributed systems manage state) and content-addressed protobuf (how large
-systems store and sync data). Glon blends them into one thing — every object
-is a durable actor, every mutation is an immutable protobuf change in a DAG.
+A distributed operating environment inspired by
+[Anytype](https://anytype.io)'s philosophy — no hierarchy, just objects and
+the links between them — built on the two primitives that scale to the extreme:
+[Rivet](https://rivet.gg) actors (how games and massive distributed systems
+manage state) and content-addressed protobuf (how large systems store and sync
+data). Every object is a durable actor, every mutation is an immutable change
+in a DAG, and the graph of relations between objects is the only structure.
 
 ## How It Works
+
+**Objects, not files.** There are no folders, no directories, no tree. Every
+entity is a typed object in a flat graph. Objects relate to each other through
+typed fields — the structure emerges from the connections, not from where
+something is placed.
 
 **Changes, not state.** Every mutation is a `Change` — an immutable protobuf
 message appended to a DAG, identified by the SHA-256 of its wire bytes. Current
@@ -23,13 +30,16 @@ command — including `/help` — from the store at startup. Programs are Glon
 objects: they have change history, sync between instances, and are discoverable
 at runtime.
 
+**Self-describing.** On bootstrap, the environment loads its own source files as
+objects. You can query Glon for the code that built it.
+
 ## Quick Start
 
 ```bash
 git clone https://github.com/Geep5/Glon.git
 cd Glon && npm install
 
-# Terminal 1: start the OS
+# Terminal 1: start the environment
 npm run dev
 
 # Terminal 2: seed source files (first time)
@@ -71,7 +81,45 @@ reach disk.
 | `/accounts` | Multi-user auth and per-object permissions |
 | `/sync` | P2P sync via mDNS discovery and HTTP |
 
+### Example: LLM Agent
+
+Agents store every prompt and response as changes in the DAG — content-addressed,
+replayable, syncable. Any peer can replay the conversation without an API key.
+
+```bash
+ANTHROPIC_API_KEY=sk-... npm run client
+```
+```
+glon> /agent new analyst --system "You are a concise data analyst."
+glon> /agent ask 9b2e What are the tradeoffs of event sourcing vs CRUD?
+  assistant (847+312 tokens)
+  Event sourcing trades write simplicity for read complexity. ...
+
+glon> /agent inject c41a 9b2e       # inject analyst's context into another agent
+glon> /agent ask c41a What did the analyst get wrong?
+```
+
+### Example: Multi-Instance Chat
+
+Two Glon instances sync over HTTP — both end up with identical `.pb` files
+on disk.
+
+```
+# Server A                              # Server B
+GLON_DATA=~/.glon-a npm run dev          GLON_DATA=~/.glon-b npm run dev
+
+glon> /chat new general
+glon> /chat send 4dfaa Hello from A!
+glon> /remote push localhost:6421 4dfaa
+                                         glon> /chat read 4dfaa
+                                           # general
+                                           00:13  local  Hello from A!
+```
+
 ### Example: Tic-Tac-Toe
+
+The board is an object. Every move is a content-addressed change — tamper-evident
+and replayable.
 
 ```
 glon> /ttt new
@@ -90,35 +138,6 @@ glon> /ttt history a3f8
   1eed89826411  06:27:37  #1 X -> position 4
   ...
   d71da0218bb3  06:27:49  X wins
-```
-
-### Example: Multi-Instance Chat
-
-```
-# Server A                              # Server B
-GLON_DATA=~/.glon-a npm run dev          GLON_DATA=~/.glon-b npm run dev
-
-glon> /chat new general
-glon> /chat send 4dfaa Hello from A!
-glon> /remote push localhost:6421 4dfaa
-                                         glon> /chat read 4dfaa
-                                           # general
-                                           00:13  local  Hello from A!
-```
-
-### Example: LLM Agent
-
-```bash
-ANTHROPIC_API_KEY=sk-... npm run client
-```
-```
-glon> /agent new analyst --system "You are a concise data analyst."
-glon> /agent ask 9b2e What are the tradeoffs of event sourcing vs CRUD?
-  assistant (847+312 tokens)
-  Event sourcing trades write simplicity for read complexity. ...
-
-glon> /agent inject c41a 9b2e       # inject analyst's context into another agent
-glon> /agent ask c41a What did the analyst get wrong?
 ```
 
 ## The Protocol

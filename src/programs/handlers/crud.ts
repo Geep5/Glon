@@ -172,6 +172,100 @@ async function cmdSearch(args: string[], ctx: ProgramContext): Promise<void> {
 	ctx.print(dim(`\n${refs.length} match(es)`));
 }
 
+async function findTypeDef(typeKey: string, ctx: ProgramContext) {
+	const refs = await ctx.store.list("type");
+	for (const r of refs) {
+		const obj = await ctx.store.get(r.id);
+		if (obj?.fields?.key?.stringValue === typeKey) return obj;
+	}
+	return null;
+}
+
+async function cmdType(args: string[], ctx: ProgramContext): Promise<void> {
+	const sub = args[0];
+	switch (sub) {
+		case "create": {
+			const name = args.slice(1).join(" ");
+			if (!name) { ctx.print(red("Usage: /crud type create <name>")); return; }
+			const key = name.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
+			const fieldsJson = JSON.stringify({
+				name: ctx.stringVal(name),
+				key: ctx.stringVal(key),
+				properties: ctx.listVal([]),
+			});
+			const id = await ctx.store.create("type", fieldsJson);
+			ctx.print(green("Created type: ") + cyan(name) + dim(" (key: " + key + ")"));
+			ctx.print(dim("  id: " + id));
+			break;
+		}
+		case "list": {
+			const refs = await ctx.store.list("type");
+			if (refs.length === 0) { ctx.print(dim("(no type definitions)")); return; }
+			for (const r of refs) {
+				const obj = await ctx.store.get(r.id);
+				const name = obj?.fields?.name?.stringValue || "?";
+				const key = obj?.fields?.key?.stringValue || "?";
+				ctx.print(cyan(key.padEnd(16)) + name + dim("  " + r.id.slice(0, 12) + "..."));
+			}
+			break;
+		}
+		case "get": {
+			const key = args[1];
+			if (!key) { ctx.print(red("Usage: /crud type get <key>")); return; }
+			const typeDef = await findTypeDef(key, ctx);
+			if (!typeDef) { ctx.print(red("Type not found: ") + key); return; }
+			ctx.print(bold("name: ") + typeDef.fields.name?.stringValue);
+			ctx.print(bold("key:  ") + typeDef.fields.key?.stringValue);
+			const props = typeDef.fields.properties?.valuesValue?.items || [];
+			if (props.length === 0) {
+				ctx.print(dim("  (no properties)"));
+			} else {
+				ctx.print(bold("properties:"));
+				for (const p of props) {
+					const e = p.mapValue?.entries || {};
+					const pName = e.name?.stringValue || "?";
+					const pKey = e.key?.stringValue || "?";
+					const pFmt = e.format?.stringValue || "?";
+					ctx.print("  " + cyan(pKey.padEnd(16)) + pFmt.padEnd(12) + dim(pName));
+				}
+			}
+			break;
+		}
+		case "add-prop": {
+			const typeKey = args[1];
+			const propName = args[2];
+			const format = args[3];
+			const FORMATS = ["text", "number", "date", "select", "object", "checkbox", "url", "email"];
+			if (!typeKey || !propName || !format) {
+				ctx.print(red("Usage: /crud type add-prop <type-key> <prop-name> <format>"));
+				ctx.print(dim("  Formats: " + FORMATS.join(", ")));
+				return;
+			}
+			if (!FORMATS.includes(format)) {
+				ctx.print(red("Invalid format: ") + format);
+				ctx.print(dim("  Valid: " + FORMATS.join(", ")));
+				return;
+			}
+			const typeDef = await findTypeDef(typeKey, ctx);
+			if (!typeDef) { ctx.print(red("Type not found: ") + typeKey); return; }
+			const propKey = propName.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
+			const existing = typeDef.fields.properties?.valuesValue?.items || [];
+			const newProp = ctx.mapVal({
+				name: ctx.stringVal(propName),
+				key: ctx.stringVal(propKey),
+				format: ctx.stringVal(format),
+			});
+			const updated = ctx.listVal([...existing, newProp]);
+			const actor = ctx.objectActor(typeDef.id);
+			await actor.setField("properties", JSON.stringify(updated));
+			ctx.print(green("Added property: ") + cyan(propKey) + dim(" (" + format + ")"));
+			break;
+		}
+		default:
+			ctx.print("Type commands: create, list, get, add-prop");
+	}
+}
+
 const programDef: ProgramDef = {
 	handler: async (cmd: string, args: string[], ctx: ProgramContext) => {
 		switch (cmd) {
@@ -181,9 +275,10 @@ const programDef: ProgramDef = {
 			case "set": await cmdSet(args, ctx); break;
 			case "delete": await cmdDelete(args, ctx); break;
 			case "search": await cmdSearch(args, ctx); break;
+			case "type": await cmdType(args, ctx); break;
 			default:
 				ctx.print(`Unknown command: ${cmd}`);
-				ctx.print("Commands: create, list, get, set, delete, search");
+				ctx.print("Commands: create, list, get, set, delete, search, type");
 		}
 	},
 };

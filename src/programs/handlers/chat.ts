@@ -1,4 +1,4 @@
-// Chat — a program that runs on Glon OS.
+// Chat — a program that runs on Glon.
 import type { ProgramDef, ProgramContext } from "../runtime.js";
 
 // ANSI colors
