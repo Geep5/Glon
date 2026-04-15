@@ -316,44 +316,24 @@ interface ObjectMetadata {
 
 ## Garbage Collection
 
-### Retention Policies
+GC is a tool, not a policy. The `/gc` program provides protection,
+link-based reachability, and collection. It has no opinions about
+retention — programs decide what to protect by calling GC's actor
+actions (`protect`, `unprotect`, `isRetained`, `getRetained`).
 
-Programs declare how long their objects should be kept:
+### Algorithm
 
-```typescript
-interface RetentionPolicy {
-  maxAge?: string;         // "30d", "1y", "forever"
-  maxCount?: number;       // Keep N most recent
-  maxSize?: number;        // Total size in bytes
-  keepIfReferenced?: boolean;  // Preserve if other objects link
-}
-```
-
-The GC program (`/gc`) enforces these policies, cleaning up old
-changes while preserving object integrity.
-
-### GC Algorithm
-
-1. **Scan:** Enumerate all objects and their retention policies
-2. **Mark:** Identify changes eligible for deletion based on:
-   - Age exceeds `maxAge`
-   - Count exceeds `maxCount` (keep newest)
-   - Total size exceeds `maxSize`
-3. **Sweep:** Delete eligible changes unless:
-   - Object is protected (`/gc protect`)
-   - Object is referenced by active objects
-   - Change is part of current heads
-
-### Protected Objects
-
-Users can protect important objects from GC:
+1. **Roots:** explicitly protected object IDs (set by programs or users)
+2. **Reachability:** BFS from roots following outbound links in the
+   object graph — everything reachable from a root is retained
+3. **Collect:** delete objects that are neither roots nor reachable
 
 ```
-/gc protect <id>    # Never delete this object
-/gc unprotect <id>  # Allow normal GC rules
+/gc protect <id>     # mark as root (transitive via links)
+/gc unprotect <id>   # remove root
+/gc run [--dry-run]  # collect unreachable objects
+/gc status           # show roots and reachability
 ```
-
-Bootstrap source files and core programs are auto-protected.
 
 ## Data Flow
 
