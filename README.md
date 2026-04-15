@@ -1,8 +1,10 @@
 # Glon
 
-A protobuf-native operating system. Every mutation is a content-addressed change
-in a DAG. Every object is a durable [Rivet](https://rivet.gg) actor. Raw
-protobuf on disk, sync over HTTP.
+A protobuf-native operating system built on the two primitives that scale
+to the extreme: [Rivet](https://rivet.gg) actors (how games and massive
+distributed systems manage state) and content-addressed protobuf (how large
+systems store and sync data). Glon blends them into one thing — every object
+is a durable actor, every mutation is an immutable protobuf change in a DAG.
 
 ## How It Works
 
