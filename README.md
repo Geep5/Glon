@@ -1,8 +1,4 @@
-<p align="center">
-  <img src="GlonLogo.png" alt="Glon" width="200">
-</p>
-
-# Glon
+# 🌿 Glon
 
 A distributed operating environment inspired by
 [Anytype](https://anytype.io)'s philosophy — no hierarchy, just objects and
