@@ -258,17 +258,162 @@ src/programs/
   runtime.ts                 module bundler, actor lifecycle, validators
   handlers/
     help.ts                  list available programs (even this is a program!)
-    crud.ts                  CRUD operations (create, list, get, set, delete)
+    crud.ts                  CRUD operations on any object
     inspect.ts               DAG inspection (history, changes, heads, sync)
-    ipc.ts                   inter-process communication (send, inbox, outbox)
+    ipc.ts                   inter-object messaging (inbox/outbox)
+    graph.ts                 object graph traversal and link queries
     ttt.ts                   tic-tac-toe
-    chat.ts                  chat / messaging
-    agent.ts                 LLM agent with DAG-backed conversation
-    gc.ts                    garbage collection with retention policies
-    accounts.ts              multi-user authentication & permissions
+    chat.ts                  chat rooms
+    agent.ts                 LLM agent: conversation, tool use, auto-compaction, memory digest
+    memory.ts                pinned_fact + milestone objects, recall/digest, validator
+    peer.ts                  identity + trust for people and agents
+    remind.ts                scheduled actions (DM, gracie-compose, email)
+    discord.ts               Discord REST bridge: poll DMs, route to /gracie.ingest
+    gracie.ts                executive-assistant driver: identity-aware ingest + tools
+    web.ts                   HTTP client with SSRF guard
+    gc.ts                    reachability-based garbage collection
+    accounts.ts              multi-user auth & per-object permissions
     sync.ts                  P2P synchronization & discovery
-    graph.ts                  object graph traversal and link queries
+scripts/
+  daemon.ts                  headless host: no stdin, HTTP dispatch endpoint
+  dispatch.ts                thin HTTP client for the daemon
+  read-agent-blocks.ts       diagnostic: dump an agent's conversation blocks
 ```
+
+### Daemon vs Shell
+
+Two entry points share the same program loader:
+
+- `src/client.ts` — interactive REPL. Reads stdin, prints to stdout. Good for
+  exploring, debugging, ad-hoc chat with an agent.
+- `scripts/daemon.ts` — headless. Same program set, no stdin, exposes
+  `POST /dispatch {prefix, action, args}` on `127.0.0.1:6430`. Good for running
+  the Discord bridge, the reminder tick loop, or anything that should keep running
+  without a terminal attached.
+
+Both connect to the same actor registry on `:6420`. Running them in parallel is
+valid — the actors hold their own state, clients only dispatch.
+
+## Agents: Conversation, Tools, Compaction, Memory
+
+`/agent` is a program that treats an `agent`-typed Glon object as the durable
+home of a conversation. Every prompt, assistant text, `tool_use`, `tool_result`,
+and `compaction_summary` is a block in that object's DAG.
+
+### Conversation view
+
+The model-facing view of the conversation is derived, not stored:
+
+1. Classify blocks into typed items (user_text, assistant_text, tool_use,
+   tool_result, compaction).
+2. If a `compaction_summary` block exists, filter to items at or after
+   `first_kept_block_id` and inject the latest summary into the system prompt
+   as `<conversation-summary>`.
+3. Group contiguous same-role items into Anthropic-shaped turns.
+
+Pre-compaction blocks stay in the DAG. Any peer replaying the history can ignore
+compaction blocks and see the full original conversation.
+
+### Tool registration and `bound_args`
+
+Agents register tools as ValueMap entries on their `tools` field. Each tool
+carries a target (`target_prefix`, `target_action`) that dispatches to another
+program's actor action, plus an optional `bound_args` map. At tool-use time the
+dispatcher merges `bound_args` **over** the model's input before calling the
+target — so callers can bind identity (e.g. `owner = agentId`) that the model
+cannot spoof by passing its own value.
+
+This turns registered tools into partially-applied program actions: the model
+provides the task-specific arguments, the registrar provides the identity-
+scoped ones.
+
+### Compaction (two-stage)
+
+Before each ask, `shouldAutoCompact` estimates the effective system prompt +
+messages + memory digest against `contextWindow - reserveTokens`. Over threshold
+triggers `doCompact`:
+
+- **Stage A (opt-in, `memory_extraction_enabled`):** a private tool set exposes
+  `/memory.upsert_fact`, `upsert_milestone`, `amend_milestone`, `list_*`, and
+  `recall`, each with `bound_args = { owner: agentId }`. A tool-using summariser
+  reads the pre-cut region, inspects existing memory first, then writes structured
+  facts and milestones directly into the store. Failures degrade to Stage B.
+- **Stage B (always):** single LLM call produces a narrative `compaction_summary`
+  block covering the kept region. Knows Stage A ran, so it focuses on arc
+  (goal / progress / next steps) rather than re-listing facts memory already holds.
+
+An Anthropic context-overflow during an ask triggers a one-time mid-flight
+compaction + retry.
+
+## Memory: Facts and Milestones
+
+`/memory` gives agents two object types for durable knowledge that survives
+compaction and syncs between instances like any other Glon object.
+
+### Object types
+
+```
+pinned_fact
+  owner: ObjectLink<agent>
+  key: string                 unique per (owner, key)
+  value: string
+  confidence: low | med | high
+  sourced_from_block_id?: string
+
+milestone
+  owner: ObjectLink<agent>
+  title: string
+  narrative: string
+  topics: string[]
+  peers: ObjectLink<peer>[]
+  supersedes: ObjectLink<milestone>[]   # amendment/replacement chain
+  status: active | completed | superseded
+  confidence: low | med | high
+  sourced_from_blocks: string[]
+  started_at / ended_at: int (ms)
+```
+
+### Write paths
+
+- `upsert_fact(owner, key, value, ...)` — one row per `(owner, key)`. Same key
+  replaces value in place via `FieldSet`; prior value stays in `object_history`.
+- `upsert_milestone(owner, {...}, supersedes?)` — creates a new milestone and
+  flips each `supersedes` target's `status` to `superseded`.
+- `amend_milestone(id, {...})` — `FieldSet` on specific fields of an existing
+  milestone. Every amendment is a `Change` in that milestone's DAG.
+
+Local writes go through these action helpers (input validation). Peer-synced
+writes hit a registered validator that enforces required fields on create
+batches and enum shape on amendments. The validator is registered on
+`validatedTypes: ["pinned_fact", "milestone"]` and fires before disk write
+in `pushChanges`.
+
+### Read paths
+
+- `list_facts(owner, key?)`, `list_milestones(owner, {status?, topic?, peer_id?, limit?})` — enumerate.
+- `recall(owner, {query?, topics?, peer_ids?, time_range?})` — scoped search.
+- `digest(owner)` — markdown digest ready for system-prompt injection,
+  superseded milestones excluded, capped at `max_facts=40 / max_milestones=8`.
+
+When an agent has `memory_digest_enabled: true`, `runAsk` prepends the digest
+to the effective system prompt. Facts and milestones the model just wrote or
+amended are visible on the next turn. `shouldAutoCompact` also counts digest
+tokens in its threshold estimate.
+
+### Why objects, not a flat summary
+
+One `pinned_fact` object per `(owner, key)` means an update is one `FieldSet`
+op, not a blob rewrite. The full edit chain is recoverable from `object_history`.
+Milestones supersede via `ObjectLink`, which the store's link index tracks in
+both directions — "what replaced milestone X?" is a cheap reverse-link query.
+
+### Ownership model
+
+Everything in `/memory` is agent-scoped through the `owner` `ObjectLink` field.
+Two agents sharing a Glon store have independent memory. An agent reading its
+own store is a regular `object_list type_key=pinned_fact/milestone` query; no
+special read path.
+
 
 ## Security Model
 

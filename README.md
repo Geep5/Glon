@@ -75,13 +75,19 @@ reach disk.
 | `/crud` | Create, list, get, set, delete objects |
 | `/inspect` | DAG history, change details, sync state |
 | `/ipc` | Inter-object messaging (inbox/outbox) |
+| `/graph` | Object link traversal, neighbours, BFS |
 | `/ttt` | Tic-tac-toe — every move is a content-addressed change |
 | `/chat` | Chat rooms — messages are blocks in the DAG |
-| `/agent` | LLM agents with DAG-backed conversation history |
+| `/agent` | LLM agents with DAG-backed conversation history + auto-compaction |
+| `/memory` | Durable agent memory: pinned facts and milestone arcs that survive compaction |
+| `/peer` | People and agents Gracie talks to: identity, trust level, contact handles |
+| `/remind` | Scheduled actions: DM at a time, prompt the agent to compose then send |
+| `/discord` | I/O bridge: polls DMs and routes to `/gracie.ingest`, posts replies back |
+| `/gracie` | Executive-assistant driver: wraps an `/agent` with identity-aware ingest + tools |
+| `/web` | HTTP client (fetch, get-text, get-json) with SSRF guard |
 | `/gc` | Garbage collection with retention policies |
 | `/accounts` | Multi-user auth and per-object permissions |
 | `/sync` | P2P sync via mDNS discovery and HTTP |
-
 ### Example: LLM Agent
 
 Agents store every prompt and response as changes in the DAG — content-addressed,
@@ -99,6 +105,51 @@ glon> /agent ask 9b2e What are the tradeoffs of event sourcing vs CRUD?
 glon> /agent inject c41a 9b2e       # inject analyst's context into another agent
 glon> /agent ask c41a What did the analyst get wrong?
 ```
+
+### Example: Executive Assistant (Gracie)
+
+Gracie is an `/agent` wrapped with identity-awareness, a peer directory, a
+memory store, and bridge programs. Inbound messages from any source (shell,
+Discord, future bridges) get tagged with `[from {name} on {source}, trust={level}]`
+before reaching the model.
+
+```bash
+ANTHROPIC_API_KEY=sk-... npm run client
+```
+```
+glon> /gracie setup
+  Gracie ready
+  agent:  8d536600-...     (created)
+  grant:  6b1d0272-...     (created)
+  tools:  peer_*, remind_*, discord_send, object_*, web_*, memory_*
+
+glon> /gracie say My wife's name is Sarah. Save that.
+  gracie (to Grant)
+  Saved. wife_name=Sarah.
+  (one tool call: memory_upsert_fact)
+
+# Restart the daemon, start a fresh session — the fact survives.
+glon> /gracie say What's my wife's name?
+  gracie (to Grant)
+  Sarah.
+  (no tool calls — served from her memory digest)
+```
+
+**How it survives compaction.** When the conversation crosses the auto-compact
+threshold, Gracie's compactor runs a tool-using extraction pass first: facts go to
+`pinned_fact` objects, multi-turn arcs go to `milestone` objects (with `supersedes`
+chains for amendments). A short narrative summary covers the kept region. Both
+are blocks in the DAG — every prior value is recoverable via `object_history`.
+
+**Headless mode.** For background operation (Discord polling, scheduled reminders,
+memory writes without a shell):
+
+```bash
+ANTHROPIC_API_KEY=sk-... DISCORD_BOT_TOKEN=... npx tsx scripts/daemon.ts
+```
+
+Loads every program, starts their actor instances, exposes a local HTTP
+dispatch endpoint on `127.0.0.1:6430` for `POST /dispatch {prefix, action, args}`.
 
 ### Example: Multi-Instance Chat
 
@@ -170,10 +221,22 @@ src/
   client.ts                   CLI shell (pure program loader)
   programs/
     runtime.ts                module bundler, actor lifecycle, validators
-    handlers/                 one file per program
+    handlers/                 one file per program (16 today)
+scripts/
+  daemon.ts                   headless host: load programs, run actors, HTTP dispatch
+  dispatch.ts                 thin HTTP client for the daemon
+  read-agent-blocks.ts        diagnostic: dump an agent's conversation blocks
 test/
   dag.test.ts                 DAG replay, snapshots
   runtime.test.ts             program actor lifecycle
+  agent-compaction.test.ts    compaction view, cut-point, summary block
+  agent-tooluse.test.ts       tool registration + tool-use loop
+  peer.test.ts                peer CRUD + find-or-create
+  remind.test.ts              scheduling and tick
+  discord.test.ts             bridge polling + send
+  gracie.test.ts              ingest wrapping + bootstrap idempotency
+  web.test.ts                 HTTP client + SSRF guard
+  introspection.test.ts       agent reads its own source via /crud
 ```
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for internals: DAG replay, actor state
