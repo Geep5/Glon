@@ -249,9 +249,15 @@ async function pollPeer(peer: PeerSnapshot, state: Record<string, any>, ctx: Pro
 			}
 		} catch (err: any) {
 			// Don't let one bad message poison the rest of the poll.
-			try {
-				await postMessage(channelId, `[error: ${err?.message ?? String(err)}]`);
-			} catch { /* best-effort */ }
+			const raw = err?.message ?? String(err);
+			// Log the full error to the daemon so it's debuggable after the fact.
+			// Discord only sees the user-friendly version below.
+			ctx.print(red(`  [discord] ingest failed for peer ${peer.id}: ${raw}`));
+			const userFacing = /fetch failed|econnreset|etimedout|socket hang up/i.test(raw)
+				? "[network hiccup talking to my model — try again in a sec]"
+				: `[error: ${raw}]`;
+			try { await postMessage(channelId, userFacing); }
+			catch { /* best-effort */ }
 		}
 	}
 	return processed;
