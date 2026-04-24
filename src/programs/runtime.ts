@@ -61,6 +61,12 @@ export interface ProgramContext {
 
 	/** Get an object actor handle by ID. */
 	objectActor: (id: string) => unknown;
+
+	/**
+	 * Dispatch an action on another program's actor by prefix.
+	 * Throws if no program is running at that prefix or the action is unknown.
+	 */
+	dispatchProgram: (prefix: string, action: string, args: unknown[]) => Promise<unknown>;
 }
 
 /** Validation result returned by program validators. */

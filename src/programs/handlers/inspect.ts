@@ -6,7 +6,7 @@
  * understanding the content-addressed DAG.
  */
 
-import type { ProgramDef, ProgramContext } from "../runtime.js";
+import type { ProgramDef, ProgramContext, ProgramActorDef } from "../runtime.js";
 import type { Change } from "../../proto.js";
 
 const DIM = "\x1b[2m";
@@ -243,6 +243,85 @@ async function cmdDisk(_args: string[], ctx: ProgramContext): Promise<void> {
 	ctx.print("  " + cyan("Path:     ") + stats.path);
 }
 
+// ── Shared helpers for actor actions ────────────────────────────────
+
+function asObj(input: unknown): Record<string, any> {
+	if (input && typeof input === "object" && !Array.isArray(input)) return input as any;
+	if (typeof input === "string") {
+		try { return JSON.parse(input); } catch { /* fall through */ }
+	}
+	return {};
+}
+
+function opSummaryStruct(op: any): Record<string, unknown> {
+	if (op.objectCreate) return { type: "objectCreate", type_key: op.objectCreate.typeKey };
+	if (op.objectDelete) return { type: "objectDelete" };
+	if (op.fieldSet) return { type: "fieldSet", key: op.fieldSet.key };
+	if (op.fieldDelete) return { type: "fieldDelete", key: op.fieldDelete.key };
+	if (op.contentSet) return { type: "contentSet", bytes: op.contentSet.content?.byteLength ?? 0 };
+	if (op.blockAdd) return { type: "blockAdd", block_id: op.blockAdd.block?.id };
+	if (op.blockRemove) return { type: "blockRemove", block_id: op.blockRemove.blockId };
+	if (op.blockUpdate) return { type: "blockUpdate", block_id: op.blockUpdate.blockId };
+	if (op.blockMove) return { type: "blockMove", block_id: op.blockMove.blockId };
+	return { type: "unknown" };
+}
+
+const actorDef: ProgramActorDef = {
+	createState: () => ({}),
+	actions: {
+		history: async (ctx: ProgramContext, input: unknown) => {
+			const o = asObj(input);
+			const object_id = typeof input === "string" ? input : (o.object_id ?? o.id);
+			if (!object_id || typeof object_id !== "string") throw new Error("history: object_id required");
+			const limit = typeof o.limit === "number" && o.limit > 0 ? o.limit : 100;
+			const hexIds = ctx.listChangeFiles();
+			const matches: Change[] = [];
+			for (const hex of hexIds) {
+				const c = ctx.readChangeByHex(hex);
+				if (c && c.objectId === object_id) matches.push(c);
+			}
+			matches.sort((a, b) => a.timestamp - b.timestamp);
+			const sliced = matches.slice(-limit);
+			return {
+				total: matches.length,
+				changes: sliced.map((c) => ({
+					hex_id: ctx.hexEncode(c.id),
+					timestamp: c.timestamp,
+					author: c.author || null,
+					parent_hex_ids: c.parentIds.map((p) => ctx.hexEncode(p)),
+					op_summary: summarizeOps(c),
+					ops: c.ops.map(opSummaryStruct),
+				})),
+			};
+		},
+
+		heads: async (ctx: ProgramContext, input: unknown) => {
+			const o = asObj(input);
+			const object_id = typeof input === "string" ? input : (o.object_id ?? o.id);
+			if (!object_id || typeof object_id !== "string") throw new Error("heads: object_id required");
+			const actor = (ctx.client as any).objectActor.getOrCreate([object_id]);
+			const state = await actor.read();
+			return { head_ids: state.headIds ?? [] };
+		},
+
+		changeDetail: async (ctx: ProgramContext, input: unknown) => {
+			const o = asObj(input);
+			const hex_id = typeof input === "string" ? input : (o.hex_id ?? o.id);
+			if (!hex_id || typeof hex_id !== "string") throw new Error("changeDetail: hex_id required");
+			const c = ctx.readChangeByHex(hex_id);
+			if (!c) return null;
+			return {
+				hex_id: ctx.hexEncode(c.id),
+				object_id: c.objectId,
+				timestamp: c.timestamp,
+				author: c.author || null,
+				parent_hex_ids: c.parentIds.map((p) => ctx.hexEncode(p)),
+				ops: c.ops.map(opSummaryStruct),
+			};
+		},
+	},
+};
+
 const programDef: ProgramDef = {
 	handler: async (cmd: string, args: string[], ctx: ProgramContext) => {
 		switch (cmd) {
@@ -260,6 +339,7 @@ const programDef: ProgramDef = {
 				ctx.print("Commands: history, change, heads, changes, snapshot, sync, remote, info, disk");
 		}
 	},
+	actor: actorDef,
 };
 
 export default programDef;

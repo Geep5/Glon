@@ -31,10 +31,11 @@ function dummyCtx(overrides: Partial<ProgramContext> = {}): ProgramContext {
 		floatVal: (n: number) => ({ floatValue: n }),
 		boolVal,
 		mapVal: () => ({ mapValue: { entries: {} } }),
-		listVal: () => ({ listValue: { values: [] } }),
+		listVal: () => ({ valuesValue: { items: [] } }),
 		displayValue: () => "",
 		listChangeFiles: () => [],
 		readChangeByHex: () => null,
+		linkVal: (targetId: string, relationKey: string) => ({ linkValue: { targetId, relationKey } }),
 		hexEncode: () => "",
 		print: () => {},
 		randomUUID: () => "test-uuid",
@@ -42,6 +43,7 @@ function dummyCtx(overrides: Partial<ProgramContext> = {}): ProgramContext {
 		emit: () => {},
 		programId: "test-program",
 		objectActor: () => ({}),
+		dispatchProgram: async () => undefined,
 		...overrides,
 	};
 }

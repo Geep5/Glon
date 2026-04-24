@@ -38,6 +38,12 @@ const SOURCES = [
 	"src/programs/handlers/accounts.ts",
 	"src/programs/handlers/sync.ts",
 	"src/programs/handlers/graph.ts",
+	"src/programs/handlers/peer.ts",
+	"src/programs/handlers/gracie.ts",
+	"src/programs/handlers/discord.ts",
+	"src/programs/handlers/remind.ts",
+	"src/programs/handlers/web.ts",
+	"src/programs/handlers/memory.ts",
 	"package.json",
 	"tsconfig.json",
 ];
@@ -139,6 +145,12 @@ const PROGRAMS: ProgramDef[] = [
 			config: "Set model/system/name",
 			read: "Peek at agent conversation",
 			inject: "Inject context from another agent",
+			"register-tool": "Register a tool (dispatches to another program)",
+			"unregister-tool": "Remove a registered tool",
+			tools: "List registered tools",
+			status: "Show token usage + compaction state",
+			compact: "Manually compact old conversation turns",
+			"view-summary": "Show latest compaction summary in full",
 		},
 		entry: "agent.ts",
 		modules: { "agent.ts": "src/programs/handlers/agent.ts" },
@@ -197,6 +209,82 @@ const PROGRAMS: ProgramDef[] = [
 		entry: "graph.ts",
 		modules: { "graph.ts": "src/programs/handlers/graph.ts" },
 	},
+	{
+		prefix: "/peer",
+		name: "Peer",
+		commands: {
+			add: "Add a peer (person, agent, service)",
+			list: "List peers (filter by --kind / --trust)",
+			get: "Show a peer's full record",
+			trust: "Change a peer's trust level",
+			set: "Set a peer field (display_name, email, notes, ...)",
+			remove: "Tombstone a peer",
+		},
+		entry: "peer.ts",
+		modules: { "peer.ts": "src/programs/handlers/peer.ts" },
+	},
+	{
+		prefix: "/gracie",
+		name: "Gracie",
+		commands: {
+			setup: "Bootstrap Gracie (create agent + self peer)",
+			say: "Grant talks to Gracie from the shell",
+			ingest: "Deliver a message from a peer on a source",
+			status: "Show current agent + principal ids",
+		},
+		entry: "gracie.ts",
+		modules: { "gracie.ts": "src/programs/handlers/gracie.ts" },
+	},
+	{
+		prefix: "/discord",
+		name: "Discord",
+		commands: {
+			status: "Show bridge state (bot user, watermarks, channels cached)",
+			send: "Send a DM to a peer (diagnostic)",
+			poll: "Trigger a poll cycle now (diagnostic)",
+		},
+		entry: "discord.ts",
+		modules: { "discord.ts": "src/programs/handlers/discord.ts" },
+	},
+	{
+		prefix: "/remind",
+		name: "Remind",
+		commands: {
+			schedule: "Schedule a future action",
+			list: "List reminders (filter by --peer/--status/--channel/--before)",
+			get: "Show a reminder's full record",
+			cancel: "Cancel a pending reminder",
+			tick: "Run the scheduler once now (diagnostic)",
+		},
+		entry: "remind.ts",
+		modules: { "remind.ts": "src/programs/handlers/remind.ts" },
+	},
+	{
+		prefix: "/web",
+		name: "Web",
+		commands: {
+			status: "Show limits + SSRF policy",
+			fetch: "GET a URL and print the body (diagnostic)",
+			"get-text": "GET + decode as UTF-8 (diagnostic)",
+			"get-json": "GET + parse JSON (diagnostic)",
+		},
+		entry: "web.ts",
+		modules: { "web.ts": "src/programs/handlers/web.ts" },
+	},
+	{
+		prefix: "/memory",
+		name: "Memory",
+		commands: {
+			facts: "List pinned facts for an agent",
+			milestones: "List milestones for an agent",
+			get: "Show one milestone in full",
+			digest: "System-prompt-ready memory digest",
+			recall: "Scoped search over memory",
+			"forget-fact": "Tombstone a fact (recoverable via object_history)",
+		},
+		entry: "memory.ts",
+		modules: { "memory.ts": "src/programs/handlers/memory.ts" },
+	},
 ];
 
 const KIND_MAP: Record<string, string> = {
@@ -211,6 +299,7 @@ function kindOf(file: string): string {
 }
 
 async function main() {
+	const FORCE = process.argv.includes("--force");
 	const projectRoot = resolve(import.meta.dirname ?? ".", "..");
 
 	initDisk();
@@ -218,8 +307,7 @@ async function main() {
 	const client = createClient<typeof app>(ENDPOINT);
 	const store = client.storeActor.getOrCreate(["root"]);
 
-	console.log("Bootstrapping Glon...\n");
-
+	console.log(FORCE ? "Bootstrapping Glon (force mode: existing objects will be updated)...\n" : "Bootstrapping Glon...\n");
 	// Build lookup of existing objects by type+name for idempotency.
 	const existingByKey = new Map<string, string>();
 	try {
@@ -238,6 +326,7 @@ async function main() {
 	}
 
 	let created = 0;
+	let updated = 0;
 	let skipped = 0;
 
 	for (const relPath of SOURCES) {
@@ -245,9 +334,10 @@ async function main() {
 		const name = basename(relPath);
 		const kind = kindOf(relPath);
 
-		// Idempotency: skip if an object of this type+name already exists.
-		if (existingByKey.has(`${kind}::${name}`)) {
-			console.log(`  EXIST ${relPath.padEnd(28)} ${kind.padEnd(12)} ${existingByKey.get(`${kind}::${name}`)!.slice(0, 12)}...`);
+		// Idempotency: skip (or update on --force) if an object of this type+name already exists.
+		const existingSourceId = existingByKey.get(`${kind}::${name}`);
+		if (existingSourceId && !FORCE) {
+			console.log(`  EXIST ${relPath.padEnd(28)} ${kind.padEnd(12)} ${existingSourceId.slice(0, 12)}...`);
 			skipped++;
 			continue;
 		}
@@ -272,9 +362,21 @@ async function main() {
 		});
 
 		try {
-			const id = await store.create(kind, fieldsJson, contentBase64);
-			console.log(`  OK    ${relPath.padEnd(28)} ${kind.padEnd(12)} ${id.slice(0, 12)}...`);
-			created++;
+			if (existingSourceId) {
+				// Force-update: overwrite content and size/lines fields on the existing object.
+				const actor = client.objectActor.getOrCreate([existingSourceId]);
+				await actor.setContent(contentBase64);
+				await actor.setFields(JSON.stringify({
+					lines: intVal(lineCount),
+					size: intVal(raw.byteLength),
+				}));
+				console.log(`  UPD   ${relPath.padEnd(28)} ${kind.padEnd(12)} ${existingSourceId.slice(0, 12)}...`);
+				updated++;
+			} else {
+				const id = await store.create(kind, fieldsJson, contentBase64);
+				console.log(`  OK    ${relPath.padEnd(28)} ${kind.padEnd(12)} ${id.slice(0, 12)}...`);
+				created++;
+			}
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
 			console.log(`  ERR   ${relPath} — ${msg}`);
@@ -286,8 +388,9 @@ async function main() {
 	console.log("\nSeeding programs...\n");
 
 	for (const prog of PROGRAMS) {
-		if (existingByKey.has(`program::${prog.prefix}`)) {
-			console.log(`  EXIST ${prog.prefix.padEnd(10)} ${prog.name.padEnd(16)} ${existingByKey.get(`program::${prog.prefix}`)!.slice(0, 12)}...`);
+		const existingProgId = existingByKey.get(`program::${prog.prefix}`);
+		if (existingProgId && !FORCE) {
+			console.log(`  EXIST ${prog.prefix.padEnd(10)} ${prog.name.padEnd(16)} ${existingProgId.slice(0, 12)}...`);
 			skipped++;
 			continue;
 		}
@@ -325,17 +428,31 @@ async function main() {
 		});
 
 		try {
-			const id = await store.create("program", fieldsJson);
-			console.log(`  OK    ${prog.prefix.padEnd(10)} ${prog.name.padEnd(16)} ${id.slice(0, 12)}... (${Object.keys(prog.modules).length} modules)`);
-			created++;
+			if (existingProgId) {
+				// Force-update: overwrite commands + manifest on the existing program object.
+				const actor = client.objectActor.getOrCreate([existingProgId]);
+				await actor.setFields(JSON.stringify({
+					commands: mapVal(commandEntries),
+					manifest: mapVal({
+						entry: stringVal(prog.entry),
+						modules: mapVal(moduleEntries),
+					}),
+				}));
+				console.log(`  UPD   ${prog.prefix.padEnd(10)} ${prog.name.padEnd(16)} ${existingProgId.slice(0, 12)}... (${Object.keys(prog.modules).length} modules)`);
+				updated++;
+			} else {
+				const id = await store.create("program", fieldsJson);
+				console.log(`  OK    ${prog.prefix.padEnd(10)} ${prog.name.padEnd(16)} ${id.slice(0, 12)}... (${Object.keys(prog.modules).length} modules)`);
+				created++;
+			}
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
-			console.log(`  ERR   ${prog.name} \u2014 ${msg}`);
+			console.log(`  ERR   ${prog.name} — ${msg}`);
 			skipped++;
 		}
 	}
 
-	console.log(`\nDone. ${created} created, ${skipped} skipped.`);
+	console.log(`\nDone. ${created} created, ${updated} updated, ${skipped} skipped.`);
 
 	try {
 		const info = await store.info();

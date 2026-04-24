@@ -14,7 +14,7 @@ import { createInterface } from "node:readline";
 import { diskStats, readChangeByHex, listChangeFiles } from "./disk.js";
 import { hexEncode } from "./crypto.js";
 import { stringVal, intVal, floatVal, boolVal, mapVal, listVal, linkVal, displayValue } from "./proto.js";
-import { loadPrograms, dispatchProgram, startProgramActor, type ProgramContext, type ProgramEntry } from "./programs/runtime.js";
+import { loadPrograms, dispatchProgram, startProgramActor, dispatchActorAction, getProgramActorByPrefix, type ProgramContext, type ProgramEntry } from "./programs/runtime.js";
 import { randomUUID } from "node:crypto";
 
 const ENDPOINT = process.env.GLON_ENDPOINT ?? "http://localhost:6420";
@@ -73,6 +73,16 @@ function buildContext(overrides?: Partial<ProgramContext>): ProgramContext {
 		emit: () => {},
 		programId: "",
 		objectActor: (id: string) => client.objectActor.getOrCreate([id]),
+		dispatchProgram: async (prefix: string, action: string, args: unknown[]) => {
+			const inst = getProgramActorByPrefix(prefix);
+			if (!inst) throw new Error(`Program not running: ${prefix}`);
+			return await dispatchActorAction(
+				inst.programId,
+				action,
+				args,
+				(state) => buildContext({ state, programId: inst.programId }),
+			);
+		},
 		...overrides,
 	};
 }
@@ -92,7 +102,7 @@ async function main() {
 			// Start program actors
 			for (const prog of programs) {
 				try {
-					await startProgramActor(prog, client);
+					await startProgramActor(prog, (state) => buildContext({ state, programId: prog.id }));
 				} catch (err) {
 					const msg = err instanceof Error ? err.message : String(err);
 					console.log(red(`Failed to start ${prog.prefix}: ${msg}`));

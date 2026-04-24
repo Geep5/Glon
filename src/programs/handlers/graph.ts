@@ -1,4 +1,4 @@
-import type { ProgramDef, ProgramContext } from "../runtime.js";
+import type { ProgramDef, ProgramContext, ProgramActorDef } from "../runtime.js";
 
 const DIM = "\x1b[2m";
 const BOLD = "\x1b[1m";
@@ -106,5 +106,72 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 	}
 };
 
-const program: ProgramDef = { handler };
+// ── Shared helpers for actor actions ────────────────────────────────
+
+function asObj(input: unknown): Record<string, any> {
+	if (input && typeof input === "object" && !Array.isArray(input)) return input as any;
+	if (typeof input === "string") {
+		try { return JSON.parse(input); } catch { /* fall through */ }
+	}
+	return {};
+}
+
+function resolveObjectIdArg(input: unknown): string {
+	if (typeof input === "string") return input;
+	const o = asObj(input);
+	const id = o.object_id ?? o.id;
+	if (typeof id !== "string" || !id) throw new Error("object_id required");
+	return id;
+}
+
+const actorDef: ProgramActorDef = {
+	createState: () => ({}),
+	actions: {
+		links: async (ctx: ProgramContext, input: unknown) => {
+			const id = resolveObjectIdArg(input);
+			const store = ctx.store as any;
+			const outbound = (await store.getLinks(id)) as Array<{ relationKey: string; targetId: string }>;
+			const inbound = (await store.getBacklinks(id)) as Array<{ relationKey: string; sourceId: string }>;
+			return {
+				outbound: outbound.map((l) => ({ relation_key: l.relationKey, target_id: l.targetId })),
+				inbound: inbound.map((l) => ({ relation_key: l.relationKey, source_id: l.sourceId })),
+			};
+		},
+
+		neighbors: async (ctx: ProgramContext, input: unknown) => {
+			const id = resolveObjectIdArg(input);
+			const store = ctx.store as any;
+			const result = await store.neighbors(id) as { outbound: any[]; inbound: any[] };
+			return {
+				outbound: (result.outbound ?? []).map((n: any) => ({
+					id: n.id, type_key: n.typeKey, relation_key: n.relationKey,
+				})),
+				inbound: (result.inbound ?? []).map((n: any) => ({
+					id: n.id, type_key: n.typeKey, relation_key: n.relationKey,
+				})),
+			};
+		},
+
+		traverse: async (ctx: ProgramContext, input: unknown) => {
+			const o = asObj(input);
+			const id = typeof input === "string" ? input : (o.object_id ?? o.id);
+			if (!id || typeof id !== "string") throw new Error("traverse: object_id required");
+			const requestedDepth = typeof o.max_depth === "number" ? o.max_depth : 2;
+			const max_depth = Math.max(0, Math.min(requestedDepth, 5));
+			const max_nodes = typeof o.max_nodes === "number" && o.max_nodes > 0 ? Math.min(o.max_nodes, 200) : 200;
+			const nodes = (await (ctx.store as any).graphQuery(id, max_depth)) as Array<{
+				id: string; typeKey: string; depth: number; links: Array<{ relationKey: string; targetId: string }>;
+			}>;
+			return {
+				nodes: nodes.slice(0, max_nodes).map((n) => ({
+					id: n.id, type_key: n.typeKey, depth: n.depth,
+					links: (n.links ?? []).map((l) => ({ relation_key: l.relationKey, target_id: l.targetId })),
+				})),
+				truncated: nodes.length > max_nodes,
+			};
+		},
+	},
+};
+
+const program: ProgramDef = { handler, actor: actorDef };
 export default program;

@@ -292,8 +292,22 @@ const objectActor = actor({
 				decoded.push(decodeChange(new Uint8Array(bytes)));
 			}
 
-			// Run program validator if registered for this object type
-			const validator = getValidator(c.vars.typeKey);
+			// Resolve type for validator lookup.
+			// c.vars.typeKey is empty for brand-new objects whose first change is in this
+			// batch — fall back to scanning the batch for an objectCreate so new-object
+			// pushes get validated the same as amendments.
+			let effectiveTypeKey = c.vars.typeKey;
+			if (!effectiveTypeKey) {
+				outer: for (const ch of decoded) {
+					for (const op of ch.ops ?? []) {
+						if (op.objectCreate?.typeKey) {
+							effectiveTypeKey = op.objectCreate.typeKey;
+							break outer;
+						}
+					}
+				}
+			}
+			const validator = getValidator(effectiveTypeKey);
 			if (validator) {
 				const result = validator(decoded);
 				if (!result.valid) {
@@ -777,6 +791,12 @@ const programActor = actor({
 				},
 				programId: c.state.programId,
 				objectActor: (id: string) => c.client<typeof app>().objectActor.getOrCreate([id]),
+				dispatchProgram: async (prefix: string, actionName: string, actionArgs: unknown[]) => {
+					const { getProgramActorByPrefix, dispatchActorAction: dispatch2 } = await import("./programs/runtime.js");
+					const inst = getProgramActorByPrefix(prefix);
+					if (!inst) throw new Error(`Program not running: ${prefix}`);
+					return await dispatch2(inst.programId, actionName, actionArgs, makeCtx);
+				},
 			});
 			const result = await dispatchActorAction(c.state.programId, action, args, makeCtx);
 			return JSON.stringify(result ?? null);
@@ -796,6 +816,9 @@ const programActor = actor({
 
 export const app = setup({
 	use: { objectActor, storeActor, programActor },
+	// Program manifests (base64 source) routinely exceed the default message
+	// cap; bump to 10MB so large programs like /agent + compaction fit.
+	maxIncomingMessageSize: 10_000_000,
 });
 
 app.start();
