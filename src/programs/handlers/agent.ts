@@ -351,6 +351,82 @@ function filterToKept(items: ClassifiedItem[], firstKeptBlockId: string): Classi
 	return items.slice(idx).filter((i) => i.kind !== "compaction");
 }
 
+/**
+ * Pair every `tool_use` with a `tool_result`, synthesizing a stub in-memory
+ * when the DAG lacks one. Also drops `tool_result` blocks whose matching
+ * `tool_use` no longer exists (e.g. filtered away by compaction).
+ *
+ * Why: the Anthropic API rejects messages where a `tool_use` is not
+ * immediately followed by a `tool_result` with the same id. Writes to the
+ * agent object's block list go through RivetKit; if the connection drops
+ * after the `tool_use` block lands but before its `tool_result` block does,
+ * the on-disk conversation is left inconsistent. Fixing it at read time
+ * means the malformed DAG self-heals on the next turn without surgery.
+ *
+ * The synthetic `tool_result` carries `isError=true` so the model sees the
+ * interrupted call for what it was and does not mistake silence for success.
+ */
+function repairToolPairs(items: ClassifiedItem[]): ClassifiedItem[] {
+	const toolUseIds = new Set<string>();
+	const resolvedIds = new Set<string>();
+	for (const item of items) {
+		if (item.kind === "tool_use" && item.toolUseId) toolUseIds.add(item.toolUseId);
+		if (item.kind === "tool_result" && item.toolUseId) resolvedIds.add(item.toolUseId);
+	}
+
+	const out: ClassifiedItem[] = [];
+	for (const item of items) {
+		if (item.kind === "tool_result") {
+			// Drop orphan tool_results whose tool_use was lost (e.g. trimmed by
+			// filterToKept). Sending them to the API would raise a symmetric error.
+			if (!item.toolUseId || !toolUseIds.has(item.toolUseId)) continue;
+		}
+		out.push(item);
+		if (item.kind === "tool_use" && item.toolUseId && !resolvedIds.has(item.toolUseId)) {
+			out.push({
+				kind: "tool_result",
+				blockId: `__synthetic:${item.toolUseId}`,
+				toolUseId: item.toolUseId,
+				content: "[tool call was interrupted before producing a result — treat this as a failed call and proceed.]",
+				isError: true,
+				timestamp: item.timestamp + 1,
+			});
+			resolvedIds.add(item.toolUseId);
+		}
+	}
+	return out;
+}
+
+/**
+ * Merge adjacent same-role turns into one. Anthropic requires `messages[]`
+ * to alternate user/assistant; a synthesized `tool_result` turn immediately
+ * followed by the runtime-appended user prompt would otherwise produce two
+ * user messages in a row.
+ */
+function mergeConsecutiveTurns(turns: Turn[]): Turn[] {
+	const toArray = (c: Turn["content"]): AnthropicContent[] => {
+		if (typeof c === "string") return c.length > 0 ? [{ type: "text", text: c }] : [];
+		return [...c];
+	};
+	const out: Turn[] = [];
+	for (const t of turns) {
+		const last = out[out.length - 1];
+		if (last && last.role === t.role) {
+			const merged = [...toArray(last.content), ...toArray(t.content)];
+			// Preserve the bare-string shape when both sides were simple text so
+			// existing tests continue to observe the same content type.
+			if (merged.length === 1 && merged[0].type === "text") {
+				last.content = merged[0].text;
+			} else {
+				last.content = merged;
+			}
+		} else {
+			out.push({ ...t });
+		}
+	}
+	return out;
+}
+
 /** Group contiguous same-role items into Turn[]. */
 function groupIntoTurns(items: ClassifiedItem[]): Turn[] {
 	const turns: Turn[] = [];
@@ -427,21 +503,33 @@ interface ConversationView {
 	latestCompaction: Extract<ClassifiedItem, { kind: "compaction" }> | null;
 }
 
-/** Build the model-facing view of the conversation: system extension + turns. */
+/**
+ * Build the model-facing view of the conversation: system extension + turns.
+ *
+ * Three defensive passes on top of raw blocks:
+ *   1. classifyBlocks  — parse each block into a typed item.
+ *   2. repairToolPairs  — synthesize stubs for orphan tool_uses and drop
+ *      unpaired tool_results so the Anthropic API never sees a torn pair.
+ *   3. mergeConsecutiveTurns — collapse accidental user/user or
+ *      assistant/assistant sequences (can arise from synthesis or from the
+ *      runtime appending a fresh user prompt after a repaired tool_result).
+ */
 function buildConversationView(blocks: any[], provenance: Record<string, any>): ConversationView {
 	const items = classifyBlocks(blocks, provenance);
 	const latest = findLatestCompaction(items);
 	if (!latest) {
+		const repaired = repairToolPairs(items.filter((i) => i.kind !== "compaction"));
 		return {
 			systemExtension: undefined,
-			turns: groupIntoTurns(items.filter((i) => i.kind !== "compaction")),
+			turns: mergeConsecutiveTurns(groupIntoTurns(repaired)),
 			latestCompaction: null,
 		};
 	}
 	const kept = filterToKept(items, latest.firstKeptBlockId);
+	const repaired = repairToolPairs(kept);
 	return {
 		systemExtension: latest.summary,
-		turns: groupIntoTurns(kept),
+		turns: mergeConsecutiveTurns(groupIntoTurns(repaired)),
 		latestCompaction: latest,
 	};
 }
@@ -2858,6 +2946,8 @@ export const __test = {
 	findLatestCompaction,
 	filterToKept,
 	groupIntoTurns,
+	repairToolPairs,
+	mergeConsecutiveTurns,
 	buildConversationView,
 	findCutIndex,
 	estimateItemTokens,

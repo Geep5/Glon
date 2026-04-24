@@ -305,6 +305,93 @@ describe("classifyBlocks + buildConversationView", () => {
 	});
 });
 
+// ── Tool-pair repair (tool_use without tool_result) ───────────
+
+describe("repairToolPairs + mergeConsecutiveTurns", () => {
+	it("is a no-op on a well-paired conversation", () => {
+		const items = [
+			{ kind: "user_text" as const, blockId: "b1", text: "hi", timestamp: 1 },
+			{ kind: "assistant_text" as const, blockId: "b2", text: "one sec", timestamp: 2 },
+			{ kind: "tool_use" as const, blockId: "b3", toolUseId: "tu_ok", name: "echo", input: { v: 1 }, timestamp: 3 },
+			{ kind: "tool_result" as const, blockId: "b4", toolUseId: "tu_ok", content: "1", isError: false, timestamp: 4 },
+			{ kind: "assistant_text" as const, blockId: "b5", text: "done", timestamp: 5 },
+		];
+		const out = __test.repairToolPairs(items);
+		assert.deepEqual(out, items);
+	});
+
+	it("synthesizes an error tool_result stub for an orphan tool_use", () => {
+		const items = [
+			{ kind: "user_text" as const, blockId: "b1", text: "do X", timestamp: 1 },
+			{ kind: "tool_use" as const, blockId: "b2", toolUseId: "tu_orphan", name: "shell_exec", input: {}, timestamp: 2 },
+		];
+		const out = __test.repairToolPairs(items);
+		assert.equal(out.length, 3);
+		assert.equal(out[2].kind, "tool_result");
+		assert.equal((out[2] as any).toolUseId, "tu_orphan");
+		assert.equal((out[2] as any).isError, true);
+		assert.match((out[2] as any).content, /interrupted/i);
+		assert.match((out[2] as any).blockId, /^__synthetic:/);
+	});
+
+	it("drops orphan tool_results whose matching tool_use is not present", () => {
+		const items = [
+			{ kind: "user_text" as const, blockId: "b1", text: "ok", timestamp: 1 },
+			{ kind: "tool_result" as const, blockId: "b2", toolUseId: "tu_gone", content: "x", isError: false, timestamp: 2 },
+			{ kind: "assistant_text" as const, blockId: "b3", text: "done", timestamp: 3 },
+		];
+		const out = __test.repairToolPairs(items);
+		assert.equal(out.length, 2);
+		assert.equal(out[0].kind, "user_text");
+		assert.equal(out[1].kind, "assistant_text");
+	});
+
+	it("mergeConsecutiveTurns collapses adjacent same-role turns into one", () => {
+		const turns = [
+			{ role: "user" as const, content: "a", timestamp: 1 },
+			{ role: "user" as const, content: "b", timestamp: 2 },
+			{ role: "assistant" as const, content: "c", timestamp: 3 },
+		];
+		const out = __test.mergeConsecutiveTurns(turns);
+		assert.equal(out.length, 2);
+		assert.equal(out[0].role, "user");
+		assert.equal(out[1].role, "assistant");
+	});
+
+	it("end-to-end: buildConversationView repairs an orphan tool_use so messages are API-valid", () => {
+		const h = createHarness();
+		const id = h.seedAgent();
+		h.seedBlocks(id, [
+			{ content: userText("do it") },
+			{ content: assistantText("working") },
+			{ content: toolUseCustom("tu_stuck", "shell_exec", { cmd: "true" }) },
+			// NO tool_result for tu_stuck — simulating a tool_result write that
+			// never landed in the DAG because RivetKit dropped mid-turn.
+		]);
+		const obj = h.objects.get(id)!;
+		const storeBlocks = obj.blocks.map((b) => ({ id: b.id, childrenIds: [], content: b.content }));
+		const provenance = Object.fromEntries(obj.blocks.map((b) => [b.id, { timestamp: b.timestamp, author: "t", changeId: "c" }]));
+
+		const view = __test.buildConversationView(storeBlocks, provenance);
+		// The view must be a valid Anthropic sequence: every tool_use paired
+		// with a tool_result and no two consecutive same-role turns.
+		let tuCount = 0, trCount = 0;
+		for (const turn of view.turns) {
+			const arr = typeof turn.content === "string" ? [] : turn.content;
+			for (const c of arr) {
+				if (c.type === "tool_use") tuCount++;
+				if (c.type === "tool_result") trCount++;
+			}
+		}
+		assert.equal(tuCount, 1);
+		assert.equal(trCount, 1, "orphan tool_use gets a synthesized tool_result paired with it");
+		for (let i = 1; i < view.turns.length; i++) {
+			assert.notEqual(view.turns[i].role, view.turns[i - 1].role, "roles must alternate");
+		}
+	});
+});
+
+
 // ── findCutIndex ─────────────────────────────────────────────────
 
 describe("findCutIndex", () => {
