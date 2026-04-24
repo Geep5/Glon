@@ -176,32 +176,61 @@ async function doTyping(peerId: string, state: Record<string, any>, ctx: Program
 
 // ── Core: polling ────────────────────────────────────────────────
 
+/** Discord snowflake epoch — all snowflake timestamps are offsets from this. */
+const DISCORD_EPOCH_MS = 1420070400000;
+
+/**
+ * Window for processing "recent" messages on the first poll of a channel.
+ *
+ * Rationale: the old behavior was to silently absorb the newest message into
+ * the watermark on first tick, which meant a user's very first DM to the bot
+ * got dropped — a common first-time setup trap. We now process messages whose
+ * snowflake timestamp is within this window so an onboarding DM is answered.
+ * Older history is still skipped so a long-offline bot does not flood on boot.
+ */
+const FIRST_POLL_RECENCY_MS = 15 * 60 * 1000;
+
+/** Extract the Unix ms timestamp encoded in a Discord snowflake id. */
+export function snowflakeTimestampMs(id: string): number {
+	return Number(BigInt(id) >> 22n) + DISCORD_EPOCH_MS;
+}
+
 async function pollPeer(peer: PeerSnapshot, state: Record<string, any>, ctx: ProgramContext): Promise<number> {
 	if (!peer.discord_id) return 0;
 	state.watermarks = state.watermarks ?? {};
 
 	const channelId = await getDmChannel(peer, state);
-	const watermark = state.watermarks[channelId];
+	const watermark = state.watermarks[channelId] as string | undefined;
+	const isFirstPoll = !watermark;
 
-	const qs = watermark ? `?limit=10&after=${watermark}` : `?limit=1`;
+	// First poll: fetch a small tail so we can honour the recency window.
+	// Subsequent polls only need messages after the watermark.
+	const qs = isFirstPoll ? `?limit=5` : `?limit=10&after=${watermark}`;
 	const msgs = await discord("GET", `/channels/${channelId}/messages${qs}`) as DiscordMessage[] | null;
-	if (!msgs || msgs.length === 0) return 0;
-
-	// First tick per channel: set watermark without processing (avoid replaying history).
-	if (!watermark) {
-		state.watermarks[channelId] = msgs[0].id;
+	if (!msgs || msgs.length === 0) {
+		// Ensure the channel has *some* watermark so next tick uses `after`.
+		if (isFirstPoll) state.watermarks[channelId] = "0";
 		return 0;
 	}
 
 	const botUserId = await getBotUserId(state);
-	// Discord returns newest-first; process oldest-first.
+	// Discord returns newest-first; process oldest-first so the DAG sees them in order.
 	const sorted = [...msgs].sort((a, b) => a.id.localeCompare(b.id));
+
+	// On first poll, skip anything older than the recency window. This preserves the
+	// "no unbounded history replay" invariant while still picking up a user's onboarding DM.
+	const now = Date.now();
+	const eligible = isFirstPoll
+		? sorted.filter((m) => now - snowflakeTimestampMs(m.id) <= FIRST_POLL_RECENCY_MS)
+		: sorted;
+
+	// Always advance the watermark to the newest returned message, even for skipped
+	// messages, so the next tick only sees genuinely new traffic.
+	const newest = sorted[sorted.length - 1].id;
+	if (!watermark || newest > watermark) state.watermarks[channelId] = newest;
+
 	let processed = 0;
-
-	for (const m of sorted) {
-		// Update watermark aggressively so we don't re-process on crash.
-		if (m.id > (state.watermarks[channelId] as string)) state.watermarks[channelId] = m.id;
-
+	for (const m of eligible) {
 		const authorId = m.author?.id;
 		if (!authorId || authorId === botUserId) continue;
 		const content = (m.content ?? "").trim();
@@ -241,6 +270,322 @@ async function runPoll(state: Record<string, any>, ctx: ProgramContext): Promise
 	}
 	return { peers: peers.length, processed };
 }
+
+// ── Core: Gateway (presence / "online" status) ─────────────────
+//
+// Discord shows a bot as online only while it holds a live Gateway
+// WebSocket. REST alone can't do it. We maintain a single outbound WSS
+// client from the discord programActor, keep it warm with heartbeats, and
+// reconnect with jittered exponential backoff on any drop.
+//
+// Intents are 0 — we don't subscribe to any events. REST polling already
+// handles inbound DMs. This keeps the bot presence-only, so no privileged
+// intents are required on the Discord developer dashboard.
+//
+// The WS client lives in the daemon process (scripts/daemon.ts). When the
+// daemon dies the connection dies with it; onCreate/onTick re-open it when
+// the daemon is restarted.
+
+const GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json";
+const GATEWAY_PRESENCE_ACTIVITY_NAME = "/gracie say";
+const GATEWAY_PRESENCE_ACTIVITY_TYPE = 2; // 2 = Listening to …
+
+// Gateway opcodes — see https://discord.com/developers/docs/events/gateway-events
+const OP_DISPATCH = 0;
+const OP_HEARTBEAT = 1;
+const OP_IDENTIFY = 2;
+const OP_RECONNECT = 7;
+const OP_INVALID_SESSION = 9;
+const OP_HELLO = 10;
+const OP_HEARTBEAT_ACK = 11;
+
+const GATEWAY_MAX_BACKOFF_MS = 30_000;
+const GATEWAY_BASE_BACKOFF_MS = 1_000;
+
+/** Close codes that indicate we should not retry — configuration is wrong. */
+const GATEWAY_FATAL_CLOSE_CODES = new Set([
+	4004, // authentication failed (bad token)
+	4010, // invalid shard
+	4011, // sharding required
+	4012, // invalid API version
+	4013, // invalid intents
+	4014, // disallowed intents (privileged intent not enabled in dev portal)
+]);
+
+/**
+ * Minimal WebSocket shape we use. We accept `globalThis.WebSocket` (Node 22+)
+ * or a test-injected fake via `globalThis.__DISCORD_GATEWAY_WS_CTOR`.
+ */
+interface GatewayWS {
+	readyState: number;
+	send(data: string): void;
+	close(code?: number, reason?: string): void;
+	// Discord sends everything as text frames; we set these directly on the
+	// instance so test fakes don't need an EventTarget implementation.
+	onopen: ((ev?: any) => void) | null;
+	onmessage: ((ev: { data: string }) => void) | null;
+	onclose: ((ev: { code: number; reason: string }) => void) | null;
+	onerror: ((ev: any) => void) | null;
+}
+
+type GatewayWSCtor = new (url: string) => GatewayWS;
+
+function gatewayWSCtor(): GatewayWSCtor {
+	const injected = (globalThis as any).__DISCORD_GATEWAY_WS_CTOR as GatewayWSCtor | undefined;
+	if (injected) return injected;
+	return WebSocket as unknown as GatewayWSCtor;
+}
+
+/** Build the IDENTIFY payload. Pure — unit-testable. */
+export function buildIdentifyPayload(token: string): unknown {
+	return {
+		op: OP_IDENTIFY,
+		d: {
+			token,
+			intents: 0,
+			properties: {
+				os: process.platform,
+				browser: "glon",
+				device: "glon",
+			},
+			presence: {
+				status: "online",
+				since: null,
+				afk: false,
+				activities: [
+					{ name: GATEWAY_PRESENCE_ACTIVITY_NAME, type: GATEWAY_PRESENCE_ACTIVITY_TYPE },
+				],
+			},
+		},
+	};
+}
+
+/** Jittered exponential backoff. Pure. */
+export function computeReconnectDelayMs(attempt: number, random: () => number = Math.random): number {
+	const base = Math.min(GATEWAY_BASE_BACKOFF_MS * 2 ** Math.max(0, attempt - 1), GATEWAY_MAX_BACKOFF_MS);
+	const jitter = 0.25; // ±25%
+	return Math.round(base * (1 - jitter + random() * jitter * 2));
+}
+
+/** Decide whether the next heartbeat is due. Pure. */
+export function shouldSendHeartbeat(state: Record<string, any>, now: number): boolean {
+	if (!state.gatewayHeartbeatMs) return false;
+	if (!state.gatewayConnected) return false;
+	const last = state.gatewayLastHeartbeatSentAt ?? 0;
+	return now - last >= state.gatewayHeartbeatMs;
+}
+
+/**
+ * Detect a "zombied" connection where we've sent heartbeats but the server
+ * hasn't ack'd in over two intervals. Discord tells us to reconnect in this
+ * case (https://discord.com/developers/docs/events/gateway#heartbeat-interval).
+ */
+export function isHeartbeatAckOverdue(state: Record<string, any>, now: number): boolean {
+	if (!state.gatewayHeartbeatMs) return false;
+	if (!state.gatewayConnected) return false;
+	const lastSent = state.gatewayLastHeartbeatSentAt ?? 0;
+	const lastAck = state.gatewayLastHeartbeatAckAt ?? 0;
+	if (lastSent === 0) return false; // never sent yet
+	if (lastAck >= lastSent) return false; // all ack'd
+	return now - lastSent >= state.gatewayHeartbeatMs * 2;
+}
+
+function sendHeartbeat(state: Record<string, any>, ws: GatewayWS, now: number): void {
+	ws.send(JSON.stringify({ op: OP_HEARTBEAT, d: state.gatewayLastSeq ?? null }));
+	state.gatewayLastHeartbeatSentAt = now;
+}
+
+interface GatewayFrame {
+	op: number;
+	d?: any;
+	s?: number | null;
+	t?: string | null;
+}
+
+/**
+ * Dispatch a received Gateway frame. Returns structured actions for the caller
+ * so we can unit-test the decision logic without real network or timers.
+ */
+export function handleGatewayFrame(state: Record<string, any>, frame: GatewayFrame, now: number): {
+	sendIdentify: boolean;
+	sendHeartbeat: boolean;
+	reconnect: boolean;
+} {
+	let sendIdentify = false;
+	let sendHb = false;
+	let reconnect = false;
+
+	switch (frame.op) {
+		case OP_HELLO: {
+			const intervalMs = Number(frame.d?.heartbeat_interval);
+			if (intervalMs > 0) state.gatewayHeartbeatMs = intervalMs;
+			sendIdentify = true;
+			break;
+		}
+		case OP_HEARTBEAT: {
+			// Server requested an immediate heartbeat (out-of-band).
+			sendHb = true;
+			break;
+		}
+		case OP_HEARTBEAT_ACK: {
+			state.gatewayLastHeartbeatAckAt = now;
+			break;
+		}
+		case OP_RECONNECT: {
+			reconnect = true;
+			break;
+		}
+		case OP_INVALID_SESSION: {
+			// Always treat as non-resumable — we never resume sessions.
+			reconnect = true;
+			break;
+		}
+		case OP_DISPATCH: {
+			if (typeof frame.s === "number") state.gatewayLastSeq = frame.s;
+			if (frame.t === "READY") {
+				state.gatewayIdentified = true;
+				state.gatewayReconnectAttempts = 0;
+				state.botUserId = frame.d?.user?.id ?? state.botUserId;
+			}
+			break;
+		}
+		default: {
+			// Ignore any other opcodes (HEARTBEAT_ACK handled above, etc.).
+			break;
+		}
+	}
+	return { sendIdentify, sendHeartbeat: sendHb, reconnect };
+}
+
+/** Is this close code fatal (stop retrying)? Pure. */
+export function shouldReconnectOnClose(code: number | undefined): boolean {
+	if (code === undefined) return true;
+	if (GATEWAY_FATAL_CLOSE_CODES.has(code)) return false;
+	return true;
+}
+
+/** Close and detach an active WS connection without triggering reconnect. */
+function closeGateway(state: Record<string, any>, code = 1000, reason = ""): void {
+	const ws = state.gatewayWs as GatewayWS | null;
+	state.gatewayConnected = false;
+	state.gatewayIdentified = false;
+	if (ws) {
+		// Detach handlers first so the close doesn't trigger our reconnect path.
+		ws.onopen = null;
+		ws.onmessage = null;
+		ws.onclose = null;
+		ws.onerror = null;
+		try { ws.close(code, reason); } catch { /* best-effort */ }
+	}
+	state.gatewayWs = null;
+	state.gatewayHeartbeatMs = null;
+}
+
+/**
+ * Open a new Gateway connection. Safe to call when a connection is already
+ * open — the old one is closed first. All handlers and state updates live
+ * here; tick logic drives heartbeats and reconnects.
+ */
+function openGateway(state: Record<string, any>, ctx: ProgramContext): void {
+	if (state.gatewayFatal) return; // stopped after fatal close
+	if (state.gatewayWs) closeGateway(state);
+	const token = process.env.DISCORD_BOT_TOKEN;
+	if (!token) return;
+
+	let ws: GatewayWS;
+	try {
+		ws = new (gatewayWSCtor())(GATEWAY_URL);
+	} catch (err: any) {
+		ctx.print(dim(`  [discord] gateway connect failed: ${err?.message ?? String(err)}`));
+		scheduleGatewayReconnect(state);
+		return;
+	}
+
+	state.gatewayWs = ws;
+	state.gatewayConnected = false;
+	state.gatewayIdentified = false;
+	state.gatewayLastHeartbeatSentAt = 0;
+	state.gatewayLastHeartbeatAckAt = 0;
+	state.gatewayLastSeq = null;
+
+	ws.onopen = () => { state.gatewayConnected = true; };
+
+	ws.onmessage = (ev: { data: string }) => {
+		let frame: GatewayFrame;
+		try { frame = JSON.parse(ev.data); }
+		catch { return; } // ignore malformed
+		const now = Date.now();
+		const wasIdentified = state.gatewayIdentified;
+		const actions = handleGatewayFrame(state, frame, now);
+		if (!wasIdentified && state.gatewayIdentified) {
+			ctx.print(green(`  [discord] gateway connected — presence online`));
+		}
+		if (actions.sendIdentify) {
+			ws.send(JSON.stringify(buildIdentifyPayload(token)));
+		}
+		if (actions.sendHeartbeat) {
+			sendHeartbeat(state, ws, now);
+		}
+		if (actions.reconnect) {
+			closeGateway(state, 1000);
+			scheduleGatewayReconnect(state);
+		}
+	};
+
+	ws.onclose = (ev: { code: number; reason: string }) => {
+		state.gatewayConnected = false;
+		state.gatewayIdentified = false;
+		state.gatewayWs = null;
+		if (!shouldReconnectOnClose(ev.code)) {
+			state.gatewayFatal = true;
+			ctx.print(red(`  [discord] gateway closed fatally (code=${ev.code}): ${ev.reason || "bot will stay offline"}`));
+			return;
+		}
+		scheduleGatewayReconnect(state);
+	};
+
+	ws.onerror = () => {
+		// Errors are followed by a close — let onclose handle reconnect.
+	};
+}
+
+function scheduleGatewayReconnect(state: Record<string, any>): void {
+	state.gatewayReconnectAttempts = (state.gatewayReconnectAttempts ?? 0) + 1;
+	state.gatewayNextReconnectAt = Date.now() + computeReconnectDelayMs(state.gatewayReconnectAttempts);
+}
+
+/**
+ * Called from onTick. Keeps the connection healthy:
+ *   - reconnect if disconnected and backoff elapsed
+ *   - fire a heartbeat if one is due
+ *   - force-reconnect if we're in a zombie state (no ack in 2×interval)
+ */
+function tickGateway(state: Record<string, any>, ctx: ProgramContext): void {
+	if (state.gatewayFatal) return;
+	if (!process.env.DISCORD_BOT_TOKEN) return;
+	const now = Date.now();
+
+	if (!state.gatewayWs) {
+		if (!state.gatewayNextReconnectAt || now >= state.gatewayNextReconnectAt) {
+			openGateway(state, ctx);
+		}
+		return;
+	}
+
+	if (isHeartbeatAckOverdue(state, now)) {
+		ctx.print(dim("  [discord] gateway heartbeat ack overdue — reconnecting"));
+		closeGateway(state, 4000);
+		scheduleGatewayReconnect(state);
+		return;
+	}
+
+	if (shouldSendHeartbeat(state, now)) {
+		const ws = state.gatewayWs as GatewayWS;
+		try { sendHeartbeat(state, ws, now); }
+		catch { /* close handler will reconnect */ }
+	}
+}
+
 
 // ── Handler (CLI subcommands) ────────────────────────────────────
 
@@ -312,6 +657,17 @@ const actorDef: ProgramActorDef = {
 		watermarks: {} as Record<string, string>,
 		pollMs: DEFAULT_POLL_MS,
 		tickInProgress: false,
+		// Gateway (presence) state — managed by openGateway/tickGateway.
+		gatewayWs: null as GatewayWS | null,
+		gatewayConnected: false,
+		gatewayIdentified: false,
+		gatewayHeartbeatMs: null as number | null,
+		gatewayLastSeq: null as number | null,
+		gatewayLastHeartbeatSentAt: 0,
+		gatewayLastHeartbeatAckAt: 0,
+		gatewayReconnectAttempts: 0,
+		gatewayNextReconnectAt: 0,
+		gatewayFatal: false,
 	}),
 
 	onCreate: async (ctx: ProgramContext) => {
@@ -322,12 +678,24 @@ const actorDef: ProgramActorDef = {
 		} catch {
 			// Log handled in tick loop.
 		}
+		// Open the Gateway connection so the bot appears online. Non-blocking:
+		// the WebSocket handshake and IDENTIFY happen on their own event loop.
+		openGateway(ctx.state, ctx);
+	},
+
+	onDestroy: async (ctx: ProgramContext) => {
+		closeGateway(ctx.state, 1000, "daemon shutdown");
 	},
 
 	tickMs: DEFAULT_POLL_MS,
 
 	onTick: async (ctx: ProgramContext) => {
 		if (!process.env.DISCORD_BOT_TOKEN) return;
+		// Gateway maintenance runs on every tick, independent of the REST
+		// poll guard. A stalled REST poll should never block presence.
+		try { tickGateway(ctx.state, ctx); }
+		catch (err: any) { ctx.print(dim(`  [discord] gateway tick error: ${err?.message ?? String(err)}`)); }
+
 		if (ctx.state.tickInProgress) return;
 		ctx.state.tickInProgress = true;
 		try {
@@ -386,6 +754,15 @@ export const __test = {
 	doTyping,
 	runPoll,
 	pollPeer,
+	buildIdentifyPayload,
+	computeReconnectDelayMs,
+	shouldSendHeartbeat,
+	isHeartbeatAckOverdue,
+	shouldReconnectOnClose,
+	handleGatewayFrame,
+	openGateway,
+	tickGateway,
+	closeGateway,
 };
 
 // silence unused-warning for helpers we export only via __test

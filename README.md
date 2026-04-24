@@ -34,20 +34,107 @@ at runtime.
 **Self-describing.** On bootstrap, the environment loads its own source files as
 objects. You can query Glon for the code that built it.
 
-## Quick Start
+## Getting Started
 
+**Prerequisites**
+- Node 20+ (the dev server uses the built-in `node:sqlite`).
+- An Anthropic API key if you want agents. Discord bot token if you want the bridge.
+
+**Install**
 ```bash
 git clone https://github.com/Geep5/Glon.git
 cd Glon && npm install
+cp .env.example .env        # fill in secrets (see sections below)
+```
 
-# Terminal 1: start the environment
+**Run**
+```bash
+# Terminal 1 — RivetKit actor host. Stays running.
 npm run dev
 
-# Terminal 2: seed source files (first time)
+# Terminal 2 — seed source files + programs. Only on first run.
 npm run bootstrap
 
-# Terminal 3: open the shell
+# Terminal 3 — interactive shell.
 npm run client
+```
+
+Every script auto-loads `.env` from the project root, so `ANTHROPIC_API_KEY`
+and `DISCORD_BOT_TOKEN` are picked up without inline prefixes. Inline still
+works if you prefer (`ANTHROPIC_API_KEY=sk-... npm run client`).
+
+**Port collisions.** The dev server fails fast if `6420` is already bound
+instead of silently sliding to the next port. Either free it or set
+`GLON_PORT=6520` in `.env`. Clients auto-discover the chosen port via a
+lockfile at `~/.glon/.endpoint`, so you never have to tell them.
+
+## Gracie — Executive Assistant
+
+Gracie wraps a `/agent` with identity-aware ingest, a peer directory,
+memory, and the Discord bridge. Set up once:
+
+```bash
+npm run client
+glon> /gracie setup --grant-name Grant --grant-email grant@example.com --grant-discord 123456789012345678
+```
+
+Or headless (via the daemon's HTTP dispatch, see below):
+
+```bash
+curl -sS -X POST http://127.0.0.1:6430/dispatch \
+  -H 'Content-Type: application/json' \
+  -d '{"prefix":"/gracie","action":"setup","args":[{"grantName":"Grant"}]}'
+```
+
+### Discord bridge setup
+
+1. **Create the application.** Visit [Discord Developer Portal](https://discord.com/developers/applications)
+   and click **New Application**. The application name is what users see as
+   the bot's handle in Discord — name it what you want your assistant to be
+   called (e.g. "Gracie").
+2. **Grab the bot token.** Bot tab → **Reset Token** → copy into `.env` as
+   `DISCORD_BOT_TOKEN=...`. The token is the ONLY credential the bridge uses;
+   nothing is persisted to the DAG.
+3. **Invite the bot.** OAuth2 → URL Generator → scope `bot`, permissions
+   `Send Messages` + `Read Message History`. Open the URL and add it to a
+   guild you share with your user, or DM it directly.
+4. **Find your Discord user id.** Settings → Advanced → enable **Developer
+   Mode**. Then right-click your name anywhere → **Copy User ID**. That
+   18-digit snowflake goes into `/gracie setup --grant-discord <id>`.
+5. **DM the bot.** Any future messages to the bot flow through `/discord`'s
+   3-second poll into `/gracie.ingest`, then Gracie's reply is posted back.
+   The first poll processes messages from the last 15 minutes so your
+   onboarding "hi" isn't dropped. The bridge also holds a Gateway WebSocket
+   to Discord so the bot shows online — presence-only; messages still flow
+   via the REST poll.
+
+**Note:** Discord's REST API doesn't let bots list their own DM inbox, so
+every peer must be registered with their `discord_id` up front. You can add
+more people later:
+
+```
+glon> /peer add
+  display_name=Sarah kind=human trust_level=family discord_id=987654321098765432
+```
+
+### Headless operation
+
+For background use (Discord polling, scheduled reminders, agent memory
+writes) without a shell:
+
+```bash
+npx tsx scripts/daemon.ts
+```
+
+This loads every program, starts their actor instances, and exposes a local
+HTTP dispatch endpoint on `127.0.0.1:6430` for
+`POST /dispatch {prefix, action, args}`. Every program's `actor.actions.*`
+is callable over this endpoint. Example:
+
+```bash
+curl -sS -X POST http://127.0.0.1:6430/dispatch \
+  -H 'Content-Type: application/json' \
+  -d '{"prefix":"/gracie","action":"say","args":["What is on my calendar today?"]}'
 ```
 
 ## Programs
@@ -82,7 +169,7 @@ reach disk.
 | `/memory` | Durable agent memory: pinned facts and milestone arcs that survive compaction |
 | `/peer` | People and agents Gracie talks to: identity, trust level, contact handles |
 | `/remind` | Scheduled actions: DM at a time, prompt the agent to compose then send |
-| `/discord` | I/O bridge: polls DMs and routes to `/gracie.ingest`, posts replies back |
+| `/discord` | I/O bridge: Gateway WebSocket for online presence + 3s REST poll for DMs, routes to `/gracie.ingest`, posts replies back |
 | `/gracie` | Executive-assistant driver: wraps an `/agent` with identity-aware ingest + tools |
 | `/web` | HTTP client (fetch, get-text, get-json) with SSRF guard |
 | `/gc` | Garbage collection with retention policies |
@@ -93,9 +180,8 @@ reach disk.
 Agents store every prompt and response as changes in the DAG — content-addressed,
 replayable, syncable. Any peer can replay the conversation without an API key.
 
-```bash
-ANTHROPIC_API_KEY=sk-... npm run client
-```
+With `ANTHROPIC_API_KEY` in your `.env`:
+
 ```
 glon> /agent new analyst --system "You are a concise data analyst."
 glon> /agent ask 9b2e What are the tradeoffs of event sourcing vs CRUD?
@@ -106,23 +192,14 @@ glon> /agent inject c41a 9b2e       # inject analyst's context into another agen
 glon> /agent ask c41a What did the analyst get wrong?
 ```
 
-### Example: Executive Assistant (Gracie)
+### Example: Gracie conversation
 
 Gracie is an `/agent` wrapped with identity-awareness, a peer directory, a
 memory store, and bridge programs. Inbound messages from any source (shell,
 Discord, future bridges) get tagged with `[from {name} on {source}, trust={level}]`
-before reaching the model.
+before reaching the model. See **Getting Started → Gracie** above for setup.
 
-```bash
-ANTHROPIC_API_KEY=sk-... npm run client
 ```
-```
-glon> /gracie setup
-  Gracie ready
-  agent:  8d536600-...     (created)
-  grant:  6b1d0272-...     (created)
-  tools:  peer_*, remind_*, discord_send, object_*, web_*, memory_*
-
 glon> /gracie say My wife's name is Sarah. Save that.
   gracie (to Grant)
   Saved. wife_name=Sarah.
@@ -140,16 +217,6 @@ threshold, Gracie's compactor runs a tool-using extraction pass first: facts go 
 `pinned_fact` objects, multi-turn arcs go to `milestone` objects (with `supersedes`
 chains for amendments). A short narrative summary covers the kept region. Both
 are blocks in the DAG — every prior value is recoverable via `object_history`.
-
-**Headless mode.** For background operation (Discord polling, scheduled reminders,
-memory writes without a shell):
-
-```bash
-ANTHROPIC_API_KEY=sk-... DISCORD_BOT_TOKEN=... npx tsx scripts/daemon.ts
-```
-
-Loads every program, starts their actor instances, exposes a local HTTP
-dispatch endpoint on `127.0.0.1:6430` for `POST /dispatch {prefix, action, args}`.
 
 ### Example: Multi-Instance Chat
 
@@ -216,6 +283,8 @@ src/
   proto.ts                    typed encode/decode
   dag/                        change creation, topological sort, state computation
   disk.ts                     per-object .pb file storage
+  env.ts                      .env loader (zero-dep, side-effect import)
+  endpoint.ts                 port lockfile + resolver shared by all entry points
   index.ts                    actor definitions (object, store, program)
   bootstrap.ts                seed source files + programs as objects
   client.ts                   CLI shell (pure program loader)

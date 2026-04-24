@@ -348,6 +348,8 @@ describe("gracie tool auto-wiring", () => {
 			"google_docs_get", "google_docs_write",
 			// Shell tools (via /shell → persistent bash)
 			"shell_exec", "shell_sessions", "shell_kill",
+			// Subagent spawning (M2)
+			"spawn",
 		];
 		assert.deepEqual([...result.wiredTools].sort(), [...expected].sort());
 		assert.equal(result.skippedTools.length, 0);

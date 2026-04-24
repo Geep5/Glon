@@ -14,6 +14,7 @@
 // If the process restarts, `ensureBootstrapped()` rehydrates from the store.
 
 import type { ProgramDef, ProgramContext, ProgramActorDef } from "../runtime.js";
+import { spawnTool } from "./agent.js";
 
 // ── ANSI ─────────────────────────────────────────────────────────
 
@@ -96,6 +97,18 @@ Rules:
 - When Grant says "show me your code", use object_list type_key=program to find
   /gracie, object_get it to read its manifest, and object_read_source on the
   manifest's typescript object. Cite object ids in your reply so Grant can verify.
+- Questions about your own architecture, capabilities, current state, or how something
+  works internally must be answered from the live DAG, not from this conversation.
+  Your source code and agent object both change out of band; conversation history lags
+  behind. On any such question:
+    - For behavior / how code works: call object_read_source on the relevant handler
+      (/discord, /gracie, /agent, /memory) before asserting.
+    - For your own current state (model, system prompt, tools wired, compaction knobs,
+      tokens used): call object_get on your own agent object (your gracieAgentId) and
+      cite the exact field value you read.
+  Treat prior claims in this conversation as hearsay until re-verified. Cite the object
+  id(s) you read so Grant can audit. If you have not made a tool call this turn that
+  produced the evidence, you do not know the answer — say so instead of guessing.
 
 ## Memory
 Your conversation gets compacted when it grows too long. To keep facts and
@@ -1092,6 +1105,7 @@ function buildGracieTools(gracieAgentId: string): ToolSpec[] {
 		...buildMemoryTools(gracieAgentId),
 		...buildGoogleTools(),
 		...buildShellTools(),
+		spawnTool(gracieAgentId),
 	];
 }
 
@@ -1396,8 +1410,20 @@ const actorDef: ProgramActorDef = {
 	createState: () => ({ gracieAgentId: "", principalPeerId: "" }),
 
 	actions: {
-		/** One-time setup (idempotent). Opts may be a JSON string or plain object. */
+		/**
+		 * One-time setup (idempotent). Opts may be a JSON string or plain object.
+		 *
+		 * Aliased as both `bootstrap` and `setup`: the CLI command is `/gracie setup`,
+		 * and headless callers (HTTP dispatch) should be able to use the same verb.
+		 */
 		bootstrap: async (ctx: ProgramContext, opts?: string | BootstrapOpts) => {
+			const parsed: BootstrapOpts = typeof opts === "string" ? (opts ? JSON.parse(opts) : {}) : (opts ?? {});
+			const result = await doBootstrap(parsed, ctx);
+			ctx.state.gracieAgentId = result.gracieAgentId;
+			ctx.state.principalPeerId = result.principalPeerId;
+			return result;
+		},
+		setup: async (ctx: ProgramContext, opts?: string | BootstrapOpts) => {
 			const parsed: BootstrapOpts = typeof opts === "string" ? (opts ? JSON.parse(opts) : {}) : (opts ?? {});
 			const result = await doBootstrap(parsed, ctx);
 			ctx.state.gracieAgentId = result.gracieAgentId;

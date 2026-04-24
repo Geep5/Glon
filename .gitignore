@@ -12,3 +12,10 @@ dist/
 .env
 .env.*
 *.secret
+.DS_Store
+.run/
+
+# Local developer helper scripts that export credentials inline — never commit.
+ask-agent-about-architecture.sh
+check-agent-history.sh
+tell-agent-truth.sh

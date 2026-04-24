@@ -268,7 +268,7 @@ src/programs/
     memory.ts                pinned_fact + milestone objects, recall/digest, validator
     peer.ts                  identity + trust for people and agents
     remind.ts                scheduled actions (DM, gracie-compose, email)
-    discord.ts               Discord REST bridge: poll DMs, route to /gracie.ingest
+    discord.ts               Discord bridge: Gateway WS for online presence + REST poll for DMs → /gracie.ingest
     gracie.ts                executive-assistant driver: identity-aware ingest + tools
     web.ts                   HTTP client with SSRF guard
     gc.ts                    reachability-based garbage collection

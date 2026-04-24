@@ -8,6 +8,7 @@
  * Usage: npm run client / npx tsx src/client.ts
  */
 
+import "./env.js"; // side-effect: load .env into process.env
 import { createClient } from "rivetkit/client";
 import type { app } from "./index.js";
 import { createInterface } from "node:readline";
@@ -16,8 +17,9 @@ import { hexEncode } from "./crypto.js";
 import { stringVal, intVal, floatVal, boolVal, mapVal, listVal, linkVal, displayValue } from "./proto.js";
 import { loadPrograms, dispatchProgram, startProgramActor, dispatchActorAction, getProgramActorByPrefix, type ProgramContext, type ProgramEntry } from "./programs/runtime.js";
 import { randomUUID } from "node:crypto";
+import { resolveEndpoint } from "./endpoint.js";
 
-const ENDPOINT = process.env.GLON_ENDPOINT ?? "http://localhost:6420";
+const ENDPOINT = resolveEndpoint();
 
 // ── ANSI helpers ─────────────────────────────────────────────────
 const DIM = "\x1b[2m";

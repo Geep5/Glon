@@ -11,10 +11,12 @@
  * value (treated as a single arg).
  */
 
+import "../src/env.js"; // side-effect: load .env into process.env
 import { createClient } from "rivetkit/client";
 import type { app } from "../src/index.js";
+import { resolveEndpoint } from "../src/endpoint.js";
 
-const ENDPOINT = process.env.GLON_ENDPOINT ?? "http://localhost:6420";
+const ENDPOINT = resolveEndpoint();
 
 async function main() {
 	const [prefix, action, argsRaw] = process.argv.slice(2);

@@ -2,8 +2,10 @@
  * Read an agent's blocks to debug tool-use loops. Usage:
  *   npx tsx scripts/read-agent-blocks.ts <agent-id>
  */
+import "../src/env.js"; // side-effect: load .env into process.env
 import { createClient } from "rivetkit/client";
 import type { app } from "../src/index.js";
+import { resolveEndpoint } from "../src/endpoint.js";
 
 async function main() {
 	const agentId = process.argv[2];
@@ -11,7 +13,7 @@ async function main() {
 		console.error("Usage: read-agent-blocks.ts <agent-id>");
 		process.exit(1);
 	}
-	const client = createClient<typeof app>(process.env.GLON_ENDPOINT ?? "http://localhost:6420");
+	const client = createClient<typeof app>(resolveEndpoint());
 	const actor = client.objectActor.getOrCreate([agentId]);
 	const state = await actor.read() as any;
 	const blocks = state?.blocks ?? [];

@@ -8,13 +8,15 @@
  * Usage: npm run bootstrap / npx tsx src/bootstrap.ts
  */
 
+import "./env.js"; // side-effect: load .env into process.env
 import { createClient } from "rivetkit/client";
 import type { app } from "./index.js";
 import { readFileSync } from "node:fs";
 import { resolve, basename, extname } from "node:path";
 import { initDisk } from "./disk.js";
 import { stringVal, intVal, mapVal } from "./proto.js";
-const ENDPOINT = process.env.GLON_ENDPOINT ?? "http://localhost:6420";
+import { resolveEndpoint } from "./endpoint.js";
+const ENDPOINT = resolveEndpoint();
 
 const SOURCES = [
 	"proto/glon.proto",
@@ -23,6 +25,8 @@ const SOURCES = [
 	"src/dag/change.ts",
 	"src/dag/dag.ts",
 	"src/disk.ts",
+	"src/env.ts",
+	"src/endpoint.ts",
 	"src/index.ts",
 	"src/bootstrap.ts",
 	"src/client.ts",
@@ -34,6 +38,7 @@ const SOURCES = [
 	"src/programs/handlers/ttt.ts",
 	"src/programs/handlers/chat.ts",
 	"src/programs/handlers/agent.ts",
+	"src/programs/handlers/task.ts",
 	"src/programs/handlers/gc.ts",
 	"src/programs/handlers/accounts.ts",
 	"src/programs/handlers/sync.ts",
@@ -153,9 +158,26 @@ const PROGRAMS: ProgramDef[] = [
 			status: "Show token usage + compaction state",
 			compact: "Manually compact old conversation turns",
 			"view-summary": "Show latest compaction summary in full",
+			tree: "Render the spawn lineage tree rooted at this agent",
+			"list-templates": "List builtin and DAG-defined agent templates",
+			"create-template": "Create a new agent_template in the DAG",
+			"delete-template": "Tombstone an agent_template by name or id",
+			recall: "Re-inject a compacted block back into the agent's live context",
 		},
 		entry: "agent.ts",
 		modules: { "agent.ts": "src/programs/handlers/agent.ts" },
+	},
+	{
+		prefix: "/task",
+		name: "Task (subagent spawning)",
+		commands: {
+			spawn: "Spawn one or more subagents from a JSON batch",
+			status: "Show a spawned subagent's depth, parent, and submitted result",
+			tree: "Render the spawn lineage tree rooted at an agent",
+			cancel: "Request cancellation of a running subagent",
+		},
+		entry: "task.ts",
+		modules: { "task.ts": "src/programs/handlers/task.ts" },
 	},
 	{
 		prefix: "/gc",

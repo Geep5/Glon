@@ -9,6 +9,7 @@
  * Run: npx tsx scripts/daemon.ts
  */
 
+import "../src/env.js"; // side-effect: load .env into process.env
 import { createClient } from "rivetkit/client";
 import type { app } from "../src/index.js";
 import { diskStats, readChangeByHex, listChangeFiles } from "../src/disk.js";
@@ -23,8 +24,9 @@ import {
 	type ProgramEntry,
 } from "../src/programs/runtime.js";
 import { randomUUID } from "node:crypto";
+import { resolveEndpoint } from "../src/endpoint.js";
 
-const ENDPOINT = process.env.GLON_ENDPOINT ?? "http://localhost:6420";
+const ENDPOINT = resolveEndpoint();
 const client = createClient<typeof app>(ENDPOINT);
 const store = client.storeActor.getOrCreate(["root"]);
 

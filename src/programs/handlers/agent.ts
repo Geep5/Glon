@@ -58,6 +58,34 @@ const DEFAULT_COMPACTION_CONTEXT_WINDOW = 200000;
 const DEFAULT_COMPACTION_RESERVE_TOKENS = 16384;
 const DEFAULT_COMPACTION_KEEP_RECENT_TOKENS = 20000;
 
+// ── Subagent spawning ───────────────────────────────────────────
+//
+// An agent can spawn other agents as durable, content-addressed children
+// (typeKey="agent" like any other). The parent's DAG records a single
+// tool_use/tool_result pair whose content is the *compressed* batch result;
+// per-child ObjectLink references are embedded in the tool_use input so
+// glonWorld can render lineage edges. Each child's full transcript remains
+// inspectable as its own agent object.
+//
+// See `buildSubagentSystemPrompt`, `doSpawn`, `doSubmitResult`, `doCancel`.
+
+const DEFAULT_MAX_SPAWN_DEPTH = 4;
+const DEFAULT_SPAWN_CONCURRENCY = 6;
+const SUBAGENT_ADDENDUM = `
+
+---
+SUBAGENT CONTEXT
+
+You are a subagent. Your parent delegated one task to you and is waiting
+for your structured answer.
+
+When you are finished, call the \`submit_result\` tool with your final
+answer. If you don't, your last assistant message will be used as the
+fallback result with a \`no_submit_result\` warning.
+
+You cannot spawn further subagents unless your template permits it.
+`;
+
 // Block content-type tags (CustomContent.contentType).
 const BLOCK_TOOL_USE = "tool_use";
 const BLOCK_TOOL_RESULT = "tool_result";
@@ -570,8 +598,10 @@ async function callAnthropic(
 		max_tokens: maxTokens ?? 4096,
 		messages,
 		stream,
-		temperature: temperature ?? 0.7,
 	};
+	// Newer models (Opus 4.7+) reject `temperature` outright. Only include it when
+	// the agent has an explicit override; otherwise let the API use its default.
+	if (temperature !== undefined) body.temperature = temperature;
 	if (system) body.system = system;
 	if (tools && tools.length > 0) {
 		body.tools = tools.map((t) => ({
@@ -1272,6 +1302,11 @@ async function runAsk(
 		if (iterations >= MAX_TOOL_ITERATIONS) {
 			throw new Error(`Tool-use loop exceeded ${MAX_TOOL_ITERATIONS} iterations`);
 		}
+		// Cancel check (honoured by spawned subagents whose parent called `/agent.cancel`).
+		const curState = await store.get(agentId);
+		if (curState && extractString(curState.fields?.cancel_requested) === "true") {
+			throw new Error("cancelled: cancel_requested was set on this agent");
+		}
 		iterations++;
 
 		let streamBuffer = "";
@@ -1627,6 +1662,132 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 			break;
 		}
 
+		case "recall": {
+			const raw = args[0];
+			const blockRaw = args[1];
+			if (!raw || !blockRaw) { print(red("Usage: agent recall <agent-id> <block-id>")); break; }
+			const id = await resolveId(raw);
+			if (!id) { print(red("Not found: ") + raw); break; }
+			try {
+				const state = await store.get(id);
+				if (!state) { print(red("Agent not found")); break; }
+				// Accept a full block id OR any unique prefix.
+				const match = (state.blocks ?? []).find((b: any) => b.id === blockRaw || b.id.startsWith(blockRaw));
+				if (!match) { print(red("Block not in this agent: ") + blockRaw); break; }
+				const result = await doRecall(id, match.id, ctx);
+				print(green("  Recalled ") + result.sourceKind + dim(` → new block ${result.newBlockId.slice(0, 8)}`));
+				if (result.truncated) print(dim("  (content was long; truncated at 8192 bytes)"));
+			} catch (err: any) {
+				print(red("  Error: ") + (err?.message ?? String(err)));
+			}
+			break;
+		}
+
+		case "tree": {
+			const raw = args[0];
+			if (!raw) { print(red("Usage: agent tree <id>")); break; }
+			const id = await resolveId(raw);
+			if (!id) { print(red("Not found: ") + raw); break; }
+			try {
+				const root = await doGetSubagents(id, ctx);
+				print(bold("spawn tree rooted at ") + root.id);
+				print(renderSubagentTree(root));
+				const count = countDescendants(root);
+				print(dim(`  ${count} subagent(s) total`));
+			} catch (err: any) {
+				print(red("  Error: ") + (err?.message ?? String(err)));
+			}
+			break;
+		}
+
+		case "list-templates": {
+			try {
+				const dagRefs = (await (store as any).list("agent_template")) as Array<{ id: string }> ?? [];
+				const seen = new Set<string>();
+				print(bold("agent templates:"));
+				for (const ref of dagRefs) {
+					const s = await store.get(ref.id);
+					if (!s || s.deleted) continue;
+					const name = extractString(s.fields?.name) ?? ref.id.slice(0, 8);
+					const model = extractString(s.fields?.model) ?? DEFAULT_MODEL;
+					const spawns = extractString(s.fields?.spawns) ?? "";
+					const desc = extractString(s.fields?.description) ?? "";
+					seen.add(name);
+					print(green(`  ${name}`) + dim(` [DAG ${ref.id.slice(0, 8)}]`));
+					print(dim(`    model=${model}  spawns=${spawns || "(none)"}  ${desc}`));
+				}
+				for (const [name, tpl] of Object.entries(BUILTIN_TEMPLATES)) {
+					if (seen.has(name)) continue;
+					print(yellow(`  ${name}`) + dim(" [builtin]"));
+					print(dim(`    model=${tpl.model}  spawns=${tpl.spawns || "(none)"}  ${tpl.description}`));
+				}
+			} catch (err: any) {
+				print(red("  list-templates failed: ") + (err?.message ?? String(err)));
+			}
+			break;
+		}
+
+		case "create-template": {
+			let name: string | undefined, model = DEFAULT_MODEL, systemText = "", spawns = "", description = "";
+			const positional: string[] = [];
+			for (let i = 0; i < args.length; i++) {
+				if (args[i] === "--model" && args[i + 1]) model = args[++i];
+				else if (args[i] === "--system" && args[i + 1]) systemText = args[++i];
+				else if (args[i] === "--spawns" && args[i + 1]) spawns = args[++i];
+				else if (args[i] === "--description" && args[i + 1]) description = args[++i];
+				else positional.push(args[i]);
+			}
+			name = positional[0];
+			if (!name) {
+				print(red("Usage: agent create-template <name> [--model M] [--system S] [--spawns '*'|'' |CSV] [--description D]"));
+				break;
+			}
+			if (!systemText) systemText = `You are a ${name} agent. Finish with submit_result.`;
+			const fields: Record<string, any> = {
+				name: stringVal(name),
+				model: stringVal(model),
+				system: stringVal(systemText),
+				spawns: stringVal(spawns),
+				description: stringVal(description),
+			};
+			try {
+				const id: string = await (store as any).create("agent_template", JSON.stringify(fields));
+				print(green("Template created: ") + bold(name) + dim(` (${id})`));
+				if (BUILTIN_TEMPLATES[name]) {
+					print(dim("  note: this DAG template now overrides the built-in of the same name."));
+				}
+			} catch (err: any) {
+				print(red("  create-template failed: ") + (err?.message ?? String(err)));
+			}
+			break;
+		}
+
+		case "delete-template": {
+			const raw = args[0];
+			if (!raw) { print(red("Usage: agent delete-template <name-or-id>")); break; }
+			// Try interpreting as DAG id prefix first; fall back to name lookup.
+			let id: string | null = await resolveId(raw);
+			if (!id) {
+				try {
+					const dagRefs = (await (store as any).list("agent_template")) as Array<{ id: string }> ?? [];
+					for (const ref of dagRefs) {
+						const s = await store.get(ref.id);
+						if (s && !s.deleted && extractString(s.fields?.name) === raw) { id = ref.id; break; }
+					}
+				} catch { /* ignore */ }
+			}
+			if (!id) { print(red("Template not found: ") + raw); break; }
+			const state = await store.get(id);
+			if (!state || state.typeKey !== "agent_template") {
+				print(red("Not an agent_template: ") + id);
+				break;
+			}
+			const actor = (client as any).objectActor.getOrCreate([id]);
+			await actor.markDeleted();
+			print(green("Template tombstoned: ") + id);
+			break;
+		}
+
 		case "read": {
 			const raw = args[0];
 			if (!raw) { print(red("Usage: agent read <id>")); break; }
@@ -1776,6 +1937,707 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 	}
 };
 
+// ── Subagent spawning machinery ────────────────────────────────
+//
+// Templates are code-constant defaults that can be overridden at runtime
+// by DAG objects of typeKey="agent_template" with matching `name`. If a
+// matching DAG object exists it wins; otherwise the code default applies.
+// This mirrors the "both" storage model: shipping sensible defaults while
+// letting each peer customize without touching source.
+
+interface AgentTemplate {
+	name: string;
+	description: string;
+	model: string;
+	system: string;
+	/** Tools to register on a spawned instance. `submit_result` and `spawn` are
+	 *  added by the runtime based on policy; no need to list them here. */
+	defaultTools: ToolSpec[];
+	/** Spawn policy. `"*"` = unrestricted, `""` = cannot spawn, CSV = whitelist. */
+	spawns: string;
+}
+
+// Read-only DAG tool bundle — safe for any subagent. Every tool listed
+// here targets an existing glon program action and mutates nothing.
+const READ_ONLY_TOOLS: ToolSpec[] = [
+	{
+		name: "object_list",
+		description: "List Glon objects in the store. Optional type_key filter narrows to one type.",
+		input_schema: { type: "object", properties: { type_key: { type: "string" }, limit: { type: "number" } } },
+		target_prefix: "/crud", target_action: "list",
+	},
+	{
+		name: "object_get",
+		description: "Read an object's state summary. Use object_read_source for file contents.",
+		input_schema: { type: "object", properties: { object_id: { type: "string" } }, required: ["object_id"] },
+		target_prefix: "/crud", target_action: "get",
+	},
+	{
+		name: "object_read_source",
+		description: "Read raw UTF-8 content of an object. Truncates at max_bytes.",
+		input_schema: { type: "object", properties: { object_id: { type: "string" }, max_bytes: { type: "number" } }, required: ["object_id"] },
+		target_prefix: "/crud", target_action: "readContent",
+	},
+	{
+		name: "object_search",
+		description: "Full-text search across object fields and content. Narrow with type_key.",
+		input_schema: { type: "object", properties: { query: { type: "string" }, type_key: { type: "string" }, limit: { type: "number" } }, required: ["query"] },
+		target_prefix: "/crud", target_action: "search",
+	},
+	{
+		name: "object_links",
+		description: "Show outbound and inbound ObjectLinks for an object.",
+		input_schema: { type: "object", properties: { object_id: { type: "string" } }, required: ["object_id"] },
+		target_prefix: "/graph", target_action: "links",
+	},
+	{
+		name: "object_neighbors",
+		description: "Immediate neighbours (one-hop link targets) of an object.",
+		input_schema: { type: "object", properties: { object_id: { type: "string" } }, required: ["object_id"] },
+		target_prefix: "/graph", target_action: "neighbors",
+	},
+];
+
+const BUILTIN_TEMPLATES: Record<string, AgentTemplate> = {
+	task: {
+		name: "task",
+		description: "General-purpose worker agent. Can spawn further subagents.",
+		model: DEFAULT_MODEL,
+		system: "You are a general-purpose agent running inside Glon. You can use registered tools and may spawn further subagents to parallelize work. Be precise, terse, and finish with submit_result.",
+		defaultTools: READ_ONLY_TOOLS,
+		spawns: "*",
+	},
+	explore: {
+		name: "explore",
+		description: "Read-only investigator. Returns a compressed map of findings.",
+		model: DEFAULT_MODEL,
+		system: "You are an investigator. Read the DAG via the tools you have. Do not mutate anything. Return a compressed, structured summary via submit_result.",
+		defaultTools: READ_ONLY_TOOLS,
+		spawns: "",
+	},
+	quick_task: {
+		name: "quick_task",
+		description: "Fast small-model worker for mechanical tasks.",
+		model: "claude-haiku-4-20250414",
+		system: "You are a lightweight worker. Do the single mechanical task you were given and return the answer via submit_result. Do not explore beyond the request.",
+		defaultTools: [],
+		spawns: "",
+	},
+};
+
+async function resolveAgentTemplate(name: string, ctx: ProgramContext): Promise<AgentTemplate> {
+	const store = ctx.store as any;
+	// DAG override: scan agent_template objects, first matching name wins.
+	try {
+		const refs = (await store.list("agent_template")) as Array<{ id: string }>;
+		for (const ref of refs) {
+			const state = await store.get(ref.id);
+			if (!state || state.deleted) continue;
+			const templateName = extractString(state.fields?.name);
+			if (templateName !== name) continue;
+			const toolsRaw = extractString(state.fields?.default_tools) ?? "[]";
+			let defaultTools: ToolSpec[] = [];
+			try { defaultTools = JSON.parse(toolsRaw); } catch { /* keep empty */ }
+			return {
+				name: templateName,
+				description: extractString(state.fields?.description) ?? "",
+				model: extractString(state.fields?.model) ?? DEFAULT_MODEL,
+				system: extractString(state.fields?.system) ?? BUILTIN_TEMPLATES.task.system,
+				defaultTools,
+				spawns: extractString(state.fields?.spawns) ?? "",
+			};
+		}
+	} catch { /* store may not support list in tests — fall through to code default */ }
+	const tpl = BUILTIN_TEMPLATES[name];
+	if (!tpl) throw new Error(`Unknown agent template: ${name}`);
+	return tpl;
+}
+
+interface SpawnTaskInput {
+	id: string;
+	agentTemplate: string;
+	assignment: string;
+	model?: string;
+	/** If set, cancels the child after this many ms and marks result status="timeout". */
+	timeoutMs?: number;
+	/** If set, retries the task up to this many times on status in {error, timeout}. Default 0. */
+	maxAttempts?: number;
+}
+
+interface SpawnInput {
+	/** Parent agent id — always bound via tool `bound_args` when invoked by a model. */
+	agentId: string;
+	context?: string;
+	schema?: unknown;
+	maxConcurrency?: number;
+	tasks: SpawnTaskInput[];
+}
+
+interface SingleResult {
+	id: string;
+	childAgentId: string;
+	output: unknown;
+	status: "ok" | "no_submit_result" | "cancelled" | "error" | "timeout" | "schema_invalid";
+	attempts?: number;
+	error?: string;
+	durationMs: number;
+	tokens: { input: number; output: number };
+	compacted: boolean;
+}
+
+interface SubmitResultInput {
+	/** Child agent id, bound via the tool's bound_args so the model can't spoof another agent. */
+	agentId: string;
+	result: unknown;
+}
+
+function maxSpawnDepth(): number {
+	const raw = process.env.GLON_AGENT_MAX_DEPTH;
+	if (!raw) return DEFAULT_MAX_SPAWN_DEPTH;
+	const n = Number(raw);
+	return Number.isFinite(n) && n >= 0 ? n : DEFAULT_MAX_SPAWN_DEPTH;
+}
+
+class Semaphore {
+	private avail: number;
+	private waiters: Array<() => void> = [];
+	constructor(n: number) { this.avail = Math.max(1, n); }
+	async run<T>(fn: () => Promise<T>): Promise<T> {
+		if (this.avail > 0) { this.avail--; }
+		else await new Promise<void>((res) => this.waiters.push(res));
+		try { return await fn(); }
+		finally {
+			const next = this.waiters.shift();
+			if (next) next(); else this.avail++;
+		}
+	}
+}
+
+function buildSubagentSystemPrompt(
+	template: AgentTemplate,
+	parentId: string,
+	task: SpawnTaskInput,
+	depth: number,
+	sharedContext: string | undefined,
+	schema: unknown | undefined,
+): string {
+	const parts = [template.system.trim(), SUBAGENT_ADDENDUM.trim()];
+	parts.push(`Parent agent: ${parentId}`);
+	parts.push(`Task id: ${task.id}`);
+	parts.push(`Depth: ${depth}`);
+	if (sharedContext && sharedContext.trim()) {
+		parts.push("--- SHARED CONTEXT ---\n" + sharedContext.trim());
+	}
+	if (schema !== undefined) {
+		parts.push("--- OUTPUT SCHEMA ---\nYour submit_result `result` argument must satisfy:\n" + JSON.stringify(schema, null, 2));
+	}
+	return parts.join("\n\n");
+}
+
+function submitResultTool(childId: string): ToolSpec {
+	return {
+		name: "submit_result",
+		description: "Submit your final structured result to the parent agent and conclude the task.",
+		input_schema: {
+			type: "object",
+			properties: { result: { description: "Your structured answer. Shape must match the output schema if one was given in your system prompt." } },
+			required: ["result"],
+		},
+		target_prefix: "/agent",
+		target_action: "submitResult",
+		bound_args: { agentId: childId },
+	};
+}
+
+export function spawnTool(parentId: string): ToolSpec { return {
+		name: "spawn",
+		description: "Spawn one or more subagents in parallel to complete delegated tasks. Each task runs as a fresh agent with its own DAG. Waits for all children before returning a compressed batch result.",
+		input_schema: {
+			type: "object",
+			properties: {
+				context: { type: "string", description: "Shared background prepended to every child's first user turn." },
+				schema: { type: "object", description: "Optional output shape every child's submit_result must satisfy." },
+				maxConcurrency: { type: "number", description: "Upper bound on parallel children. Default 6." },
+				tasks: {
+					type: "array",
+					minItems: 1,
+					items: {
+						type: "object",
+						required: ["id", "agentTemplate", "assignment"],
+						properties: {
+							id: { type: "string" },
+							agentTemplate: { type: "string", description: "Template name (e.g. 'task', 'explore', 'quick_task') or an agent_template object id." },
+							assignment: { type: "string" },
+							model: { type: "string" },
+						},
+					},
+				},
+			},
+			required: ["tasks"],
+		},
+		target_prefix: "/agent",
+		target_action: "spawn",
+		bound_args: { agentId: parentId },
+	}; }
+
+async function createChildAgent(
+	parent: { id: string; depth: number; spawnsPolicy: string },
+	task: SpawnTaskInput,
+	sharedContext: string | undefined,
+	schema: unknown | undefined,
+	ctx: ProgramContext,
+): Promise<{ childId: string; template: AgentTemplate }> {
+	const store = ctx.store as any;
+	const { stringVal, linkVal } = ctx as any;
+
+	const template = await resolveAgentTemplate(task.agentTemplate, ctx);
+	const childDepth = parent.depth + 1;
+	const system = buildSubagentSystemPrompt(template, parent.id, task, childDepth, sharedContext, schema);
+	const childCanSpawn = template.spawns !== "" && childDepth < maxSpawnDepth();
+
+	const fields: Record<string, any> = {
+		name: stringVal(`${template.name}-${task.id}`),
+		model: stringVal(task.model ?? template.model),
+		system: stringVal(system),
+		spawn_parent: linkVal(parent.id, "spawn_parent"),
+		spawn_depth: stringVal(String(childDepth)),
+		spawn_task_id: stringVal(task.id),
+		spawn_template: stringVal(template.name),
+	};
+	if (schema !== undefined && schema !== null) {
+		fields.output_schema = stringVal(JSON.stringify(schema));
+	}
+	const childId: string = await store.create("agent", JSON.stringify(fields));
+
+	// Every child always gets submit_result. Children that can spawn get the spawn tool.
+	await doRegisterTool(childId, submitResultTool(childId), ctx);
+	if (childCanSpawn) {
+		await doRegisterTool(childId, spawnTool(childId), ctx);
+	}
+	for (const t of template.defaultTools) {
+		await doRegisterTool(childId, t, ctx);
+	}
+
+	return { childId, template };
+}
+
+async function doSpawn(input: SpawnInput, ctx: ProgramContext): Promise<{ childAgentIds: string[]; results: SingleResult[]; batchId: string }> {
+	const store = ctx.store as any;
+	if (!input?.agentId) throw new Error("spawn: agentId required");
+	if (!Array.isArray(input.tasks) || input.tasks.length === 0) {
+		throw new Error("spawn: tasks[] required");
+	}
+	const parent = await store.get(input.agentId);
+	if (!parent) throw new Error(`spawn: parent agent not found: ${input.agentId}`);
+	if (parent.typeKey !== "agent") throw new Error(`spawn: ${input.agentId} is not an agent`);
+
+	const parentDepth = extractInt(parent.fields?.spawn_depth, 0);
+	const cap = maxSpawnDepth();
+	if (parentDepth >= cap) {
+		throw new Error(`spawn: parent is at max depth (${cap}); cannot spawn further`);
+	}
+	// Policy enforcement: a parent's template's `spawns` field — when we know
+	// what template the parent came from — may whitelist templates it can
+	// delegate to. For top-level user-created agents without a template, allow
+	// anything (back-compat).
+	const parentTemplateName = extractString(parent.fields?.spawn_template);
+	let allowed: "*" | string[] = "*";
+	if (parentTemplateName) {
+		const parentTpl = await resolveAgentTemplate(parentTemplateName, ctx);
+		if (parentTpl.spawns === "") {
+			throw new Error(`spawn: parent template '${parentTemplateName}' is not allowed to spawn subagents`);
+		}
+		allowed = parentTpl.spawns === "*" ? "*" : parentTpl.spawns.split(",").map((s) => s.trim()).filter(Boolean);
+	}
+	if (allowed !== "*") {
+		for (const t of input.tasks) {
+			if (!allowed.includes(t.agentTemplate)) {
+				throw new Error(`spawn: template '${t.agentTemplate}' not permitted by parent policy (${allowed.join(",") || "<none>"})`);
+			}
+		}
+	}
+
+	const ids = new Set<string>();
+	for (const t of input.tasks) {
+		if (!t?.id) throw new Error("spawn: every task needs an id");
+		if (ids.has(t.id)) throw new Error(`spawn: duplicate task id '${t.id}'`);
+		ids.add(t.id);
+		if (!t.agentTemplate) throw new Error(`spawn[${t.id}]: agentTemplate required`);
+		if (!t.assignment) throw new Error(`spawn[${t.id}]: assignment required`);
+	}
+
+	const sem = new Semaphore(input.maxConcurrency ?? DEFAULT_SPAWN_CONCURRENCY);
+	const childAgentIds: string[] = [];
+	const parentRef = { id: input.agentId, depth: parentDepth, spawnsPolicy: parentTemplateName ? (await resolveAgentTemplate(parentTemplateName, ctx)).spawns : "*" };
+
+	const batchId = (ctx as any).randomUUID ? (ctx as any).randomUUID() : `batch-${Date.now()}`;
+	const emit = (channel: string, data: any) => { try { ctx.emit?.(channel, data); } catch { /* best-effort */ } };
+	emit("spawn:start", {
+		batchId,
+		parentAgentId: input.agentId,
+		tasks: input.tasks.map((t) => ({ id: t.id, template: t.agentTemplate })),
+		maxConcurrency: input.maxConcurrency ?? DEFAULT_SPAWN_CONCURRENCY,
+	});
+	const results = await Promise.all(input.tasks.map((task) => sem.run(async (): Promise<SingleResult> => {
+		const started = Date.now();
+		const maxAttempts = Math.max(1, task.maxAttempts ?? 1);
+		let childId = "";
+		let lastResult: SingleResult | null = null;
+		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+			lastResult = await runOneAttempt(task, attempt, parentRef, input.context, input.schema, ctx, (id) => {
+				childId = id; childAgentIds.push(id);
+				emit("spawn:child_created", { batchId, taskId: task.id, childAgentId: id, attempt });
+			}, started);
+			emit("spawn:child_done", { batchId, taskId: task.id, childAgentId: lastResult.childAgentId, status: lastResult.status, attempt, durationMs: lastResult.durationMs });
+			if (lastResult.status === "ok" || lastResult.status === "no_submit_result" || lastResult.status === "schema_invalid" || lastResult.status === "cancelled") break;
+		}
+		return lastResult!;
+	})));
+
+
+	emit("spawn:complete", {
+		batchId,
+		parentAgentId: input.agentId,
+		summary: {
+			total: results.length,
+			ok: results.filter((r) => r.status === "ok").length,
+			no_submit_result: results.filter((r) => r.status === "no_submit_result").length,
+			timeout: results.filter((r) => r.status === "timeout").length,
+			error: results.filter((r) => r.status === "error").length,
+			cancelled: results.filter((r) => r.status === "cancelled").length,
+			schema_invalid: results.filter((r) => r.status === "schema_invalid").length,
+		},
+	});
+	return { childAgentIds, results, batchId };
+}
+
+async function runOneAttempt(
+	task: SpawnTaskInput,
+	attempt: number,
+	parentRef: { id: string; depth: number; spawnsPolicy: string },
+	sharedContext: string | undefined,
+	schema: unknown | undefined,
+	ctx: ProgramContext,
+	onChildCreated: (id: string) => void,
+	batchStartedAt: number,
+): Promise<SingleResult> {
+	const store = ctx.store as any;
+	let childId = "";
+	let timedOut = false;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		const created = await createChildAgent(parentRef, task, sharedContext, schema, ctx);
+		childId = created.childId;
+		onChildCreated(childId);
+
+		const askPromise = runAsk(childId, task.assignment, ctx);
+		const timeoutPromise = task.timeoutMs && task.timeoutMs > 0
+			? new Promise<never>((_res, rej) => {
+				timer = setTimeout(async () => {
+					timedOut = true;
+					try { await doCancel(childId, ctx); } catch { /* best-effort */ }
+					rej(new Error(`timeout: task exceeded ${task.timeoutMs}ms`));
+				}, task.timeoutMs);
+			})
+			: null;
+		const ask = await (timeoutPromise ? Promise.race([askPromise, timeoutPromise]) : askPromise);
+		if (timer) clearTimeout(timer);
+
+		const state = await store.get(childId);
+		const submitted = extractString(state?.fields?.submitted_result);
+		if (submitted !== undefined) {
+			let parsed: unknown = submitted;
+			try { parsed = JSON.parse(submitted); } catch { /* keep raw */ }
+			return {
+				id: task.id,
+				childAgentId: childId,
+				output: parsed,
+				status: "ok",
+				attempts: attempt,
+				durationMs: Date.now() - batchStartedAt,
+				tokens: { input: ask.inputTokens, output: ask.outputTokens },
+				compacted: ask.compactedBeforeAsk || ask.compactedOnOverflow,
+			};
+		}
+		const submissionErrors = extractString(state?.fields?.submission_errors);
+		if (submissionErrors) {
+			return {
+				id: task.id,
+				childAgentId: childId,
+				output: null,
+				status: "schema_invalid",
+				attempts: attempt,
+				error: submissionErrors,
+				durationMs: Date.now() - batchStartedAt,
+				tokens: { input: ask.inputTokens, output: ask.outputTokens },
+				compacted: ask.compactedBeforeAsk || ask.compactedOnOverflow,
+			};
+		}
+		return {
+			id: task.id,
+			childAgentId: childId,
+			output: ask.finalText,
+			status: "no_submit_result",
+			attempts: attempt,
+			error: "subagent finished without calling submit_result; falling back to final assistant text",
+			durationMs: Date.now() - batchStartedAt,
+			tokens: { input: ask.inputTokens, output: ask.outputTokens },
+			compacted: ask.compactedBeforeAsk || ask.compactedOnOverflow,
+		};
+	} catch (err: any) {
+		if (timer) clearTimeout(timer);
+		const msg = err?.message ?? String(err);
+		const isTimeout = timedOut || /^timeout:/i.test(msg);
+		const isCancelled = !isTimeout && /cancelled/i.test(msg);
+		const isSchemaFail = /schema validation/i.test(msg);
+		const status: SingleResult["status"] = isTimeout ? "timeout" : isCancelled ? "cancelled" : isSchemaFail ? "schema_invalid" : "error";
+		return {
+			id: task.id,
+			childAgentId: childId,
+			output: null,
+			status,
+			attempts: attempt,
+			error: msg,
+			durationMs: Date.now() - batchStartedAt,
+			tokens: { input: 0, output: 0 },
+			compacted: false,
+		};
+	}
+}
+
+// Minimal JSON-Schema-subset validator for submit_result payloads.
+// Supports: type, required, properties, items, enum, const, nullable.
+// No external deps. Returns a flat list of path-qualified error strings;
+// empty list means valid.
+function validateAgainstSchema(value: unknown, schema: any, path: string = "$"): string[] {
+	if (schema == null || typeof schema !== "object") return [];
+	const errors: string[] = [];
+	const expected = schema.type;
+	const nullable = schema.nullable === true;
+	if (value === null) {
+		if (!nullable && expected !== "null" && expected !== undefined) {
+			errors.push(`${path}: expected ${expected}, got null`);
+		}
+		return errors;
+	}
+	if (expected) {
+		const actual = Array.isArray(value) ? "array" : typeof value;
+		const hit = Array.isArray(expected) ? expected.includes(actual) : actual === expected;
+		if (!hit) errors.push(`${path}: expected ${Array.isArray(expected) ? expected.join("|") : expected}, got ${actual}`);
+	}
+	if (Array.isArray(schema.enum) && !schema.enum.includes(value)) {
+		errors.push(`${path}: value not in enum (${JSON.stringify(schema.enum)})`);
+	}
+	if ("const" in schema && value !== schema.const) {
+		errors.push(`${path}: expected const ${JSON.stringify(schema.const)}, got ${JSON.stringify(value)}`);
+	}
+	if (schema.properties && typeof value === "object" && !Array.isArray(value) && value !== null) {
+		const obj = value as Record<string, unknown>;
+		if (Array.isArray(schema.required)) {
+			for (const key of schema.required) {
+				if (!(key in obj)) errors.push(`${path}.${key}: required`);
+			}
+		}
+		for (const [key, sub] of Object.entries(schema.properties)) {
+			if (key in obj) errors.push(...validateAgainstSchema(obj[key], sub, `${path}.${key}`));
+		}
+	}
+	if (schema.items && Array.isArray(value)) {
+		for (let i = 0; i < value.length; i++) {
+			errors.push(...validateAgainstSchema(value[i], schema.items, `${path}[${i}]`));
+		}
+	}
+	return errors;
+}
+
+async function doSubmitResult(input: SubmitResultInput, ctx: ProgramContext): Promise<{ ok: true }> {
+	const client = ctx.client as any;
+	const store = ctx.store as any;
+	const { stringVal } = ctx as any;
+	if (!input?.agentId) throw new Error("submitResult: agentId required");
+
+	const state = await store.get(input.agentId);
+	const schemaJson = state ? extractString(state.fields?.output_schema) : undefined;
+	if (schemaJson) {
+		let schema: unknown = null;
+		try { schema = JSON.parse(schemaJson); } catch { /* stored malformed — skip */ }
+		if (schema) {
+			const payload = input.result;
+			const errors = validateAgainstSchema(payload, schema);
+			if (errors.length > 0) {
+				const msg = `submit_result failed schema validation:\n  - ${errors.join("\n  - ")}`;
+				// Record the failure on the child so doSpawn can classify status=schema_invalid
+				// even if the model doesn't retry or never succeeds. Error is still thrown so the
+				// model sees is_error=true on its tool_result and can self-correct.
+				const actor = client.objectActor.getOrCreate([input.agentId]);
+				await actor.setField("submission_errors", JSON.stringify(stringVal(msg)));
+				throw new Error(msg);
+			}
+		}
+	}
+
+	const resultJson = typeof input.result === "string" ? input.result : JSON.stringify(input.result);
+	const actor = client.objectActor.getOrCreate([input.agentId]);
+	await actor.setField("submitted_result", JSON.stringify(stringVal(resultJson)));
+	await actor.setField("submitted_at", JSON.stringify(stringVal(String(Date.now()))));
+	return { ok: true };
+}
+
+interface SubagentNode {
+	id: string;
+	name: string;
+	template: string | undefined;
+	depth: number;
+	taskId: string | undefined;
+	status: "pending" | "done" | "cancelled" | "unknown";
+	children: SubagentNode[];
+}
+
+/** Walk the spawn_parent links reachable from an agent and return a tree. */
+async function doGetSubagents(rootId: string, ctx: ProgramContext, maxDepth: number = 8): Promise<SubagentNode> {
+	const store = ctx.store as any;
+	// Scan is O(agents). /agent doesn't maintain a reverse index today; if this
+	// becomes a bottleneck we can add one to storeActor.
+	let refs: Array<{ id: string }> = [];
+	try { refs = (await store.list("agent")) ?? []; } catch { /* minimal harness — single-node tree */ }
+	const states = new Map<string, any>();
+	for (const ref of refs) {
+		const s = await store.get(ref.id);
+		if (s && !s.deleted) states.set(ref.id, s);
+	}
+	const rootState = states.get(rootId) ?? await store.get(rootId);
+	if (!rootState) throw new Error(`agent not found: ${rootId}`);
+	if (!states.has(rootId)) states.set(rootId, rootState);
+
+	function nodeFor(id: string, state: any, depth: number): SubagentNode {
+		const name = extractString(state.fields?.name) ?? id.slice(0, 8);
+		const tpl = extractString(state.fields?.spawn_template);
+		const taskId = extractString(state.fields?.spawn_task_id);
+		const submitted = extractString(state.fields?.submitted_result);
+		const cancelled = extractString(state.fields?.cancel_requested) === "true";
+		const status: SubagentNode["status"] = cancelled ? "cancelled" : submitted ? "done" : "pending";
+		return { id, name, template: tpl, depth, taskId, status, children: [] };
+	}
+
+	const rootNode = nodeFor(rootId, rootState, extractInt(rootState.fields?.spawn_depth, 0));
+	const byParent = new Map<string, string[]>();
+	for (const [id, s] of states) {
+		const parentId = s.fields?.spawn_parent?.linkValue?.targetId;
+		if (!parentId) continue;
+		const bucket = byParent.get(parentId);
+		if (bucket) bucket.push(id); else byParent.set(parentId, [id]);
+	}
+
+	const startDepth = rootNode.depth;
+	function expand(node: SubagentNode) {
+		if (node.depth - startDepth >= maxDepth) return;
+		const childIds = byParent.get(node.id) ?? [];
+		for (const cid of childIds) {
+			const cstate = states.get(cid);
+			if (!cstate) continue;
+			const childNode = nodeFor(cid, cstate, node.depth + 1);
+			node.children.push(childNode);
+			expand(childNode);
+		}
+	}
+	expand(rootNode);
+	return rootNode;
+}
+
+function countDescendants(node: SubagentNode): number {
+	let n = 0;
+	for (const c of node.children) n += 1 + countDescendants(c);
+	return n;
+}
+
+function renderSubagentTree(node: SubagentNode, indent: string = "", isLast: boolean = true, isRoot: boolean = true): string {
+	const branch = isRoot ? "" : (isLast ? "└─ " : "├─ ");
+	const statusSym = node.status === "done" ? "✓" : node.status === "cancelled" ? "✗" : "·";
+	const tplTag = node.template ? `[${node.template}]` : "";
+	const taskTag = node.taskId ? ` task=${node.taskId}` : "";
+	const head = `${indent}${branch}${statusSym} ${node.name} ${tplTag}${taskTag}  ${node.id.slice(0, 8)}`;
+	const lines = [head];
+	const nextIndent = indent + (isRoot ? "" : (isLast ? "   " : "│  "));
+	for (let i = 0; i < node.children.length; i++) {
+		lines.push(renderSubagentTree(node.children[i], nextIndent, i === node.children.length - 1, false));
+	}
+	return lines.join("\n");
+}
+
+// Render a block's content into text suitable for re-injection as a user turn.
+// Each shape produces a clearly-framed quotation so the model knows this is a
+// deliberate recall rather than a fresh utterance.
+function renderBlockForRecall(block: any, tsIso: string): { text: string; kind: string } {
+	const textContent = block?.content?.text;
+	if (textContent?.text !== undefined) {
+		const role = textContent.style === STYLE_ASSISTANT ? "assistant" : "user";
+		return {
+			kind: role === "assistant" ? "assistant_text" : "user_text",
+			text: `[Recalled ${role} turn from ${tsIso}]:\n${textContent.text}`,
+		};
+	}
+	const custom = block?.content?.custom;
+	if (custom) {
+		const contentType = custom.contentType ?? custom.content_type;
+		const meta = custom.meta ?? {};
+		if (contentType === BLOCK_TOOL_USE) {
+			const toolName = meta.tool_name ?? "?";
+			const input = meta.input ?? "{}";
+			return { kind: "tool_use", text: `[Recalled tool call from ${tsIso}]: ${toolName}(${input})` };
+		}
+		if (contentType === BLOCK_TOOL_RESULT) {
+			return { kind: "tool_result", text: `[Recalled tool result from ${tsIso}]:\n${meta.content ?? ""}${meta.is_error === "true" ? "\n(was an error)" : ""}` };
+		}
+		if (contentType === BLOCK_COMPACTION_SUMMARY) {
+			return { kind: "compaction", text: `[Recalled compaction summary from ${tsIso}]:\n${meta.summary ?? ""}` };
+		}
+	}
+	return { kind: "other", text: `[Recalled block ${block?.id ?? "?"} from ${tsIso}]` };
+}
+
+/** Re-inject a specific block into this agent's live context by writing a
+*  new user_text block that quotes it. The new block's timestamp places it
+*  after the latest compaction's firstKeptBlockId, so on the next ask it is
+*  part of the model's live context window.
+*/
+async function doRecall(agentId: string, blockId: string, ctx: ProgramContext): Promise<{ newBlockId: string; sourceKind: string; truncated: boolean }> {
+	const store = ctx.store as any;
+	const client = ctx.client as any;
+	const { randomUUID } = ctx;
+
+	const state = await store.get(agentId);
+	if (!state) throw new Error(`recall: agent not found: ${agentId}`);
+	if (state.typeKey !== "agent") throw new Error(`recall: ${agentId} is not an agent`);
+
+	const block = (state.blocks ?? []).find((b: any) => b.id === blockId);
+	if (!block) throw new Error(`recall: block ${blockId} is not on agent ${agentId}`);
+
+	const prov = state.blockProvenance?.[blockId];
+	const tsIso = prov?.timestamp ? new Date(prov.timestamp).toISOString() : "unknown time";
+	const rendered = renderBlockForRecall(block, tsIso);
+
+	const RECALL_TRUNCATE = 8192;
+	let text = rendered.text;
+	let truncated = false;
+	if (text.length > RECALL_TRUNCATE) {
+		text = text.slice(0, RECALL_TRUNCATE) + `\n…[recall truncated, ${text.length - RECALL_TRUNCATE} bytes omitted]`;
+		truncated = true;
+	}
+
+	const newBlockId = randomUUID();
+	const actor = client.objectActor.getOrCreate([agentId]);
+	await actor.addBlock(JSON.stringify(textBlock(newBlockId, text, STYLE_USER)));
+	return { newBlockId, sourceKind: rendered.kind, truncated };
+}
+
+async function doCancel(agentId: string, ctx: ProgramContext): Promise<{ ok: true }> {
+	const client = ctx.client as any;
+	const { stringVal } = ctx as any;
+	const actor = client.objectActor.getOrCreate([agentId]);
+	await actor.setField("cancel_requested", JSON.stringify(stringVal("true")));
+	return { ok: true };
+}
+
 // ── Actor (programmatic API for other programs) ──────────────────
 
 const actorDef: ProgramActorDef = {
@@ -1804,6 +2666,23 @@ const actorDef: ProgramActorDef = {
 		},
 		status: async (ctx: ProgramContext, agentId: string) => {
 			return await doStatus(agentId, ctx);
+		},
+		spawn: async (ctx: ProgramContext, arg: string | SpawnInput) => {
+			const input: SpawnInput = typeof arg === "string" ? JSON.parse(arg) : arg;
+			return await doSpawn(input, ctx);
+		},
+		submitResult: async (ctx: ProgramContext, arg: string | SubmitResultInput) => {
+			const input: SubmitResultInput = typeof arg === "string" ? JSON.parse(arg) : arg;
+			return await doSubmitResult(input, ctx);
+		},
+		recall: async (ctx: ProgramContext, agentId: string, blockId: string) => {
+			return await doRecall(agentId, blockId, ctx);
+		},
+		cancel: async (ctx: ProgramContext, agentId: string) => {
+			return await doCancel(agentId, ctx);
+		},
+		getSubagents: async (ctx: ProgramContext, agentId: string) => {
+			return await doGetSubagents(agentId, ctx);
 		},
 	},
 };
@@ -1834,4 +2713,21 @@ export const __test = {
 	shouldAutoCompact,
 	isContextOverflowError,
 	buildEffectiveSystem,
+	// Subagent spawning
+	doSpawn,
+	doSubmitResult,
+	doCancel,
+	resolveAgentTemplate,
+	BUILTIN_TEMPLATES,
+	buildSubagentSystemPrompt,
+	submitResultTool,
+	spawnTool,
+	validateAgainstSchema,
+	doGetSubagents,
+	renderSubagentTree,
+	countDescendants,
+	doRecall,
+	renderBlockForRecall,
+	Semaphore,
+	maxSpawnDepth,
 };

@@ -14,6 +14,7 @@
  * Rivet requires the registry in scope for c.client<typeof app>().
  */
 
+import "./env.js"; // side-effect: load .env into process.env before anything reads it
 import { actor, event, setup } from "rivetkit";
 import { db } from "rivetkit/db";
 import type { Change, Operation, Value, ObjectRef, Block, ObjectLink } from "./proto.js";
@@ -30,6 +31,12 @@ import {
 import { computeState, findHeads, toSnapshot, type ObjectState, type BlockProvenance } from "./dag/dag.js";
 import { initDisk, writeChange, readChangeByHex, listChangeFilesForObject, deleteChangesForObject, diskStats } from "./disk.js";
 import { getValidator } from "./programs/runtime.js";
+import {
+	assertPortAvailable,
+	clearEndpointLockfile,
+	desiredPort,
+	writeEndpointLockfile,
+} from "./endpoint.js";
 
 // ── Types ────────────────────────────────────────────────────────
 
@@ -814,11 +821,36 @@ const programActor = actor({
 
 // ── Registry ─────────────────────────────────────────────────────
 
+const MANAGER_PORT = desiredPort();
+
 export const app = setup({
 	use: { objectActor, storeActor, programActor },
+	// Explicit port instead of RivetKit's silent fallback: we fail fast in
+	// startServer() if it's busy so clients never see 6420 answered by nothing.
+	managerPort: MANAGER_PORT,
 	// Program manifests (base64 source) routinely exceed the default message
 	// cap; bump to 10MB so large programs like /agent + compaction fit.
 	maxIncomingMessageSize: 10_000_000,
 });
 
-app.start();
+async function startServer(): Promise<void> {
+	try {
+		await assertPortAvailable(MANAGER_PORT);
+	} catch (err) {
+		console.error((err as Error).message);
+		process.exit(1);
+	}
+	writeEndpointLockfile(MANAGER_PORT);
+	const cleanup = () => {
+		clearEndpointLockfile();
+		process.exit(0);
+	};
+	process.on("SIGINT", cleanup);
+	process.on("SIGTERM", cleanup);
+	process.on("exit", clearEndpointLockfile);
+	app.start();
+}
+
+// Run immediately when invoked as the entry point (not when imported for types).
+// Using a top-level await-less IIFE keeps this file valid under CJS-style bundles.
+void startServer();
