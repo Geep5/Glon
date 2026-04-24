@@ -32,10 +32,20 @@ function createHarness() {
 	const harnessReplies = new Map<string, string>(); // prompt text -> response
 	const dispatchCalls: { prefix: string; action: string; args: unknown[] }[] = [];
 
+	// Fields shared by ctx.store.get (read side) and ctx.objectActor().setField
+	// (write side), so tests can exercise persist-then-restore round-trips
+	// without a real RivetKit instance.
+	const PROGRAM_ID = "test-discord";
+	const storedFields: Record<string, unknown> = {};
+	const actorCalls: { id: string; key: string; valueJson: string }[] = [];
+
 	const ctx: ProgramContext = {
 		client: {},
 		store: {
-			get: async () => null,
+			get: async (id: string) => {
+				if (id === PROGRAM_ID) return { id, fields: { ...storedFields } };
+				return null;
+			},
 			create: async () => "x",
 			list: async () => [],
 		},
@@ -51,8 +61,13 @@ function createHarness() {
 		randomUUID: () => "uuid",
 		state: {},
 		emit: () => {},
-		programId: "test-discord",
-		objectActor: () => ({}),
+		programId: PROGRAM_ID,
+		objectActor: (id: string) => ({
+			setField: async (key: string, valueJson: string) => {
+				actorCalls.push({ id, key, valueJson });
+				if (id === PROGRAM_ID) storedFields[key] = JSON.parse(valueJson);
+			},
+		}),
 		dispatchProgram: async (prefix, action, args) => {
 			dispatchCalls.push({ prefix, action, args });
 			if (prefix === "/peer" && action === "list") {
@@ -77,7 +92,14 @@ function createHarness() {
 		peers,
 		harnessReplies,
 		dispatchCalls,
+		storedFields,
+		actorCalls,
+		PROGRAM_ID,
 		addPeer(peer: any) { peers.set(peer.id, peer); },
+		/** Seed `storedFields[key]` with a raw string — simulates a prior daemon run. */
+		seedStoredField(key: string, raw: string) {
+			storedFields[key] = stringVal(raw);
+		},
 	};
 }
 
@@ -334,6 +356,149 @@ describe("discord polling", () => {
 		assert.equal(h.state.tickInProgress, true);
 	});
 });
+
+// ── Durable state (watermarks survive daemon restart) ──────────
+
+describe("discord durable state", () => {
+	afterEach(() => { clearDiscordMock(); delete process.env.DISCORD_BOT_TOKEN; });
+
+	it("FIRST_POLL_RECENCY_MS is 60s — the persisted-watermark fix lets us shrink it", () => {
+		assert.equal(__test.FIRST_POLL_RECENCY_MS, 60 * 1000);
+	});
+
+	it("snapshotPersistedState only includes durable fields, never gateway/in-flight state", () => {
+		const raw = __test.snapshotPersistedState({
+			watermarks: { "ch-1": "123" },
+			dmChannelByPeer: { "peer-a": "ch-1" },
+			botUserId: "bot",
+			tickInProgress: true,
+			gatewayConnected: true,
+		});
+		assert.deepEqual(JSON.parse(raw), {
+			watermarks: { "ch-1": "123" },
+			dmChannelByPeer: { "peer-a": "ch-1" },
+		});
+	});
+
+	it("restorePersistedState rehydrates state from a prior daemon run", async () => {
+		const h = createHarness();
+		h.seedStoredField(__test.PERSISTED_STATE_FIELD, JSON.stringify({
+			watermarks: { "ch-1": "99999" },
+			dmChannelByPeer: { "peer-grant": "ch-1" },
+		}));
+		await __test.restorePersistedState(h.state, h.ctx);
+		assert.deepEqual(h.state.watermarks, { "ch-1": "99999" });
+		assert.deepEqual(h.state.dmChannelByPeer, { "peer-grant": "ch-1" });
+	});
+
+	it("restorePersistedState is a silent no-op when the program object has no field yet", async () => {
+		const h = createHarness();
+		await __test.restorePersistedState(h.state, h.ctx);
+		assert.equal(h.state.watermarks, undefined);
+		assert.equal(h.state.dmChannelByPeer, undefined);
+	});
+
+	it("persistStateIfChanged writes through objectActor.setField when the snapshot changes", async () => {
+		const h = createHarness();
+		h.state.watermarks = { "ch-1": "100" };
+		h.state.dmChannelByPeer = { "peer-a": "ch-1" };
+		await __test.persistStateIfChanged(h.state, h.ctx);
+		assert.equal(h.actorCalls.length, 1);
+		assert.equal(h.actorCalls[0].id, h.PROGRAM_ID);
+		assert.equal(h.actorCalls[0].key, __test.PERSISTED_STATE_FIELD);
+		const written = JSON.parse(h.actorCalls[0].valueJson) as any;
+		const payload = JSON.parse(written.stringValue);
+		assert.deepEqual(payload.watermarks, { "ch-1": "100" });
+	});
+
+	it("persistStateIfChanged is a no-op on the second call when nothing changed", async () => {
+		const h = createHarness();
+		h.state.watermarks = { "ch-1": "100" };
+		await __test.persistStateIfChanged(h.state, h.ctx);
+		await __test.persistStateIfChanged(h.state, h.ctx);
+		await __test.persistStateIfChanged(h.state, h.ctx);
+		assert.equal(h.actorCalls.length, 1, "only the first call hits the actor");
+	});
+
+	it("persist → restart → restore preserves the watermark across a simulated daemon bounce", async () => {
+		const h = createHarness();
+		h.addPeer({ id: "peer-grant", display_name: "Grant", discord_id: "111", kind: "self", trust_level: "self" });
+		h.state.botUserId = "bot-id";
+		h.state.dmChannelByPeer = { "peer-grant": "ch-1" };
+		h.state.watermarks = { "ch-1": "100" };
+		h.harnessReplies.set("hello", "hi grant");
+
+		let posted = 0;
+		mockDiscord((call) => {
+			if (call.path.startsWith("/channels/ch-1/messages?")) {
+				return [{ id: "101", author: { id: "111" }, content: "hello" }];
+			}
+			if (call.method === "POST" && call.path === "/channels/ch-1/messages") {
+				posted++;
+				return { id: "reply" };
+			}
+			if (call.path === "/channels/ch-1/typing") return null;
+			return null;
+		});
+
+		const r1 = await __test.runPoll(h.state, h.ctx);
+		assert.equal(r1.processed, 1);
+		await __test.persistStateIfChanged(h.state, h.ctx);
+		assert.equal(posted, 1, "first poll posts one reply");
+
+		// Simulate daemon bounce: drop the in-memory state, keep the same store-backed
+		// fields. After restore the watermark should already be at 101, so the next
+		// runPoll over the same Discord history must not re-ingest "hello".
+		h.ctx.state = {} as any;
+		await __test.restorePersistedState(h.ctx.state, h.ctx);
+		assert.deepEqual((h.ctx.state as any).watermarks, { "ch-1": "101" });
+		assert.deepEqual((h.ctx.state as any).dmChannelByPeer, { "peer-grant": "ch-1" });
+
+		const r2 = await __test.runPoll(h.ctx.state, h.ctx);
+		assert.equal(r2.processed, 0, "already-handled message must not be re-ingested after restart");
+		assert.equal(posted, 1, "no second reply");
+	});
+
+	it("poll action returns tick-in-progress sentinel and skips work when a tick is running", async () => {
+		const h = createHarness();
+		process.env.DISCORD_BOT_TOKEN = "test-token";
+		h.state.tickInProgress = true;
+
+		let called = 0;
+		mockDiscord(() => { called++; return null; });
+
+		const result = await discordProgram.actor!.actions!.poll!(h.ctx) as any;
+		assert.equal(called, 0, "poll action must not race a running tick");
+		assert.equal(result.skipped, "tick-in-progress");
+		assert.equal(h.state.tickInProgress, true, "caller's flag is left untouched");
+	});
+
+	it("poll action persists state after a successful run", async () => {
+		const h = createHarness();
+		process.env.DISCORD_BOT_TOKEN = "test-token";
+		h.addPeer({ id: "peer-grant", display_name: "Grant", discord_id: "111", kind: "self", trust_level: "self" });
+		h.state.botUserId = "bot-id";
+		h.state.dmChannelByPeer = { "peer-grant": "ch-1" };
+		h.state.watermarks = { "ch-1": "100" };
+		h.harnessReplies.set("new", "ack");
+
+		mockDiscord((call) => {
+			if (call.path.startsWith("/channels/ch-1/messages?")) {
+				return [{ id: "200", author: { id: "111" }, content: "new" }];
+			}
+			if (call.method === "POST" && call.path === "/channels/ch-1/messages") return { id: "x" };
+			if (call.path === "/channels/ch-1/typing") return null;
+			return null;
+		});
+
+		await discordProgram.actor!.actions!.poll!(h.ctx);
+		const writes = h.actorCalls.filter((c) => c.key === __test.PERSISTED_STATE_FIELD);
+		assert.equal(writes.length, 1, "poll action persists exactly once after the run");
+		const payload = JSON.parse(JSON.parse(writes[0].valueJson).stringValue);
+		assert.equal(payload.watermarks["ch-1"], "200");
+	});
+});
+
 
 // ── Gateway (presence) ────────────────────────────────────
 

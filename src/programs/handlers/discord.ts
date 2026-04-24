@@ -182,17 +182,78 @@ const DISCORD_EPOCH_MS = 1420070400000;
 /**
  * Window for processing "recent" messages on the first poll of a channel.
  *
- * Rationale: the old behavior was to silently absorb the newest message into
- * the watermark on first tick, which meant a user's very first DM to the bot
- * got dropped — a common first-time setup trap. We now process messages whose
- * snowflake timestamp is within this window so an onboarding DM is answered.
- * Older history is still skipped so a long-offline bot does not flood on boot.
+ * Used only when no persisted watermark exists for the channel (true first
+ * encounter, never a process restart — those are covered by
+ * `restorePersistedState`). The window exists for the onboarding case: a
+ * user DMs the bot before the daemon has ever seen this channel; we still
+ * want to answer if the message is fresh. Anything older than the window is
+ * absorbed into the watermark silently, so a long-offline bot does not flood
+ * a channel on first boot.
  */
-const FIRST_POLL_RECENCY_MS = 15 * 60 * 1000;
+const FIRST_POLL_RECENCY_MS = 60 * 1000;
 
 /** Extract the Unix ms timestamp encoded in a Discord snowflake id. */
 export function snowflakeTimestampMs(id: string): number {
 	return Number(BigInt(id) >> 22n) + DISCORD_EPOCH_MS;
+}
+
+// ── Durable state (watermarks + DM channel cache) ───────────────
+//
+// Watermarks and the peer → DM channel map live on the /discord program
+// object in the DAG, keyed by `PERSISTED_STATE_FIELD`. Without this, a
+// daemon restart within `FIRST_POLL_RECENCY_MS` of any inbound would
+// re-ingest the same user message and Gracie would answer it twice.
+//
+// The field holds a single JSON string, refreshed after every poll cycle
+// only when the snapshot actually changed. We never persist gateway state
+// or the `tickInProgress` guard — those are pure in-memory invariants.
+
+const PERSISTED_STATE_FIELD = "persisted_state";
+
+interface PersistedDiscordState {
+	watermarks: Record<string, string>;
+	dmChannelByPeer: Record<string, string>;
+}
+
+function snapshotPersistedState(state: Record<string, any>): string {
+	return JSON.stringify({
+		watermarks: (state.watermarks ?? {}) as Record<string, string>,
+		dmChannelByPeer: (state.dmChannelByPeer ?? {}) as Record<string, string>,
+	});
+}
+
+async function restorePersistedState(state: Record<string, any>, ctx: ProgramContext): Promise<void> {
+	if (!ctx.programId || !ctx.store) return;
+	try {
+		const obj = await (ctx.store as any).get(ctx.programId);
+		const field = obj?.fields?.[PERSISTED_STATE_FIELD];
+		const raw = typeof field === "string" ? field : field?.stringValue;
+		if (!raw) return;
+		const parsed = JSON.parse(raw) as PersistedDiscordState;
+		if (parsed.watermarks && typeof parsed.watermarks === "object") {
+			state.watermarks = { ...parsed.watermarks };
+		}
+		if (parsed.dmChannelByPeer && typeof parsed.dmChannelByPeer === "object") {
+			state.dmChannelByPeer = { ...parsed.dmChannelByPeer };
+		}
+		state._lastPersistedSnapshot = snapshotPersistedState(state);
+	} catch (err: any) {
+		ctx.print(dim(`  [discord] restore state failed: ${err?.message ?? String(err)}`));
+	}
+}
+
+async function persistStateIfChanged(state: Record<string, any>, ctx: ProgramContext): Promise<void> {
+	if (!ctx.programId) return;
+	const snap = snapshotPersistedState(state);
+	if (state._lastPersistedSnapshot === snap) return;
+	try {
+		const actor = ctx.objectActor(ctx.programId) as any;
+		if (typeof actor?.setField !== "function") return;
+		await actor.setField(PERSISTED_STATE_FIELD, JSON.stringify(ctx.stringVal(snap)));
+		state._lastPersistedSnapshot = snap;
+	} catch (err: any) {
+		ctx.print(dim(`  [discord] persist state failed: ${err?.message ?? String(err)}`));
+	}
 }
 
 async function pollPeer(peer: PeerSnapshot, state: Record<string, any>, ctx: ProgramContext): Promise<number> {
@@ -677,8 +738,11 @@ const actorDef: ProgramActorDef = {
 	}),
 
 	onCreate: async (ctx: ProgramContext) => {
-		// Warm up the bot user id on startup (non-fatal if it fails — tick retries).
 		if (!process.env.DISCORD_BOT_TOKEN) return;
+		// Rehydrate watermarks + DM channel cache before the first tick so a
+		// daemon restart does not re-ingest messages we already answered.
+		await restorePersistedState(ctx.state, ctx);
+		// Warm up the bot user id on startup (non-fatal if it fails — tick retries).
 		try {
 			await getBotUserId(ctx.state);
 		} catch {
@@ -706,6 +770,7 @@ const actorDef: ProgramActorDef = {
 		ctx.state.tickInProgress = true;
 		try {
 			await runPoll(ctx.state, ctx);
+			await persistStateIfChanged(ctx.state, ctx);
 		} catch (err: any) {
 			// onTick errors are swallowed by runtime, but we log for diagnostics.
 			ctx.print(dim(`  [discord] tick error: ${err?.message ?? String(err)}`));
@@ -741,9 +806,22 @@ const actorDef: ProgramActorDef = {
 			return await doTyping(peerId, ctx.state, ctx);
 		},
 
-		/** Trigger a poll cycle now. */
+		/**
+		 * Trigger a poll cycle now. Respects the same `tickInProgress` guard as
+		 * the auto-tick so an external dispatch cannot race a running tick and
+		 * re-ingest the same message.
+		 */
 		poll: async (ctx: ProgramContext) => {
-			return await runPoll(ctx.state, ctx);
+			if (!process.env.DISCORD_BOT_TOKEN) return { peers: 0, processed: 0, skipped: "no-token" as const };
+			if (ctx.state.tickInProgress) return { peers: 0, processed: 0, skipped: "tick-in-progress" as const };
+			ctx.state.tickInProgress = true;
+			try {
+				const result = await runPoll(ctx.state, ctx);
+				await persistStateIfChanged(ctx.state, ctx);
+				return result;
+			} finally {
+				ctx.state.tickInProgress = false;
+			}
 		},
 	},
 };
@@ -769,6 +847,11 @@ export const __test = {
 	openGateway,
 	tickGateway,
 	closeGateway,
+	restorePersistedState,
+	persistStateIfChanged,
+	snapshotPersistedState,
+	PERSISTED_STATE_FIELD,
+	FIRST_POLL_RECENCY_MS,
 };
 
 // silence unused-warning for helpers we export only via __test
