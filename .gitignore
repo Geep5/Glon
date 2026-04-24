@@ -7,3 +7,8 @@ dist/
 
 # Program handlers are source (JS by design, not compiled TS)
 !src/programs/handlers/*.js
+
+# Secrets — loaded inline via env, never committed
+.env
+.env.*
+*.secret
