@@ -151,6 +151,30 @@ How to handle mutations:
   to your own scratch doc), you can use confirmed=true directly but mention it.
 
 
+## Shell access
+You have shell_exec on Grant's machine. It's real bash — pipes, redirects, $VARS,
+globs, backgrounding, everything works. Sessions persist cwd + env across calls,
+so \`cd ~/projekt\` in one call sticks for the next call in the same session.
+
+Use this when:
+- You need a specific binary (git, npm, ffmpeg, jq, python, node, gcloud, etc.)
+- You're exploring a repo or filesystem (ls, find, grep, cat, head, tree, tail)
+- You're inspecting system state (ps, df, du, free, uname, uptime, who)
+- You're running tests, builds, or deploys that Grant asked for
+
+Rules of thumb:
+- Trusted environment: no confirmation gate on shell_exec. But act like an
+  executive assistant, not a script: announce destructive actions (rm, git push,
+  kill -9, deploys, anything that changes external state) before running them.
+- Prefer one composed command over many round-trips when it's natural —
+  \`cd ~/projekt && git status && git log -3\` is one call, not three.
+- Use distinct session names for parallel work (\`repo1\`, \`deploy\`, \`scratch\`).
+  Default session is 'main'.
+- If something hangs, shell_kill the session and start over.
+- For Google Workspace operations, prefer the google_* tools over shelling out
+  to \`gws\` — the typed actions are clearer and they gate dangerous mutations.
+
+
 ## Web access
 You have HTTP tools: web_fetch (full control), web_get_text (GET + UTF-8),
 web_get_json (GET + parsed JSON). Responses are capped at 16 KB by default;
@@ -1013,8 +1037,62 @@ function buildGoogleTools(): ToolSpec[] {
 	];
 }
 
+// ── Shell tools (via /shell → persistent bash sessions) ────────────
+//
+// Full bash, no gate. Trusted environment — Gracie can run anything Grant's
+// user can run. Sessions persist cwd + env across calls so multi-step work
+// (cd somewhere, run something, read a file) composes naturally.
+
+function buildShellTools(): ToolSpec[] {
+	return [
+		{
+			name: "shell_exec",
+			description: [
+				"Run a bash command in a persistent session on Grant's machine.",
+				"Full bash semantics: pipes, redirects, $VARS, globs, backgrounding.",
+				"cwd and env persist across calls within the same `session` name.",
+				"Default session is 'main'. Use distinct session names to run parallel work.",
+				"Returns stdout, stderr, exit_code, duration_ms, and the resulting cwd.",
+			].join(" "),
+			input_schema: {
+				type: "object",
+				properties: {
+					command: { type: "string", description: "bash command line, e.g. 'cd ~/projekt && git status'" },
+					session: { type: "string", description: "session name; default 'main'" },
+					timeout_ms: { type: "number", description: "per-call timeout; default 30000, max 600000" },
+				},
+				required: ["command"],
+			},
+			target_prefix: "/shell",
+			target_action: "exec",
+		},
+		{
+			name: "shell_sessions",
+			description: "List live shell sessions with cwd, exec count, and idle time.",
+			input_schema: { type: "object", properties: {} },
+			target_prefix: "/shell",
+			target_action: "list_sessions",
+		},
+		{
+			name: "shell_kill",
+			description: "Kill and discard a shell session. Next shell_exec on that name starts a fresh bash. Use when a session hangs or you need a clean state.",
+			input_schema: {
+				type: "object",
+				properties: { session: { type: "string", description: "session name; default 'main'" } },
+			},
+			target_prefix: "/shell",
+			target_action: "kill",
+		},
+	];
+}
+
 function buildGracieTools(gracieAgentId: string): ToolSpec[] {
-	return [...BASE_TOOLS, ...buildMemoryTools(gracieAgentId), ...buildGoogleTools()];
+	return [
+		...BASE_TOOLS,
+		...buildMemoryTools(gracieAgentId),
+		...buildGoogleTools(),
+		...buildShellTools(),
+	];
 }
 
 async function autoWireTools(agentId: string, ctx: ProgramContext): Promise<{ wired: string[]; skipped: { name: string; reason: string }[] }> {

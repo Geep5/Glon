@@ -45,6 +45,7 @@ const SOURCES = [
 	"src/programs/handlers/web.ts",
 	"src/programs/handlers/memory.ts",
 	"src/programs/handlers/google.ts",
+	"src/programs/handlers/shell.ts",
 	"package.json",
 	"tsconfig.json",
 ];
@@ -296,6 +297,17 @@ const PROGRAMS: ProgramDef[] = [
 		},
 		entry: "google.ts",
 		modules: { "google.ts": "src/programs/handlers/google.ts" },
+	},
+	{
+		prefix: "/shell",
+		name: "Shell",
+		commands: {
+			exec: "Run a bash command in a persistent session",
+			sessions: "List live shell sessions",
+			kill: "Kill and discard a session",
+		},
+		entry: "shell.ts",
+		modules: { "shell.ts": "src/programs/handlers/shell.ts" },
 	},
 ];
 

@@ -346,6 +346,8 @@ describe("gracie tool auto-wiring", () => {
 			"google_drive_search", "google_drive_get",
 			"google_sheets_read", "google_sheets_append",
 			"google_docs_get", "google_docs_write",
+			// Shell tools (via /shell → persistent bash)
+			"shell_exec", "shell_sessions", "shell_kill",
 		];
 		assert.deepEqual([...result.wiredTools].sort(), [...expected].sort());
 		assert.equal(result.skippedTools.length, 0);
