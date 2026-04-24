@@ -572,6 +572,33 @@ ${conversation}`;
 
 // ── Anthropic client ─────────────────────────────────────────────
 
+/** Transient network failure heuristic — these are all worth one retry. */
+function isTransientFetchError(err: unknown): boolean {
+	const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+	if (msg.includes("fetch failed")) return true;
+	if (msg.includes("econnreset")) return true;
+	if (msg.includes("econnrefused")) return true;
+	if (msg.includes("etimedout")) return true;
+	if (msg.includes("socket hang up")) return true;
+	if (msg.includes("enotfound")) return true;
+	return false;
+}
+
+/**
+ * Wrap `fetch` with one retry on transient network errors. Does NOT retry non-2xx
+ * HTTP responses — those come back as a resolved Response with `ok: false`, and the
+ * caller decides how to surface them. We only retry when the network layer itself threw.
+ */
+async function fetchWithTransientRetry(url: string, opts: RequestInit, retryDelayMs = 1500): Promise<Response> {
+	try {
+		return await fetch(url, opts);
+	} catch (err) {
+		if (!isTransientFetchError(err)) throw err;
+		await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+		return await fetch(url, opts);
+	}
+}
+
 async function callAnthropic(
 	messages: { role: string; content: string | AnthropicContent[] }[],
 	system: string | undefined,
@@ -611,7 +638,10 @@ async function callAnthropic(
 		}));
 	}
 
-	const res = await fetch("https://api.anthropic.com/v1/messages", {
+	// Transient network errors (TypeError: fetch failed, ECONNRESET, socket hang up)
+	// manifest as fetch throwing rather than returning a non-OK response. Retry once
+	// with a short delay so one bad TLS handshake doesn't surface a user-visible error.
+	const fetchOpts = {
 		method: "POST",
 		headers: {
 			"Content-Type": "application/json",
@@ -619,7 +649,8 @@ async function callAnthropic(
 			"anthropic-version": "2023-06-01",
 		},
 		body: JSON.stringify(body),
-	});
+	};
+	const res = await fetchWithTransientRetry("https://api.anthropic.com/v1/messages", fetchOpts);
 
 	if (!res.ok) {
 		const text = await res.text();
