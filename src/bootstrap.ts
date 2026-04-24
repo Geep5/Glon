@@ -178,7 +178,10 @@ const PROGRAMS: ProgramDef[] = [
 			cancel: "Request cancellation of a running subagent",
 		},
 		entry: "task.ts",
-		modules: { "task.ts": "src/programs/handlers/task.ts" },
+		modules: {
+			"task.ts": "src/programs/handlers/task.ts",
+			"agent.ts": "src/programs/handlers/agent.ts",
+		},
 	},
 	{
 		prefix: "/gc",
@@ -259,7 +262,10 @@ const PROGRAMS: ProgramDef[] = [
 			"refresh-prompt": "Re-render default system prompt + re-wire tools",
 		},
 		entry: "holdfast.ts",
-		modules: { "holdfast.ts": "src/programs/handlers/holdfast.ts" },
+		modules: {
+			"holdfast.ts": "src/programs/handlers/holdfast.ts",
+			"agent.ts": "src/programs/handlers/agent.ts",
+		},
 	},
 	{
 		prefix: "/discord",

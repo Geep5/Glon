@@ -207,16 +207,20 @@ async function bundleModuleSet(ms: ModuleSet): Promise<string> {
 				if (args.kind === "entry-point") {
 					return { path: args.path, namespace: "glon" };
 				}
-				// Resolve relative imports within the module set
+				// Resolve relative imports within the module set.
+				// TypeScript ESM writes `import … from "./foo.js"` even when the source
+				// file on disk is `foo.ts`, so we try both extension swaps before giving up.
 				const resolved = args.path.replace(/^\.\//, "");
-				if (ms.modules.has(resolved)) {
-					return { path: resolved, namespace: "glon" };
-				}
-				// Try with .ts/.js extensions
-				for (const ext of [".ts", ".js"]) {
-					const withExt = resolved + ext;
-					if (ms.modules.has(withExt)) {
-						return { path: withExt, namespace: "glon" };
+				const candidates = [
+					resolved,
+					resolved + ".ts",
+					resolved + ".js",
+					resolved.endsWith(".js") ? resolved.slice(0, -3) + ".ts" : null,
+					resolved.endsWith(".ts") ? resolved.slice(0, -3) + ".js" : null,
+				].filter((c): c is string => !!c);
+				for (const c of candidates) {
+					if (ms.modules.has(c)) {
+						return { path: c, namespace: "glon" };
 					}
 				}
 				// External — let it pass through (will be available at runtime via ctx)
