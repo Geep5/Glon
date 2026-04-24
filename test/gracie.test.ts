@@ -338,6 +338,14 @@ describe("gracie tool auto-wiring", () => {
 			"memory_upsert_milestone", "memory_amend_milestone",
 			"memory_list_milestones", "memory_get_milestone",
 			"memory_recall",
+			// Google Workspace tools (via /google → gws CLI)
+			"google_calendar_agenda", "google_calendar_list_events",
+			"google_calendar_insert", "google_calendar_delete_event",
+			"google_gmail_triage", "google_gmail_search", "google_gmail_read",
+			"google_gmail_send", "google_gmail_reply",
+			"google_drive_search", "google_drive_get",
+			"google_sheets_read", "google_sheets_append",
+			"google_docs_get", "google_docs_write",
 		];
 		assert.deepEqual([...result.wiredTools].sort(), [...expected].sort());
 		assert.equal(result.skippedTools.length, 0);

@@ -44,6 +44,7 @@ const SOURCES = [
 	"src/programs/handlers/remind.ts",
 	"src/programs/handlers/web.ts",
 	"src/programs/handlers/memory.ts",
+	"src/programs/handlers/google.ts",
 	"package.json",
 	"tsconfig.json",
 ];
@@ -284,6 +285,17 @@ const PROGRAMS: ProgramDef[] = [
 		},
 		entry: "memory.ts",
 		modules: { "memory.ts": "src/programs/handlers/memory.ts" },
+	},
+	{
+		prefix: "/google",
+		name: "Google",
+		commands: {
+			status: "Probe gws binary reachability",
+			agenda: "Calendar agenda (today/tomorrow/week/days)",
+			triage: "Gmail unread inbox triage",
+		},
+		entry: "google.ts",
+		modules: { "google.ts": "src/programs/handlers/google.ts" },
 	},
 ];
 

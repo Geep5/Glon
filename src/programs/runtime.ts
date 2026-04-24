@@ -257,12 +257,19 @@ async function bundleModuleSet(ms: ModuleSet): Promise<string> {
 	// modules provided at eval-time via `arguments[0]` (the externals map).
 	return `
 		var __externals = arguments[0];
+		var __nodeRequire = arguments[1];
 		var module = { exports: {} };
 		var exports = module.exports;
 		var require = function(id) {
 			var key = id.replace(/^(\\.\\.\\/)+/, "").replace(/^\\.\\//, "");
 			if (__externals[key]) return __externals[key];
 			if (__externals[id]) return __externals[id];
+			// Node built-ins: only \`node:\`-prefixed imports are allowed through.
+			// Programs that want child_process/fs/etc must import them explicitly
+			// with the \`node:\` prefix to avoid ambiguity with DAG-provided modules.
+			if (__nodeRequire && id.indexOf("node:") === 0) {
+				return __nodeRequire(id);
+			}
 			throw new Error("Cannot resolve module: " + id);
 		};
 		${bundled}
@@ -285,7 +292,11 @@ async function compileModuleProgram(ms: ModuleSet, name: string): Promise<Progra
 			"crypto.js": cryptoMod,
 		};
 		const factory = new Function(bundled);
-		const exports = factory(externals);
+		// Node built-ins go through the real require, scoped to node: prefix only
+		// (see the shim in bundleModuleSet).
+		const { createRequire } = await import("node:module");
+		const nodeRequire = createRequire(import.meta.url);
+		const exports = factory(externals, nodeRequire);
 		const def: ProgramDef = exports.default ?? exports;
 
 		// Validate shape
