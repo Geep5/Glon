@@ -1,4 +1,4 @@
-# Glon — Architecture
+# glon — Architecture
 
 ## Layers
 
@@ -11,7 +11,7 @@
 +------------------------------+--------------------------------+
 |  Shell (src/client.ts)       |  Bootstrap (src/bootstrap.ts)  |
 |  Pure program loader         |  Seed source & programs        |
-|  ZERO built-in commands      |  as Glon objects               |
+|  ZERO built-in commands      |  as glon objects               |
 +------------------------------+--------------------------------+
 |  Store Actor (coordinator)                                    |
 |  SQLite index: objects, changes, DAG edges, links             |
@@ -88,7 +88,7 @@ The sync system operates peer-to-peer without central servers:
 | `ObjectEvent` | "This object changed, here are the new heads + changes" |
 | `AppMessage` | Free-form IPC between objects |
 | `BloomFilter` | "Here's what content I have" (space-efficient) |
-| `PeerAnnounce` | "I'm a Glon peer at this endpoint" (mDNS) |
+| `PeerAnnounce` | "I'm a glon peer at this endpoint" (mDNS) |
 
 ### Sync Handshake
 
@@ -171,7 +171,7 @@ fresh from disk.
 
 ## Programs
 
-Programs are Glon objects with type `program`. They sync between
+Programs are glon objects with type `program`. They sync between
 instances, have full change history, and are individually addressable.
 
 ### Object Shape
@@ -234,7 +234,7 @@ The context object passed to all program code:
 | `store` | Actor client for CRUD, list, search |
 | `state` | Program's persistent state (read/write) |
 | `emit(channel, data)` | Broadcast structured events |
-| `programId` | This program's Glon object ID |
+| `programId` | This program's glon object ID |
 | `objectActor(id)` | Typed access to any object actor |
 | `proto` | Encode/decode helpers (`stringVal`, `mapVal`, etc.) |
 | `print(msg)` | Output to the shell |
@@ -296,7 +296,7 @@ valid — the actors hold their own state, clients only dispatch.
 
 ## Agents: Conversation, Tools, Compaction, Memory
 
-`/agent` is a program that treats an `agent`-typed Glon object as the durable
+`/agent` is a program that treats an `agent`-typed glon object as the durable
 home of a conversation. Every prompt, assistant text, `tool_use`, `tool_result`,
 and `compaction_summary` is a block in that object's DAG.
 
@@ -348,7 +348,7 @@ compaction + retry.
 ## Memory: Facts and Milestones
 
 `/memory` gives agents two object types for durable knowledge that survives
-compaction and syncs between instances like any other Glon object.
+compaction and syncs between instances like any other glon object.
 
 ### Object types
 
@@ -410,7 +410,7 @@ both directions — "what replaced milestone X?" is a cheap reverse-link query.
 ### Ownership model
 
 Everything in `/memory` is agent-scoped through the `owner` `ObjectLink` field.
-Two agents sharing a Glon store have independent memory. An agent reading its
+Two agents sharing a glon store have independent memory. An agent reading its
 own store is a regular `object_list type_key=pinned_fact/milestone` query; no
 special read path.
 
@@ -519,7 +519,7 @@ Value {
 }
 ```
 
-Glon never interprets these structures. The DAG replay code does
+glon never interprets these structures. The DAG replay code does
 `state.fields.set(key, value)` — it doesn't look inside the Value.
 Programs define their own conventions on top of the typed primitives.
 
@@ -535,22 +535,22 @@ CustomContent {
 }
 ```
 
-Glon stores, content-addresses, syncs, and replays custom blocks
+glon stores, content-addresses, syncs, and replays custom blocks
 through the standard Change DAG. Peers that don't understand a
 `CustomContent` block fall back to displaying the `meta` map.
 
 ### Why Not Program-Defined Protobufs?
 
-**Custom Operations (programs bring their own reducers):** Glon
+**Custom Operations (programs bring their own reducers):** glon
 would need each program's code to replay the DAG. A peer without
 the program couldn't compute state. Breaks "any peer can recompute
 from changes alone."
 
-**Custom Value schemas (opaque bytes with type URLs):** Glon
+**Custom Value schemas (opaque bytes with type URLs):** glon
 could carry but not inspect the data. Loses field indexing, value
 queries, and state diffing.
 
-Recursive Value avoids both traps: Glon always replays the DAG
+Recursive Value avoids both traps: glon always replays the DAG
 (Operations are unchanged), always inspects values (typed all the
 way down), and programs compose arbitrary structures from a fixed
 set of primitives. `glon.proto` is stable.
