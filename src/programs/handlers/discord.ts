@@ -293,8 +293,8 @@ async function runPoll(state: Record<string, any>, ctx: ProgramContext): Promise
 // the daemon is restarted.
 
 const GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json";
-const GATEWAY_PRESENCE_ACTIVITY_NAME = "/gracie say";
-const GATEWAY_PRESENCE_ACTIVITY_TYPE = 2; // 2 = Listening to …
+const GATEWAY_PRESENCE_ACTIVITY_NAME = "Grant's Companion";
+const GATEWAY_PRESENCE_ACTIVITY_TYPE = 4; // 4 = Custom status
 
 // Gateway opcodes — see https://discord.com/developers/docs/events/gateway-events
 const OP_DISPATCH = 0;
