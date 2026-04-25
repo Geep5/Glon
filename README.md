@@ -42,8 +42,8 @@ The kernel knows nothing about LLMs. The fact that `/agent` exists at the progra
 
 **Install**
 ```bash
-git clone https://github.com/Geep5/Glon.git
-cd Glon && npm install
+git clone https://github.com/Geep5/glon.git
+cd glon && npm install
 cp .env.example .env        # fill in secrets (see sections below)
 ```
 
