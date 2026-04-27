@@ -1,4 +1,4 @@
-// Peer — identity + trust for every human and agent Gracie talks to.
+// Peer — identity + trust for every human and agent the harness talks to.
 //
 // A peer is a first-class Glon object (type "peer"). Grant, Grant's mom,
 // FIG, future external bots — all peers, unified under one abstraction.
@@ -13,7 +13,7 @@
 //   email?:       email address (for mail tools)
 //   notes?:       free-text, owner-editable
 //
-// The set of valid `kind` / `trust_level` values is soft — Gracie's
+// The set of valid `kind` / `trust_level` values is soft — the harness's
 // system prompt and downstream programs interpret them. New categories
 // can be added without schema changes.
 

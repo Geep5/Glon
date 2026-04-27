@@ -44,13 +44,14 @@ const SOURCES = [
 	"src/programs/handlers/sync.ts",
 	"src/programs/handlers/graph.ts",
 	"src/programs/handlers/peer.ts",
-	"src/programs/handlers/gracie.ts",
+	"src/programs/handlers/holdfast.ts",
 	"src/programs/handlers/discord.ts",
 	"src/programs/handlers/remind.ts",
 	"src/programs/handlers/web.ts",
 	"src/programs/handlers/memory.ts",
 	"src/programs/handlers/google.ts",
 	"src/programs/handlers/shell.ts",
+	"src/programs/handlers/auth.ts",
 	"package.json",
 	"tsconfig.json",
 ];
@@ -248,16 +249,17 @@ const PROGRAMS: ProgramDef[] = [
 		modules: { "peer.ts": "src/programs/handlers/peer.ts" },
 	},
 	{
-		prefix: "/gracie",
-		name: "Gracie",
+		prefix: "/holdfast",
+		name: "Holdfast",
 		commands: {
-			setup: "Bootstrap Gracie (create agent + self peer)",
-			say: "Grant talks to Gracie from the shell",
+			setup: "Bootstrap the harness (create agent + self peer)",
+			say: "Principal talks to the agent from the shell",
 			ingest: "Deliver a message from a peer on a source",
 			status: "Show current agent + principal ids",
+			"refresh-prompt": "Re-render default system prompt + re-wire tools",
 		},
-		entry: "gracie.ts",
-		modules: { "gracie.ts": "src/programs/handlers/gracie.ts" },
+		entry: "holdfast.ts",
+		modules: { "holdfast.ts": "src/programs/handlers/holdfast.ts" },
 	},
 	{
 		prefix: "/discord",
@@ -330,6 +332,18 @@ const PROGRAMS: ProgramDef[] = [
 		},
 		entry: "shell.ts",
 		modules: { "shell.ts": "src/programs/handlers/shell.ts" },
+	},
+	{
+		prefix: "/auth",
+		name: "Auth",
+		commands: {
+			login: "Run interactive OAuth, save token",
+			status: "Show current credential, expiry",
+			refresh: "Force a token refresh",
+			logout: "Delete stored credentials",
+		},
+		entry: "auth.ts",
+		modules: { "auth.ts": "src/programs/handlers/auth.ts" },
 	},
 ];
 

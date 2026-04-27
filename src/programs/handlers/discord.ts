@@ -1,16 +1,16 @@
-// Discord — I/O bridge between Gracie (or any Glon agent) and Discord.
+// Discord — I/O bridge between Holdfast (or any Glon agent) and Discord.
 //
 // Runs as a Glon program with a 3-second tick. Each tick:
 //   1. Loads peers that have `discord_id` set via /peer.list
 //   2. Opens/caches a DM channel per peer
 //   3. Polls each DM channel for new messages since its watermark
-//   4. Dispatches each inbound to /gracie.ingest(source="discord", peer_id, text)
-//   5. Sends Gracie's final reply back as Discord messages (split at 2000)
+//   4. Dispatches each inbound to /holdfast.ingest(source="discord", peer_id, text)
+//   5. Sends the agent's final reply back as Discord messages (split at 2000)
 //
-// Actions exposed to other programs (Gracie calls these as tools):
+// Actions exposed to other programs (the harness calls these as tools):
 //   - send(peerId, text)       — DM a peer by peer id
 //   - sendChannel(channelId, text) — post to a specific channel
-//   - typing(peerId)           — typing indicator while Gracie thinks
+//   - typing(peerId)           — typing indicator while the agent thinks
 //
 // Credentials: DISCORD_BOT_TOKEN env var only. Never persisted to the DAG.
 // State (bot user id, channel cache, watermarks) lives in the actor's
@@ -77,7 +77,7 @@ async function discord(method: string, path: string, body?: unknown): Promise<an
 
 	const headers: Record<string, string> = {
 		"Authorization": `Bot ${token()}`,
-		"User-Agent": "Glon/Gracie (+https://github.com/Geep5/Glon)",
+		"User-Agent": "Glon/Holdfast (+https://github.com/Geep5/Glon)",
 	};
 	if (body !== undefined) headers["Content-Type"] = "application/json";
 
@@ -241,7 +241,7 @@ async function pollPeer(peer: PeerSnapshot, state: Record<string, any>, ctx: Pro
 			// Fire typing while we think.
 			discord("POST", `/channels/${channelId}/typing`).catch(() => { /* non-critical */ });
 
-			const result = await ctx.dispatchProgram("/gracie", "ingest", ["discord", peer.id, content]) as {
+			const result = await ctx.dispatchProgram("/holdfast", "ingest", ["discord", peer.id, content]) as {
 				finalText: string;
 			};
 			if (result?.finalText) {
@@ -715,7 +715,7 @@ const actorDef: ProgramActorDef = {
 	},
 
 	actions: {
-		/** Send a DM to a peer (by peer id). Exposed to Gracie as a tool. */
+		/** Send a DM to a peer (by peer id). Exposed to the harness as a tool. */
 		send: async (ctx: ProgramContext, input: string | { peer_id?: string; text?: string }) => {
 			const args = typeof input === "string" ? JSON.parse(input) : input;
 			const peerId = args?.peer_id;

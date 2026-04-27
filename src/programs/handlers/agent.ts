@@ -571,6 +571,54 @@ ${conversation}`;
 }
 
 // ── Anthropic client ─────────────────────────────────────────────
+//
+// Two auth modes:
+//
+// 1. OAuth via Claude Pro/Max — set up once with `/auth login anthropic`.
+//    The token comes from /auth's actor and we send it as a Bearer header,
+//    plus the Claude Code beta strings, User-Agent, and X-Stainless-* fingerprint
+//    that the official `claude` CLI sends. Anthropic accepts those requests and
+//    bills against the user's plan instead of API credits.
+//
+// 2. API key — `ANTHROPIC_API_KEY` env var. Plain `x-api-key` auth, billed per token.
+//
+// The OAuth path imposes two extra constraints we satisfy here:
+//   - `system` MUST start with the Claude Code identity string (we prepend it as
+//     the first system block when not already present).
+//   - Tool names get a `proxy_` prefix on the wire. We strip it from responses so
+//     the rest of the agent's dispatch logic stays in Glon's namespace.
+//
+// These constants are part of the impersonation. Bump them when the official
+// Claude CLI updates and our requests start failing with 4xx — see /auth's
+// header notes for the rotation surface area.
+
+const CLAUDE_CODE_VERSION = "2.1.39";
+const CLAUDE_CODE_SYSTEM_INSTRUCTION = "You are Claude Code, Anthropic's official CLI for Claude.";
+const CLAUDE_CODE_TOOL_PREFIX = "proxy_";
+const CLAUDE_CODE_BETAS = [
+	"claude-code-20250219",
+	"oauth-2025-04-20",
+	"interleaved-thinking-2025-05-14",
+	"prompt-caching-scope-2026-01-05",
+].join(",");
+// Stainless is Anthropic's SDK generator; the official CLI sends these on every
+// request. Drift over time — keep aligned with whatever the current `claude` CLI sends.
+const CLAUDE_CODE_STAINLESS_HEADERS: Record<string, string> = {
+	"X-Stainless-Helper-Method": "stream",
+	"X-Stainless-Retry-Count": "0",
+	"X-Stainless-Runtime-Version": "v24.13.1",
+	"X-Stainless-Package-Version": "0.73.0",
+	"X-Stainless-Runtime": "node",
+	"X-Stainless-Lang": "js",
+	"X-Stainless-Arch": "arm64",
+	"X-Stainless-Os": "MacOS",
+	"X-Stainless-Timeout": "600",
+};
+
+interface ResolvedAnthropicCredential {
+	token: string;
+	isOAuth: boolean;
+}
 
 /** Transient network failure heuristic — these are all worth one retry. */
 function isTransientFetchError(err: unknown): boolean {
@@ -599,6 +647,44 @@ async function fetchWithTransientRetry(url: string, opts: RequestInit, retryDela
 	}
 }
 
+/**
+ * Resolve an Anthropic credential. Tries the /auth program first (OAuth and
+ * api_key entries in auth.json), falls back to ANTHROPIC_API_KEY env var.
+ * Returns null only when nothing is configured — callers turn that into a
+ * useful error message at the API boundary.
+ */
+async function resolveAnthropicCredential(ctx: ProgramContext | undefined): Promise<ResolvedAnthropicCredential | null> {
+	if (ctx) {
+		try {
+			const result = await ctx.dispatchProgram("/auth", "getAnthropic", []) as ResolvedAnthropicCredential | null;
+			if (result?.token) return result;
+		} catch {
+			// /auth not loaded (e.g. before bootstrap, or in a stripped harness).
+			// Fall through to env-var.
+		}
+	}
+	const envKey = process.env.ANTHROPIC_API_KEY;
+	if (envKey) return { token: envKey, isOAuth: false };
+	return null;
+}
+
+/**
+ * Convert a string system prompt into the array form Anthropic accepts when
+ * we need to prepend the Claude Code identity. If the user's prompt already
+ * contains the identity string we leave it alone (no double-prepending).
+ */
+function buildOAuthSystemBlocks(system: string | undefined): { type: "text"; text: string }[] {
+	const userPrompt = (system ?? "").trim();
+	if (userPrompt.includes(CLAUDE_CODE_SYSTEM_INSTRUCTION)) {
+		return [{ type: "text", text: userPrompt }];
+	}
+	const blocks: { type: "text"; text: string }[] = [
+		{ type: "text", text: CLAUDE_CODE_SYSTEM_INSTRUCTION },
+	];
+	if (userPrompt) blocks.push({ type: "text", text: userPrompt });
+	return blocks;
+}
+
 async function callAnthropic(
 	messages: { role: string; content: string | AnthropicContent[] }[],
 	system: string | undefined,
@@ -607,6 +693,7 @@ async function callAnthropic(
 	tools: ToolSpec[] | undefined,
 	onChunk: ((text: string) => void) | undefined,
 	maxTokens?: number,
+	ctx?: ProgramContext,
 ): Promise<InferenceResult> {
 	const testFetch = (globalThis as any).__ANTHROPIC_FETCH as
 		| undefined
@@ -615,9 +702,15 @@ async function callAnthropic(
 		return testFetch({ messages, tools, system, model, maxTokens });
 	}
 
-	const apiKey = process.env.ANTHROPIC_API_KEY;
-	if (!apiKey) throw new Error("ANTHROPIC_API_KEY not set");
+	const auth = await resolveAnthropicCredential(ctx);
+	if (!auth) {
+		throw new Error(
+			"No Anthropic credentials. Run `/auth login anthropic` to use a Claude Pro/Max plan, " +
+			"or set ANTHROPIC_API_KEY in your environment.",
+		);
+	}
 
+	// Streaming with tool_use is more complex; the existing path only streams when no tools.
 	const stream = !!onChunk && !tools;
 
 	const body: Record<string, any> = {
@@ -629,28 +722,56 @@ async function callAnthropic(
 	// Newer models (Opus 4.7+) reject `temperature` outright. Only include it when
 	// the agent has an explicit override; otherwise let the API use its default.
 	if (temperature !== undefined) body.temperature = temperature;
-	if (system) body.system = system;
+
+	if (auth.isOAuth) {
+		body.system = buildOAuthSystemBlocks(system);
+	} else if (system) {
+		body.system = system;
+	}
+
 	if (tools && tools.length > 0) {
 		body.tools = tools.map((t) => ({
-			name: t.name,
+			name: auth.isOAuth ? `${CLAUDE_CODE_TOOL_PREFIX}${t.name}` : t.name,
 			description: t.description,
 			input_schema: t.input_schema,
 		}));
 	}
 
-	// Transient network errors (TypeError: fetch failed, ECONNRESET, socket hang up)
-	// manifest as fetch throwing rather than returning a non-OK response. Retry once
-	// with a short delay so one bad TLS handshake doesn't surface a user-visible error.
-	const fetchOpts = {
-		method: "POST",
-		headers: {
-			"Content-Type": "application/json",
-			"x-api-key": apiKey,
-			"anthropic-version": "2023-06-01",
-		},
-		body: JSON.stringify(body),
+	const headers: Record<string, string> = {
+		"Content-Type": "application/json",
+		"anthropic-version": "2023-06-01",
 	};
-	const res = await fetchWithTransientRetry("https://api.anthropic.com/v1/messages", fetchOpts);
+	if (auth.isOAuth) {
+		headers["Authorization"] = `Bearer ${auth.token}`;
+		headers["anthropic-beta"] = CLAUDE_CODE_BETAS;
+		headers["User-Agent"] = `claude-cli/${CLAUDE_CODE_VERSION} (external, cli)`;
+		headers["X-App"] = "cli";
+		for (const [k, v] of Object.entries(CLAUDE_CODE_STAINLESS_HEADERS)) headers[k] = v;
+	} else {
+		headers["x-api-key"] = auth.token;
+	}
+
+	const doFetch = () => fetchWithTransientRetry("https://api.anthropic.com/v1/messages", {
+		method: "POST",
+		headers,
+		body: JSON.stringify(body),
+	});
+
+	let res = await doFetch();
+
+	// One refresh-and-retry on 401 in OAuth mode. The token may have expired
+	// faster than our buffer suggested (clock drift, or an out-of-band revocation).
+	if (!res.ok && res.status === 401 && auth.isOAuth && ctx) {
+		try {
+			const refreshed = await ctx.dispatchProgram("/auth", "refreshAnthropic", []) as ResolvedAnthropicCredential | null;
+			if (refreshed?.token && refreshed.isOAuth) {
+				headers["Authorization"] = `Bearer ${refreshed.token}`;
+				res = await doFetch();
+			}
+		} catch {
+			// Fall through to the original 401 handling.
+		}
+	}
 
 	if (!res.ok) {
 		const text = await res.text();
@@ -694,7 +815,15 @@ async function callAnthropic(
 	}
 
 	const data = await res.json() as any;
-	const content: AnthropicContent[] = Array.isArray(data.content) ? data.content : [];
+	const rawContent: any[] = Array.isArray(data.content) ? data.content : [];
+	// In OAuth mode we sent prefixed tool names; strip the prefix from any tool_use
+	// blocks coming back so the agent's dispatch lookup keeps using Glon-native names.
+	const content: AnthropicContent[] = rawContent.map((c) => {
+		if (auth.isOAuth && c?.type === "tool_use" && typeof c.name === "string" && c.name.startsWith(CLAUDE_CODE_TOOL_PREFIX)) {
+			return { ...c, name: c.name.slice(CLAUDE_CODE_TOOL_PREFIX.length) } as AnthropicContent;
+		}
+		return c as AnthropicContent;
+	});
 	return {
 		content,
 		stopReason: data.stop_reason ?? "end_turn",
@@ -954,7 +1083,7 @@ async function runExtractionLoop(
 	while (iterations < EXTRACTION_MAX_ITERATIONS) {
 		iterations++;
 		const result = await callAnthropic(
-			messages, EXTRACTION_SYSTEM, model, SUMMARY_TEMPERATURE, tools, undefined, SUMMARY_MAX_TOKENS,
+			messages, EXTRACTION_SYSTEM, model, SUMMARY_TEMPERATURE, tools, undefined, SUMMARY_MAX_TOKENS, ctx,
 		);
 		inputTokens += result.inputTokens;
 		outputTokens += result.outputTokens;
@@ -1088,6 +1217,7 @@ async function doCompact(
 		undefined,
 		undefined,
 		SUMMARY_MAX_TOKENS,
+		ctx,
 	);
 	const summary = result.content
 		.filter((c): c is Extract<AnthropicContent, { type: "text" }> => c.type === "text")
@@ -1353,7 +1483,7 @@ async function runAsk(
 
 		let result: InferenceResult;
 		try {
-			result = await callAnthropic(messages, effectiveSystem, model, temperature, tools.length > 0 ? tools : undefined, onChunk);
+			result = await callAnthropic(messages, effectiveSystem, model, temperature, tools.length > 0 ? tools : undefined, onChunk, undefined, ctx);
 		} catch (err: any) {
 			if (iterations === 1 && !compactedOnOverflow && isContextOverflowError(err)) {
 				// Overflow recovery: compact once and retry.

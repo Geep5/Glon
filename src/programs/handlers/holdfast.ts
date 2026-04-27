@@ -1,17 +1,34 @@
-// Gracie — Grant's executive-assistant driver program.
+// Holdfast — the generic agent harness.
 //
-// Gracie's "brain" is a regular Glon agent object (via /agent). This program
-// wraps that agent with:
+// Holdfast is the structural part of running a Gracie-class agent on Glon:
+// identity-aware ingest, a peer directory wired in, durable memory tools,
+// scheduled reminders, Google Workspace bridges, shell access, and subagent
+// spawning. It does not have an opinion about who the agent is — you give
+// it a name and a principal during setup and the harness wraps an /agent
+// object configured for that identity.
+//
+// In kelp biology, a holdfast is the root-like structure that anchors
+// macroalgae to rock. Same pattern here: the harness anchors an LLM to the
+// world (peers, calendars, mailboxes, shells, the DAG) without being the
+// kelp itself. The kelp — your specific assistant's name, system prompt,
+// custom tools, preferred peers — lives in your own configuration. A
+// personal repo can drive `/holdfast setup --name "Gracie" --principal-name
+// "Grant" ...` from a bootstrap script and treat this program as the engine.
+//
+// What the harness wraps:
 //   - identity awareness (every message tagged with peer + source + trust)
-//   - a principal peer (Grant) who drives `say`
-//   - idempotent bootstrap that creates the agent + self peer on first setup
+//   - a principal peer (the human who drives `say`)
+//   - idempotent setup that creates the agent + self peer on first run
 //     and reconstitutes actor state from the store on later wakes
-//   - a uniform `ingest` action that bridges (Discord, email, etc.) will
+//   - a uniform `ingest` action that bridges (Discord, email, future inputs)
 //     call with (source, peerId, text)
 //
-// The actor holds only cache (gracieAgentId, principalPeerId). Truth lives
-// in the DAG — name="Gracie" agent object and kind="self" peer object.
-// If the process restarts, `ensureBootstrapped()` rehydrates from the store.
+// The actor holds only a cache: { agentId, agentName, principalPeerId }.
+// Truth lives in the DAG — the agent object's `name` field is canonical, and
+// the self peer is the one with kind=self. If the process restarts,
+// `ensureBootstrapped()` rehydrates from the store using the cached id, or
+// (on a fresh actor) by walking the store for a self peer + an agent linked
+// to it via the `principal` field.
 
 import type { ProgramDef, ProgramContext, ProgramActorDef } from "../runtime.js";
 import { spawnTool } from "./agent.js";
@@ -37,37 +54,43 @@ function magenta(s: string) { return `${MAGENTA}${s}${RESET}`; }
 
 const DEFAULT_MODEL = "claude-sonnet-4-20250514";
 
-const DEFAULT_SYSTEM_PROMPT = `You are Gracie, Grant Farwell's executive assistant.
+/**
+ * Render the default system prompt with the configured names substituted in.
+ * Personal repos that want a fully custom voice should pass `--system` to
+ * setup; this is the harness's structural default.
+ */
+function renderDefaultSystemPrompt(args: { agentName: string; principalName: string }): string {
+	const { agentName, principalName } = args;
+	const them = principalName;
+	const themPossessive = `${principalName}'s`;
+	return `You are ${agentName}, ${themPossessive} executive assistant.
 
-You manage Grant's life: his calendar, his reminders, his communication with
-family and trusted contacts, and his coordination with other agents.
+You manage ${themPossessive} life: ${them}'s calendar, reminders, communication
+with family and trusted contacts, and coordination with other agents.
 
 ## Identity awareness
 Every message you receive is wrapped:
   [from {name} on {source}, trust={level}] {text}
 Use the trust level to gate your behavior:
 
-  trust=self      Grant. Full agency. Act decisively.
-  trust=family    Inner circle. Act on their requests, but loop Grant in
+  trust=self      ${them}. Full agency. Act decisively.
+  trust=family    Inner circle. Act on their requests, but loop ${them} in
                   before anything irreversible (spending money, booking,
-                  sharing his schedule with outsiders).
-  trust=ops       Operational contacts (work, FIG, vendors). Act on what
-                  their role implies. When in doubt, ask.
-  trust=stranger  Unknown. Reply politely: "I'll pass that along to Grant."
-                  Do not call tools. Do not share Grant's information.
+                  sharing ${themPossessive} schedule with outsiders).
+  trust=ops       Operational contacts (work, vendors, coworkers). Act on
+                  what their role implies. When in doubt, ask.
+  trust=stranger  Unknown. Reply politely: "I'll pass that along to ${them}."
+                  Do not call tools. Do not share ${themPossessive} information.
 
 ## Tone
 Calm, specific, proactive but not chatty. Executive assistant, not friend.
 Discord-friendly formatting: no markdown tables (Discord doesn't render
 them); use bullet points or aligned code blocks.
 
-## Time
-Default to America/Los_Angeles unless told otherwise.
-
 ## Tools
-When tools are registered on you, prefer them over asking Grant to do
-things himself. Always be specific about what you did (event IDs, message
-IDs, exact times) so Grant can audit or undo.
+When tools are registered on you, prefer them over asking ${them} to do
+things ${them === principalName ? "themselves" : "themself"}. Always be specific about what you did
+(event IDs, message IDs, exact times) so ${them} can audit or undo.
 
 ## Self-awareness and mutation
 Your own implementation and state live as Glon objects in the same graph
@@ -92,22 +115,22 @@ Rules:
 - Every mutation is an immutable Change in the DAG. Nothing is truly destroyed;
   object_history shows prior values and you can restore them.
 - Major self-mutations (your own system prompt, your own model, another peer's
-  trust level, your own source code) MUST be announced to Grant before you do
+  trust level, your own source code) MUST be announced to ${them} before you do
   them. When in doubt, ask.
-- When Grant says "show me your code", use object_list type_key=program to find
-  /gracie, object_get it to read its manifest, and object_read_source on the
-  manifest's typescript object. Cite object ids in your reply so Grant can verify.
+- When ${them} says "show me your code", use object_list type_key=program to find
+  /holdfast, object_get it to read its manifest, and object_read_source on the
+  manifest's typescript object. Cite object ids in your reply so ${them} can verify.
 - Questions about your own architecture, capabilities, current state, or how something
   works internally must be answered from the live DAG, not from this conversation.
   Your source code and agent object both change out of band; conversation history lags
   behind. On any such question:
     - For behavior / how code works: call object_read_source on the relevant handler
-      (/discord, /gracie, /agent, /memory) before asserting.
+      (/discord, /holdfast, /agent, /memory) before asserting.
     - For your own current state (model, system prompt, tools wired, compaction knobs,
-      tokens used): call object_get on your own agent object (your gracieAgentId) and
-      cite the exact field value you read.
+      tokens used): call object_get on your own agent object and cite the exact field
+      value you read.
   Treat prior claims in this conversation as hearsay until re-verified. Cite the object
-  id(s) you read so Grant can audit. If you have not made a tool call this turn that
+  id(s) you read so ${them} can audit. If you have not made a tool call this turn that
   produced the evidence, you do not know the answer — say so instead of guessing.
 
 ## Memory
@@ -115,7 +138,7 @@ Your conversation gets compacted when it grows too long. To keep facts and
 decisions across compactions, write them to your memory store — those records
 survive forever and sync between instances.
 
-- memory_upsert_fact: pin an atomic fact about Grant or someone in his world.
+- memory_upsert_fact: pin an atomic fact about ${them} or someone in ${themPossessive} world.
   One row per \`key\`; upserting the same key replaces the value (the prior
   value stays in object_history). Use for: contact info, preferences, names,
   boundaries, persistent state. The store knows you're the owner; you don't
@@ -137,12 +160,12 @@ When to write:
 
 When to read:
 - Before answering a question that may depend on prior context, call recall
-  with a focused query. Cheaper than re-asking Grant.
-- Memory is heuristic, not authoritative — if it conflicts with what Grant
-  just told you, prefer Grant.
+  with a focused query. Cheaper than re-asking ${them}.
+- Memory is heuristic, not authoritative — if it conflicts with what ${them}
+  just told you, prefer ${them}.
 
 ## Google Workspace (Calendar / Gmail / Drive / Sheets / Docs)
-You have google_* tools that bridge to Grant's local gws CLI. Auth lives in
+You have google_* tools that bridge to ${themPossessive} local gws CLI. Auth lives in
 gws — you never see tokens. Use these for calendar, email, drive, sheets, docs.
 
 Read-only: google_calendar_agenda, google_calendar_list_events,
@@ -156,16 +179,16 @@ Calling them without either field is an error.
 
 How to handle mutations:
 - For anything irreversible or that involves other people (sending email, creating
-  a calendar invite, deleting), first describe to Grant exactly what you'll do.
-- Only call with confirmed=true after Grant explicitly approves.
+  a calendar invite, deleting), first describe to ${them} exactly what you'll do.
+- Only call with confirmed=true after ${them} explicitly approves.
 - If you're unsure whether an action is fine, call with dry_run=true first to
-  preview the exact request that would be sent, show Grant, then confirm.
+  preview the exact request that would be sent, show ${them}, then confirm.
 - For trivial/self-only writes (appending a row to your own log sheet, writing
   to your own scratch doc), you can use confirmed=true directly but mention it.
 
 
 ## Shell access
-You have shell_exec on Grant's machine. It's real bash — pipes, redirects, $VARS,
+You have shell_exec on ${themPossessive} machine. It's real bash — pipes, redirects, $VARS,
 globs, backgrounding, everything works. Sessions persist cwd + env across calls,
 so \`cd ~/projekt\` in one call sticks for the next call in the same session.
 
@@ -173,7 +196,7 @@ Use this when:
 - You need a specific binary (git, npm, ffmpeg, jq, python, node, gcloud, etc.)
 - You're exploring a repo or filesystem (ls, find, grep, cat, head, tree, tail)
 - You're inspecting system state (ps, df, du, free, uname, uptime, who)
-- You're running tests, builds, or deploys that Grant asked for
+- You're running tests, builds, or deploys that ${them} asked for
 
 Rules of thumb:
 - Trusted environment: no confirmation gate on shell_exec. But act like an
@@ -195,6 +218,7 @@ request max_bytes up to 1_048_576 when you know you want a whole page. When you
 report results, always cite the URL and status code, and surface if the body
 was truncated. SSRF guard blocks localhost / private IPs (that's intentional —
 don't try to probe internal services).`;
+}
 
 // ── Helpers ──────────────────────────────────────────────────────
 
@@ -240,18 +264,46 @@ async function findSelfPeer(ctx: ProgramContext): Promise<string | null> {
 	return null;
 }
 
-// ── Core operations ──────────────────────────────────────────────
-
-interface BootstrapOpts {
-	systemPrompt?: string;
-	model?: string;
-	grantName?: string;
-	grantDiscordId?: string;
-	grantEmail?: string;
+/**
+ * Find the agent linked to the self peer via its `principal` field. Used on
+ * a fresh actor wake when state is empty: walk every agent, return the first
+ * whose `principal` link points at the self peer. Falls back to `null` if
+ * no such pairing exists yet (i.e. setup hasn't been run).
+ */
+async function findHarnessAgent(ctx: ProgramContext, principalPeerId: string): Promise<string | null> {
+	const store = ctx.store as any;
+	const refs = await store.list("agent") as { id: string }[];
+	for (const ref of refs) {
+		const obj = await store.get(ref.id);
+		if (obj?.deleted) continue;
+		const principal = obj?.fields?.principal;
+		// Field may be raw object or proto Value wrapper.
+		const targetId = principal?.linkValue?.targetId ?? principal?.targetId;
+		if (targetId === principalPeerId) return ref.id;
+	}
+	return null;
 }
 
-interface BootstrapResult {
-	gracieAgentId: string;
+// ── Core operations ──────────────────────────────────────────────
+
+interface SetupOpts {
+	/** Display name for the agent (required on first setup; persisted). */
+	name?: string;
+	/** Override the system prompt. Defaults to the rendered template. */
+	systemPrompt?: string;
+	/** Override the model. */
+	model?: string;
+	/** Display name for the principal peer (kind=self). */
+	principalName?: string;
+	/** Principal's Discord user id, for DM routing. */
+	principalDiscordId?: string;
+	/** Principal's email address. */
+	principalEmail?: string;
+}
+
+interface SetupResult {
+	agentId: string;
+	agentName: string;
 	principalPeerId: string;
 	createdAgent: boolean;
 	createdPeer: boolean;
@@ -264,8 +316,8 @@ interface BootstrapResult {
 // Each entry is a ToolSpec in the shape /agent.registerTool expects.
 // registerTool writes the spec to the agent's `tools` field regardless
 // of whether the target program is running right now — it's cheap to
-// register and Gracie's tool-use loop reports a clear "Program not
-// running" error at call time if a target is unavailable.
+// register and the tool-use loop reports a clear "Program not running"
+// error at call time if a target is unavailable.
 
 interface ToolSpec {
 	name: string;
@@ -280,7 +332,7 @@ interface ToolSpec {
 const BASE_TOOLS: ToolSpec[] = [
 	{
 		name: "peer_list",
-		description: "List all peers in Gracie's directory. Optionally filter by kind or trust_level.",
+		description: "List all peers in your directory. Optionally filter by kind or trust_level.",
 		input_schema: {
 			type: "object",
 			properties: {
@@ -293,7 +345,7 @@ const BASE_TOOLS: ToolSpec[] = [
 	},
 	{
 		name: "peer_get",
-		description: "Get full details for a peer by id. Useful when you need Grant's Discord id, Mom's email, etc.",
+		description: "Get full details for a peer by id. Useful when you need someone's Discord id, email, etc.",
 		input_schema: {
 			type: "object",
 			properties: { peer_id: { type: "string" } },
@@ -304,7 +356,7 @@ const BASE_TOOLS: ToolSpec[] = [
 	},
 	{
 		name: "peer_add",
-		description: "Add a new peer (person or agent) to Gracie's directory. Use this when Grant introduces someone new. Defaults to kind=human, trust_level=stranger.",
+		description: "Add a new peer (person or agent) to your directory. Use when your principal introduces someone new. Defaults to kind=human, trust_level=stranger.",
 		input_schema: {
 			type: "object",
 			properties: {
@@ -322,7 +374,7 @@ const BASE_TOOLS: ToolSpec[] = [
 	},
 	{
 		name: "peer_set_trust",
-		description: "Change a peer's trust level. Only do this when explicitly asked by Grant — it changes what that peer can ask you to do.",
+		description: "Change a peer's trust level. Only do this when explicitly asked by your principal — it changes what that peer can ask you to do.",
 		input_schema: {
 			type: "object",
 			properties: {
@@ -353,15 +405,15 @@ const BASE_TOOLS: ToolSpec[] = [
 		description: [
 			"Schedule a future action. fire_at accepts ISO 8601 (2026-04-24T15:00:00) or relative shorthand (+10m, +2h, +30s).",
 			"Channels:",
-			"  - discord: payload {message: '...'} — Gracie sends exactly that text via DM.",
-			"  - gracie_compose: payload {prompt: '...'} — when it fires, you get re-invoked with the prompt and compose a fresh message (use this when the message should reflect current state, e.g. 'remind Grant about dinner, check traffic first').",
+			"  - discord: payload {message: '...'} — send exactly that text via DM.",
+			"  - agent_compose: payload {prompt: '...'} — when it fires, you get re-invoked with the prompt and compose a fresh message (use this when the message should reflect current state, e.g. 'remind me about dinner, check traffic first').",
 			"  - email: payload {subject, body} — requires /mail program (not yet wired).",
 		].join("\n"),
 		input_schema: {
 			type: "object",
 			properties: {
-				channel: { type: "string", enum: ["discord", "email", "gracie_compose"] },
-				target: { type: "string", description: "peer_id for discord/gracie_compose; email address for email" },
+				channel: { type: "string", enum: ["discord", "email", "agent_compose"] },
+				target: { type: "string", description: "peer_id for discord/agent_compose; email address for email" },
 				fire_at: { type: "string", description: "ISO 8601 datetime or +Ns/+Nm/+Nh" },
 				payload: { type: "object", description: "channel-specific data" },
 				note: { type: "string", description: "human-readable label" },
@@ -405,9 +457,9 @@ const BASE_TOOLS: ToolSpec[] = [
 		description: [
 			"List Glon objects. Without filters, returns every object in the store.",
 			"Common type_keys you can filter by:",
-			"  - program   (running programs including /gracie, /agent, /peer, /discord, /remind)",
+			"  - program   (running programs including /holdfast, /agent, /peer, /discord, /remind)",
 			"  - peer      (people and agents you talk to)",
-			"  - agent     (LLM agent objects — 'Gracie' is one)",
+			"  - agent     (LLM agent objects — you are one)",
 			"  - reminder  (scheduled actions from /remind)",
 			"  - typescript, proto, json, markdown (source files of the Glon environment itself)",
 		].join("\n"),
@@ -484,7 +536,7 @@ const BASE_TOOLS: ToolSpec[] = [
 	},
 	{
 		name: "object_links",
-		description: "List the outgoing and incoming ObjectLink fields of an object. E.g. Gracie's agent has an outgoing 'principal' link to Grant's peer; Grant's peer has it inbound.",
+		description: "List the outgoing and incoming ObjectLink fields of an object. E.g. your agent has an outgoing 'principal' link to your principal's peer; that peer has it inbound.",
 		input_schema: {
 			type: "object",
 			properties: { object_id: { type: "string" } },
@@ -508,7 +560,7 @@ const BASE_TOOLS: ToolSpec[] = [
 			"Prefer peer_add / remind_schedule for domain objects — this is for novel types.",
 			"IMPORTANT: type_key='program' objects have a specific structure Glon's runtime requires",
 			"(manifest.modules.<filename> as a nested ValueMap of base64-encoded source). Do NOT try to",
-			"create program objects with this tool — ask Grant to add the program to bootstrap.ts",
+			"create program objects with this tool — ask your principal to add the program to bootstrap.ts",
 			"instead; it's the supported way to register new programs.",
 		].join(" "),
 		input_schema: {
@@ -529,10 +581,10 @@ const BASE_TOOLS: ToolSpec[] = [
 			"Set a single field on an object. Value can be a plain string, number, boolean (auto-coerced),",
 			"or a pre-built Value JSON.",
 			"Major self-mutations (your own system prompt, your model, a peer's trust level) should be",
-			"announced to Grant before you do them.",
+			"announced to your principal before you do them.",
 			"DO NOT modify your own `tools` field directly with this — the ValueMap shape is easy to",
-			"get wrong and will brick your tool access. If Grant wants you to gain a new capability,",
-			"ask him to add it in the Gracie source so it auto-registers next setup.",
+			"get wrong and will brick your tool access. If your principal wants you to gain a new capability,",
+			"ask them to add it in the harness source so it auto-registers next setup.",
 		].join(" "),
 		input_schema: {
 			type: "object",
@@ -610,7 +662,7 @@ const BASE_TOOLS: ToolSpec[] = [
 		name: "web_fetch",
 		description: [
 			"Make an HTTP request. Returns {status, status_text, headers, body, bytes, truncated, url_fetched}.",
-			"Always cite the URL and status in your reply. If truncated=true, tell Grant the full byte size.",
+			"Always cite the URL and status in your reply. If truncated=true, tell your principal the full byte size.",
 			"Default body cap is 16 KB; pass max_bytes up to 1_048_576 when you genuinely need the full page.",
 		].join(" "),
 		input_schema: {
@@ -662,11 +714,11 @@ const BASE_TOOLS: ToolSpec[] = [
 
 // ── Memory tools ─────────────────────────────────────────────────
 //
-// These bind `owner = gracieAgentId` so the model never handles its own id
+// These bind `owner = agentId` so the model never handles its own id
 // (and can't spoof a different one). All memory actions filter by owner.
 
-function buildMemoryTools(gracieAgentId: string): ToolSpec[] {
-	const owner = { owner: gracieAgentId };
+function buildMemoryTools(agentId: string): ToolSpec[] {
+	const owner = { owner: agentId };
 	return [
 		{
 			name: "memory_upsert_fact",
@@ -674,7 +726,7 @@ function buildMemoryTools(gracieAgentId: string): ToolSpec[] {
 			input_schema: {
 				type: "object",
 				properties: {
-					key: { type: "string", description: "short identifier, e.g. 'grants_birthday' or 'moms_email'" },
+					key: { type: "string", description: "short identifier, e.g. 'principal_birthday' or 'moms_email'" },
 					value: { type: "string" },
 					confidence: { type: "string", enum: ["low", "med", "high"], description: "defaults to med" },
 					sourced_from_block_id: { type: "string", description: "block id in this conversation where the fact came from (optional)" },
@@ -800,11 +852,11 @@ function buildMemoryTools(gracieAgentId: string): ToolSpec[] {
 // ── Google tools (via /google → local gws CLI) ─────────────────
 //
 // Calendar, Gmail, Drive, Sheets, Docs. Auth lives in gws (OS keyring).
-// No bound_args — these are personal calls into Grant's Google account, not
-// agent-scoped like memory. Mutations (send, insert, append, write, delete)
-// require `confirmed: true` (execute) or `dry_run: true` (preview via
-// gws --dry-run). Neither → the action errors; the model must announce to
-// Grant first.
+// No bound_args — these are personal calls into the principal's Google
+// account, not agent-scoped like memory. Mutations (send, insert, append,
+// write, delete) require `confirmed: true` (execute) or `dry_run: true`
+// (preview via gws --dry-run). Neither → the action errors; the model
+// must announce to the principal first.
 
 function buildGoogleTools(): ToolSpec[] {
 	const mutationSchema = {
@@ -1052,16 +1104,16 @@ function buildGoogleTools(): ToolSpec[] {
 
 // ── Shell tools (via /shell → persistent bash sessions) ────────────
 //
-// Full bash, no gate. Trusted environment — Gracie can run anything Grant's
-// user can run. Sessions persist cwd + env across calls so multi-step work
-// (cd somewhere, run something, read a file) composes naturally.
+// Full bash, no gate. Trusted environment — the agent can run anything the
+// principal's user can run. Sessions persist cwd + env across calls so
+// multi-step work composes naturally.
 
 function buildShellTools(): ToolSpec[] {
 	return [
 		{
 			name: "shell_exec",
 			description: [
-				"Run a bash command in a persistent session on Grant's machine.",
+				"Run a bash command in a persistent session on the principal's machine.",
 				"Full bash semantics: pipes, redirects, $VARS, globs, backgrounding.",
 				"cwd and env persist across calls within the same `session` name.",
 				"Default session is 'main'. Use distinct session names to run parallel work.",
@@ -1099,20 +1151,20 @@ function buildShellTools(): ToolSpec[] {
 	];
 }
 
-function buildGracieTools(gracieAgentId: string): ToolSpec[] {
+function buildHarnessTools(agentId: string): ToolSpec[] {
 	return [
 		...BASE_TOOLS,
-		...buildMemoryTools(gracieAgentId),
+		...buildMemoryTools(agentId),
 		...buildGoogleTools(),
 		...buildShellTools(),
-		spawnTool(gracieAgentId),
+		spawnTool(agentId),
 	];
 }
 
 async function autoWireTools(agentId: string, ctx: ProgramContext): Promise<{ wired: string[]; skipped: { name: string; reason: string }[] }> {
 	const wired: string[] = [];
 	const skipped: { name: string; reason: string }[] = [];
-	const tools = buildGracieTools(agentId);
+	const tools = buildHarnessTools(agentId);
 	for (const spec of tools) {
 		try {
 			await ctx.dispatchProgram("/agent", "registerTool", [agentId, JSON.stringify(spec)]);
@@ -1124,99 +1176,148 @@ async function autoWireTools(agentId: string, ctx: ProgramContext): Promise<{ wi
 	return { wired, skipped };
 }
 
-async function doBootstrap(opts: BootstrapOpts, ctx: ProgramContext): Promise<BootstrapResult> {
+interface HarnessState {
+	agentId: string;
+	agentName: string;
+	principalPeerId: string;
+}
+
+async function doSetup(opts: SetupOpts, ctx: ProgramContext): Promise<SetupResult> {
 	const store = ctx.store as any;
 	const client = ctx.client as any;
 	const { stringVal, linkVal } = ctx;
 
-	// Gracie agent: reuse if an agent named "Gracie" exists, else create.
-	let gracieAgentId = await findAgentByName(ctx, "Gracie");
+	// Resolve names with sensible defaults so an empty `setup` still produces
+	// a working harness on first run. Personal repos pass --name + --principal-name.
+	const agentName = opts.name?.trim() || "Assistant";
+	const principalName = opts.principalName?.trim() || "Owner";
+
+	// Reuse if an agent with this name already exists, else create.
+	let agentId = await findAgentByName(ctx, agentName);
 	let createdAgent = false;
-	if (!gracieAgentId) {
-		const system = opts.systemPrompt ?? DEFAULT_SYSTEM_PROMPT;
+	if (!agentId) {
+		const system = opts.systemPrompt ?? renderDefaultSystemPrompt({ agentName, principalName });
 		const model = opts.model ?? DEFAULT_MODEL;
 		const fieldsJson = JSON.stringify({
-			name: stringVal("Gracie"),
+			name: stringVal(agentName),
 			model: stringVal(model),
 			system: stringVal(system),
 		});
-		gracieAgentId = (await store.create("agent", fieldsJson)) as string;
+		agentId = (await store.create("agent", fieldsJson)) as string;
 		createdAgent = true;
 	}
 
-	// Self peer (Grant): reuse any peer with kind=self, else create.
+	// Self peer (the principal): reuse any peer with kind=self, else create.
 	let principalPeerId = await findSelfPeer(ctx);
 	let createdPeer = false;
 	if (!principalPeerId) {
 		const peerFields: Record<string, unknown> = {
-			display_name: stringVal(opts.grantName ?? "Grant"),
+			display_name: stringVal(principalName),
 			kind: stringVal("self"),
 			trust_level: stringVal("self"),
 		};
-		if (opts.grantDiscordId) peerFields.discord_id = stringVal(opts.grantDiscordId);
-		if (opts.grantEmail) peerFields.email = stringVal(opts.grantEmail);
+		if (opts.principalDiscordId) peerFields.discord_id = stringVal(opts.principalDiscordId);
+		if (opts.principalEmail) peerFields.email = stringVal(opts.principalEmail);
 		principalPeerId = (await store.create("peer", JSON.stringify(peerFields))) as string;
 		createdPeer = true;
 	}
 
 	// Link agent → principal peer (graph relation for future queries).
-	if (createdAgent || !extractString((await store.get(gracieAgentId))?.fields?.principal)) {
-		const agentActor = client.objectActor.getOrCreate([gracieAgentId]);
+	if (createdAgent || !extractString((await store.get(agentId))?.fields?.principal)) {
+		const agentActor = client.objectActor.getOrCreate([agentId]);
 		await agentActor.setField("principal", JSON.stringify(linkVal(principalPeerId, "principal")));
 	}
 
-	const { wired, skipped } = await autoWireTools(gracieAgentId, ctx);
+	const { wired, skipped } = await autoWireTools(agentId, ctx);
 
-	return { gracieAgentId, principalPeerId, createdAgent, createdPeer, wiredTools: wired, skippedTools: skipped };
+	return {
+		agentId,
+		agentName,
+		principalPeerId,
+		createdAgent,
+		createdPeer,
+		wiredTools: wired,
+		skippedTools: skipped,
+	};
 }
 
 interface RefreshResult {
-	gracieAgentId: string;
+	agentId: string;
 	systemChanged: boolean;
 	wiredTools: string[];
 	skippedTools: { name: string; reason: string }[];
 }
 
-/** Rewrite Gracie's `system` field from source DEFAULT_SYSTEM_PROMPT (idempotent)
- *  and re-run autoWireTools so the live agent picks up prompt/tool changes
- *  without recreating the agent or losing conversation history. */
-async function doRefreshPrompt(agentId: string, ctx: ProgramContext): Promise<RefreshResult> {
+/**
+ * Re-render the default system prompt from the current agent name and the
+ * current principal's display name, write it to the agent's `system` field
+ * (idempotent), and re-run autoWireTools so the live agent picks up prompt
+ * and tool changes without recreating the agent or losing conversation
+ * history.
+ *
+ * If the agent was set up with a `--system` override, refresh-prompt has
+ * nothing useful to compute; the operator should set `system` directly via
+ * /agent config in that case.
+ */
+async function doRefreshPrompt(state: HarnessState, ctx: ProgramContext): Promise<RefreshResult> {
 	const store = ctx.store as any;
 	const client = ctx.client as any;
-	const state = await store.get(agentId);
-	if (!state) throw new Error(`refresh-prompt: agent ${agentId} not found`);
-	if (state.typeKey !== "agent") throw new Error(`refresh-prompt: ${agentId} is not an agent`);
+	const obj = await store.get(state.agentId);
+	if (!obj) throw new Error(`refresh-prompt: agent ${state.agentId} not found`);
+	if (obj.typeKey !== "agent") throw new Error(`refresh-prompt: ${state.agentId} is not an agent`);
 
-	const currentSystem = extractString(state.fields?.system) ?? "";
+	// Re-resolve names from the live store rather than trusting the cache —
+	// the principal might have been renamed between actor wakes.
+	const agentName = extractString(obj.fields?.name) ?? state.agentName;
+	const principal = await store.get(state.principalPeerId);
+	const principalName = extractString(principal?.fields?.display_name) ?? "Owner";
+	const target = renderDefaultSystemPrompt({ agentName, principalName });
+
+	const currentSystem = extractString(obj.fields?.system) ?? "";
 	let systemChanged = false;
-	if (currentSystem !== DEFAULT_SYSTEM_PROMPT) {
-		const actor = client.objectActor.getOrCreate([agentId]);
-		await actor.setField("system", JSON.stringify(ctx.stringVal(DEFAULT_SYSTEM_PROMPT)));
+	if (currentSystem !== target) {
+		const actor = client.objectActor.getOrCreate([state.agentId]);
+		await actor.setField("system", JSON.stringify(ctx.stringVal(target)));
 		systemChanged = true;
 	}
 
-	const { wired, skipped } = await autoWireTools(agentId, ctx);
-	return { gracieAgentId: agentId, systemChanged, wiredTools: wired, skippedTools: skipped };
+	const { wired, skipped } = await autoWireTools(state.agentId, ctx);
+	return { agentId: state.agentId, systemChanged, wiredTools: wired, skippedTools: skipped };
 }
 
 async function ensureBootstrapped(
 	state: Record<string, any>,
 	ctx: ProgramContext,
-): Promise<{ gracieAgentId: string; principalPeerId: string }> {
+): Promise<HarnessState> {
 	// Fast path: state already populated.
-	if (state.gracieAgentId && state.principalPeerId) {
-		return { gracieAgentId: state.gracieAgentId, principalPeerId: state.principalPeerId };
+	if (state.agentId && state.principalPeerId && state.agentName) {
+		return {
+			agentId: state.agentId,
+			agentName: state.agentName,
+			principalPeerId: state.principalPeerId,
+		};
 	}
 
-	// Rehydrate from store.
-	const gracieAgentId = state.gracieAgentId || await findAgentByName(ctx, "Gracie");
-	const principalPeerId = state.principalPeerId || await findSelfPeer(ctx);
-	if (!gracieAgentId || !principalPeerId) {
-		throw new Error("Gracie is not bootstrapped. Run `/gracie setup` first.");
+	// Rehydrate from store. Find the self peer first; that's the anchor.
+	const principalPeerId: string | null = state.principalPeerId || await findSelfPeer(ctx);
+	if (!principalPeerId) {
+		throw new Error("Holdfast is not set up. Run `/holdfast setup --name <name> --principal-name <name>` first.");
 	}
-	state.gracieAgentId = gracieAgentId;
+
+	// Find the agent: prefer the cached id, else walk for one whose `principal`
+	// link points at this self peer.
+	const agentId: string | null = state.agentId || await findHarnessAgent(ctx, principalPeerId);
+	if (!agentId) {
+		throw new Error("Holdfast self peer exists but no agent is linked to it. Run `/holdfast setup --name <name>`.");
+	}
+
+	const agentObj = (ctx.store as any).get ? await (ctx.store as any).get(agentId) : null;
+	const agentName = state.agentName || extractString(agentObj?.fields?.name) || "Assistant";
+
+	state.agentId = agentId;
+	state.agentName = agentName;
 	state.principalPeerId = principalPeerId;
-	return { gracieAgentId, principalPeerId };
+	return { agentId, agentName, principalPeerId };
 }
 
 async function resolvePeerForIngest(peerId: string, ctx: ProgramContext): Promise<PeerSnapshot> {
@@ -1240,6 +1341,8 @@ interface IngestResult {
 	inputTokens: number;
 	outputTokens: number;
 	peer: PeerSnapshot;
+	/** The agent's display name, so callers can render output consistently. */
+	agentName: string;
 }
 
 async function doIngest(
@@ -1249,41 +1352,34 @@ async function doIngest(
 	state: Record<string, any>,
 	ctx: ProgramContext,
 ): Promise<IngestResult> {
-	const { gracieAgentId } = await ensureBootstrapped(state, ctx);
+	const harness = await ensureBootstrapped(state, ctx);
 	const peer = await resolvePeerForIngest(peerId, ctx);
 	const wrapped = formatIngestPrompt(peer, source, text);
-	const result = await ctx.dispatchProgram("/agent", "ask", [gracieAgentId, wrapped]) as {
+	const result = await ctx.dispatchProgram("/agent", "ask", [harness.agentId, wrapped]) as {
 		finalText: string; iterations: number; toolCalls: number;
 		inputTokens: number; outputTokens: number;
 	};
-	return { ...result, peer };
+	return { ...result, peer, agentName: harness.agentName };
 }
 
 async function doSay(text: string, state: Record<string, any>, ctx: ProgramContext): Promise<IngestResult> {
-	const { principalPeerId } = await ensureBootstrapped(state, ctx);
-	return await doIngest("shell", principalPeerId, text, state, ctx);
+	const harness = await ensureBootstrapped(state, ctx);
+	return await doIngest("shell", harness.principalPeerId, text, state, ctx);
 }
 
 // ── Handler (CLI subcommands) ────────────────────────────────────
 
-interface SetupArgs {
-	systemPrompt?: string;
-	model?: string;
-	grantName?: string;
-	grantDiscordId?: string;
-	grantEmail?: string;
-}
-
-function parseSetupArgs(args: string[]): SetupArgs {
-	const out: SetupArgs = {};
+function parseSetupArgs(args: string[]): SetupOpts {
+	const out: SetupOpts = {};
 	for (let i = 0; i < args.length; i++) {
 		const a = args[i];
 		const next = args[i + 1];
-		if (a === "--system" && next) { out.systemPrompt = next; i++; }
+		if (a === "--name" && next) { out.name = next; i++; }
+		else if (a === "--system" && next) { out.systemPrompt = next; i++; }
 		else if (a === "--model" && next) { out.model = next; i++; }
-		else if (a === "--grant-name" && next) { out.grantName = next; i++; }
-		else if (a === "--grant-discord" && next) { out.grantDiscordId = next; i++; }
-		else if (a === "--grant-email" && next) { out.grantEmail = next; i++; }
+		else if (a === "--principal-name" && next) { out.principalName = next; i++; }
+		else if (a === "--principal-discord" && next) { out.principalDiscordId = next; i++; }
+		else if (a === "--principal-email" && next) { out.principalEmail = next; i++; }
 	}
 	return out;
 }
@@ -1293,40 +1389,42 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 	const state = ctx.state;
 
 	switch (cmd) {
-		// /gracie setup [--system ...] [--model X] [--grant-name N] [--grant-discord ID] [--grant-email addr]
+		// /holdfast setup --name <NAME> [--principal-name N] [--system ...] [--model X]
+		//                 [--principal-discord ID] [--principal-email addr]
 		case "setup": {
 			try {
 				const opts = parseSetupArgs(args);
-				const result = await doBootstrap(opts, ctx);
-				state.gracieAgentId = result.gracieAgentId;
+				const result = await doSetup(opts, ctx);
+				state.agentId = result.agentId;
+				state.agentName = result.agentName;
 				state.principalPeerId = result.principalPeerId;
 
-				print(bold(green("  Gracie ready")));
-				print(dim(`  agent:  ${result.gracieAgentId} ${result.createdAgent ? green("(created)") : dim("(existing)")}`));
-				print(dim(`  grant:  ${result.principalPeerId} ${result.createdPeer ? green("(created)") : dim("(existing)")}`));
+				print(bold(green(`  Holdfast ready — ${result.agentName}`)));
+				print(dim(`  agent:     ${result.agentId} ${result.createdAgent ? green("(created)") : dim("(existing)")}`));
+				print(dim(`  principal: ${result.principalPeerId} ${result.createdPeer ? green("(created)") : dim("(existing)")}`));
 				if (result.wiredTools.length > 0) {
-					print(dim(`  tools:  ${result.wiredTools.join(", ")}`));
+					print(dim(`  tools:     ${result.wiredTools.join(", ")}`));
 				}
 				if (result.skippedTools.length > 0) {
-					print(dim(`  skipped: ${result.skippedTools.map((s) => s.name + " (" + s.reason + ")").join("; ")}`));
+					print(dim(`  skipped:   ${result.skippedTools.map((s) => s.name + " (" + s.reason + ")").join("; ")}`));
 				}
 				print("");
-				print(dim("  Next: `/gracie say hello`"));
+				print(dim(`  Next: \`/holdfast say hello\``));
 			} catch (err: any) {
 				print(red("  Error: ") + (err?.message ?? String(err)));
 			}
 			break;
 		}
 
-		// /gracie say <text...>
+		// /holdfast say <text...>
 		case "say": {
 			const text = args.join(" ");
-			if (!text) { print(red("Usage: gracie say <text...>")); break; }
+			if (!text) { print(red("Usage: holdfast say <text...>")); break; }
 			try {
-				print(dim("  gracie thinking..."));
+				print(dim("  thinking..."));
 				print("");
 				const result = await doSay(text, state, ctx);
-				print(magenta(bold("  gracie")) + dim(` (to ${result.peer.display_name})`));
+				print(magenta(bold(`  ${result.agentName}`)) + dim(` (to ${result.peer.display_name})`));
 				for (const line of result.finalText.split("\n")) print(`  ${line}`);
 				print("");
 				const tools = result.toolCalls > 0 ? `, ${result.toolCalls} tool call(s)` : "";
@@ -1337,19 +1435,19 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 			break;
 		}
 
-		// /gracie ingest <source> <peerId> <text...>
+		// /holdfast ingest <source> <peerId> <text...>
 		case "ingest": {
 			const source = args[0];
 			const rawPeer = args[1];
 			const text = args.slice(2).join(" ");
 			if (!source || !rawPeer || !text) {
-				print(red("Usage: gracie ingest <source> <peerId> <text...>"));
+				print(red("Usage: holdfast ingest <source> <peerId> <text...>"));
 				break;
 			}
 			const peerId = await resolveId(rawPeer) ?? rawPeer;
 			try {
 				const result = await doIngest(source, peerId, text, state, ctx);
-				print(magenta(bold("  gracie")) + dim(` (to ${result.peer.display_name}, trust=${result.peer.trust_level}, via ${source})`));
+				print(magenta(bold(`  ${result.agentName}`)) + dim(` (to ${result.peer.display_name}, trust=${result.peer.trust_level}, via ${source})`));
 				for (const line of result.finalText.split("\n")) print(`  ${line}`);
 				print("");
 				const tools = result.toolCalls > 0 ? `, ${result.toolCalls} tool call(s)` : "";
@@ -1360,29 +1458,31 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 			break;
 		}
 
-		// /gracie status
+		// /holdfast status
 		case "status": {
 			try {
 				const info = await ensureBootstrapped(state, ctx);
-				print(bold("  Gracie"));
-				print(dim(`  agent:  ${info.gracieAgentId}`));
-				print(dim(`  grant:  ${info.principalPeerId}`));
+				print(bold(`  Holdfast — ${info.agentName}`));
+				print(dim(`  agent:     ${info.agentId}`));
+				print(dim(`  principal: ${info.principalPeerId}`));
 			} catch (err: any) {
 				print(red("  ") + (err?.message ?? String(err)));
 			}
 			break;
 		}
-		// /gracie refresh-prompt
-		// Rewrites Gracie's `system` field from the current source DEFAULT_SYSTEM_PROMPT
-		// and re-runs autoWireTools. Use after editing the source prompt or tool list
-		// so the live agent picks up the changes without discarding its conversation.
+		// /holdfast refresh-prompt
+		// Re-renders the default system prompt with the current names and writes
+		// it to the agent's `system` field, then re-runs autoWireTools. Use
+		// after editing the harness source so the live agent picks up changes
+		// without discarding its conversation. Skips silently if you've set a
+		// custom prompt via --system or /agent config.
 		case "refresh-prompt":
 		case "refresh": {
 			try {
 				const info = await ensureBootstrapped(state, ctx);
-				const result = await doRefreshPrompt(info.gracieAgentId, ctx);
-				print(bold(green("  Gracie refreshed")));
-				print(dim(`  agent:  ${info.gracieAgentId}`));
+				const result = await doRefreshPrompt(info, ctx);
+				print(bold(green(`  Holdfast refreshed — ${info.agentName}`)));
+				print(dim(`  agent:  ${info.agentId}`));
 				print(dim(`  system: ${result.systemChanged ? green("rewritten") : dim("unchanged")}`));
 				print(dim(`  tools:  ${result.wiredTools.length} wired, ${result.skippedTools.length} skipped`));
 			} catch (err: any) {
@@ -1393,12 +1493,13 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 
 		default: {
 			print([
-				bold("  Gracie") + dim(" — Grant's executive assistant"),
-				`    ${cyan("gracie setup")} ${dim("[--system ...] [--model X] [--grant-name N] [--grant-discord ID] [--grant-email addr]")}`,
-				`    ${cyan("gracie say")} ${dim("<text...>")}                              ${dim("Grant talks to Gracie from the shell")}`,
-				`    ${cyan("gracie ingest")} ${dim("<source> <peerId> <text...>")}         ${dim("bridges call this on inbound")}`,
-				`    ${cyan("gracie status")}                                               ${dim("show current agent + principal ids")}`,
-				`    ${cyan("gracie refresh-prompt")}                                       ${dim("rewrite system prompt from source + re-wire tools")}`,
+				bold("  Holdfast") + dim(" — generic agent harness"),
+				`    ${cyan("holdfast setup")} ${dim("--name <NAME> [--principal-name N] [--system ...] [--model X]")}`,
+				`    ${"".padStart(15)}${dim("[--principal-discord ID] [--principal-email addr]")}`,
+				`    ${cyan("holdfast say")} ${dim("<text...>")}                              ${dim("principal talks to the agent from the shell")}`,
+				`    ${cyan("holdfast ingest")} ${dim("<source> <peerId> <text...>")}         ${dim("bridges call this on inbound")}`,
+				`    ${cyan("holdfast status")}                                               ${dim("show current agent + principal ids")}`,
+				`    ${cyan("holdfast refresh-prompt")}                                       ${dim("rewrite default system prompt + re-wire tools")}`,
 			].join("\n"));
 		}
 	}
@@ -1407,26 +1508,29 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 // ── Actor (programmatic API + hibernatable state cache) ──────────
 
 const actorDef: ProgramActorDef = {
-	createState: () => ({ gracieAgentId: "", principalPeerId: "" }),
+	createState: () => ({ agentId: "", agentName: "", principalPeerId: "" }),
 
 	actions: {
 		/**
 		 * One-time setup (idempotent). Opts may be a JSON string or plain object.
 		 *
-		 * Aliased as both `bootstrap` and `setup`: the CLI command is `/gracie setup`,
-		 * and headless callers (HTTP dispatch) should be able to use the same verb.
+		 * Aliased as both `bootstrap` and `setup`: the CLI command is
+		 * `/holdfast setup`, and headless callers (HTTP dispatch) should be
+		 * able to use the same verb.
 		 */
-		bootstrap: async (ctx: ProgramContext, opts?: string | BootstrapOpts) => {
-			const parsed: BootstrapOpts = typeof opts === "string" ? (opts ? JSON.parse(opts) : {}) : (opts ?? {});
-			const result = await doBootstrap(parsed, ctx);
-			ctx.state.gracieAgentId = result.gracieAgentId;
+		bootstrap: async (ctx: ProgramContext, opts?: string | SetupOpts) => {
+			const parsed: SetupOpts = typeof opts === "string" ? (opts ? JSON.parse(opts) : {}) : (opts ?? {});
+			const result = await doSetup(parsed, ctx);
+			ctx.state.agentId = result.agentId;
+			ctx.state.agentName = result.agentName;
 			ctx.state.principalPeerId = result.principalPeerId;
 			return result;
 		},
-		setup: async (ctx: ProgramContext, opts?: string | BootstrapOpts) => {
-			const parsed: BootstrapOpts = typeof opts === "string" ? (opts ? JSON.parse(opts) : {}) : (opts ?? {});
-			const result = await doBootstrap(parsed, ctx);
-			ctx.state.gracieAgentId = result.gracieAgentId;
+		setup: async (ctx: ProgramContext, opts?: string | SetupOpts) => {
+			const parsed: SetupOpts = typeof opts === "string" ? (opts ? JSON.parse(opts) : {}) : (opts ?? {});
+			const result = await doSetup(parsed, ctx);
+			ctx.state.agentId = result.agentId;
+			ctx.state.agentName = result.agentName;
 			ctx.state.principalPeerId = result.principalPeerId;
 			return result;
 		},
@@ -1436,7 +1540,7 @@ const actorDef: ProgramActorDef = {
 			return await doIngest(source, peerId, text, ctx.state, ctx);
 		},
 
-		/** Shell-side convenience: Grant speaks to Gracie directly. */
+		/** Shell-side convenience: the principal speaks to the agent directly. */
 		say: async (ctx: ProgramContext, text: string) => {
 			return await doSay(text, ctx.state, ctx);
 		},
@@ -1447,13 +1551,30 @@ const actorDef: ProgramActorDef = {
 			return info;
 		},
 
-		/** Rewrite the `system` field from DEFAULT_SYSTEM_PROMPT and re-wire tools. */
+		/** Re-render the default system prompt with current names and re-wire tools. */
 		refreshPrompt: async (ctx: ProgramContext) => {
 			const info = await ensureBootstrapped(ctx.state, ctx);
-			return await doRefreshPrompt(info.gracieAgentId, ctx);
+			return await doRefreshPrompt(info, ctx);
 		},
 	},
 };
 
 const program: ProgramDef = { handler, actor: actorDef };
 export default program;
+
+// ── Internal exports for testing ─────────────────────────────────
+
+export const __test = {
+	renderDefaultSystemPrompt,
+	formatIngestPrompt,
+	parseSetupArgs,
+	buildHarnessTools,
+	doSetup,
+	doIngest,
+	doSay,
+	doRefreshPrompt,
+	ensureBootstrapped,
+	findAgentByName,
+	findSelfPeer,
+	findHarnessAgent,
+};

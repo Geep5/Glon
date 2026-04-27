@@ -267,9 +267,9 @@ src/programs/
     agent.ts                 LLM agent: conversation, tool use, auto-compaction, memory digest
     memory.ts                pinned_fact + milestone objects, recall/digest, validator
     peer.ts                  identity + trust for people and agents
-    remind.ts                scheduled actions (DM, gracie-compose, email)
-    discord.ts               Discord bridge: Gateway WS for online presence + REST poll for DMs → /gracie.ingest
-    gracie.ts                executive-assistant driver: identity-aware ingest + tools
+    remind.ts                scheduled actions (DM, agent-compose, email)
+    discord.ts               Discord bridge: Gateway WS for online presence + REST poll for DMs -> /holdfast.ingest
+    holdfast.ts              generic agent harness: identity-aware ingest + tools, configured per setup
     web.ts                   HTTP client with SSRF guard
     gc.ts                    reachability-based garbage collection
     accounts.ts              multi-user auth & per-object permissions

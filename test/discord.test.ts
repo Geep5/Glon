@@ -2,7 +2,7 @@
  * Discord bridge tests.
  *
  * Exercises the actor's poll + send paths. Discord REST is mocked via
- * globalThis.__DISCORD_FETCH. /peer and /gracie dispatches are mocked
+ * globalThis.__DISCORD_FETCH. /peer and /holdfast dispatches are mocked
  * via the same dispatchProgram harness used in the other tests.
  */
 
@@ -29,7 +29,7 @@ function mockDiscord(handler: (call: DiscordCall) => any) {
 
 function createHarness() {
 	const peers = new Map<string, any>();
-	const gracieReplies = new Map<string, string>(); // prompt text → response
+	const harnessReplies = new Map<string, string>(); // prompt text -> response
 	const dispatchCalls: { prefix: string; action: string; args: unknown[] }[] = [];
 
 	const ctx: ProgramContext = {
@@ -62,9 +62,9 @@ function createHarness() {
 				const id = (args as [string])[0];
 				return peers.get(id) ?? null;
 			}
-			if (prefix === "/gracie" && action === "ingest") {
+			if (prefix === "/holdfast" && action === "ingest") {
 				const [, , text] = args as [string, string, string];
-				const reply = gracieReplies.get(text) ?? `echo:${text}`;
+				const reply = harnessReplies.get(text) ?? `echo:${text}`;
 				return { finalText: reply, iterations: 1, toolCalls: 0, inputTokens: 10, outputTokens: 20, peer: { display_name: "x" } };
 			}
 			throw new Error(`unhandled dispatch: ${prefix} ${action}`);
@@ -75,7 +75,7 @@ function createHarness() {
 		ctx,
 		state: ctx.state,
 		peers,
-		gracieReplies,
+		harnessReplies,
 		dispatchCalls,
 		addPeer(peer: any) { peers.set(peer.id, peer); },
 	};
@@ -226,7 +226,7 @@ describe("discord polling", () => {
 		const h = createHarness();
 		h.addPeer({ id: "peer-grant", display_name: "Grant", discord_id: "111", kind: "self", trust_level: "self" });
 		h.state.botUserId = "bot-id";
-		h.gracieReplies.set("hi nova", "hi grant");
+		h.harnessReplies.set("hi nova", "hi grant");
 
 		const recentId = freshSnowflake(5_000); // 5s ago
 		let postedContent = "";
@@ -249,14 +249,14 @@ describe("discord polling", () => {
 		assert.equal((h.state.watermarks as any)["ch-1"], recentId);
 	});
 
-	it("second tick with new messages ingests via /gracie and sends reply", async () => {
+	it("second tick with new messages ingests via /holdfast and sends reply", async () => {
 		const h = createHarness();
 		h.addPeer({ id: "peer-grant", display_name: "Grant", discord_id: "111", kind: "self", trust_level: "self" });
 		h.state.botUserId = "bot-id";
 		h.state.dmChannelByPeer = { "peer-grant": "ch-1" };
 		h.state.watermarks = { "ch-1": "100" };
 
-		h.gracieReplies.set("hello", "hi grant");
+		h.harnessReplies.set("hello", "hi grant");
 
 		let postedContent = "";
 		mockDiscord((call) => {

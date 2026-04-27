@@ -1,5 +1,5 @@
 /**
- * /task CLI + Gracie spawn wiring tests (M2).
+ * /task CLI + Holdfast spawn wiring tests (M2).
  *
  * Covers:
  *   - /task spawn parses a batch-JSON arg and dispatches to /agent.spawn
@@ -8,8 +8,8 @@
  *   - /task status reads spawn_parent / spawn_depth / submitted_result
  *     fields off the child agent.
  *   - /task cancel dispatches to /agent.cancel.
- *   - Gracie's buildGracieTools result includes a spawn tool bound to
- *     gracieAgentId so the model can delegate to subagents.
+ *   - Holdfast's buildHarnessTools result includes a spawn tool bound to
+ *     the harness agent id so the model can delegate to subagents.
  *
  * Run: npx tsx --test test/task-program.test.ts
  */
@@ -176,13 +176,13 @@ describe("/task cancel", () => {
 	});
 });
 
-describe("Gracie spawn wiring", () => {
+describe("Holdfast spawn wiring", () => {
 	it("spawnTool binds agentId to the caller so the model cannot spoof a parent", () => {
-		const t = spawnTool("gracie-123");
+		const t = spawnTool("holdfast-agent-123");
 		assert.equal(t.name, "spawn");
 		assert.equal(t.target_prefix, "/agent");
 		assert.equal(t.target_action, "spawn");
-		assert.deepEqual(t.bound_args, { agentId: "gracie-123" });
+		assert.deepEqual(t.bound_args, { agentId: "holdfast-agent-123" });
 		assert.match(JSON.stringify(t.input_schema), /tasks/);
 	});
 });

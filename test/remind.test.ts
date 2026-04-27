@@ -260,7 +260,7 @@ describe("runSchedulerTick", () => {
 
 		// Mock downstream programs.
 		let discordSends = 0;
-		let gracieCompositions = 0;
+		let agentCompositions = 0;
 		h.onDispatch("/discord", "send", (args) => {
 			discordSends++;
 			const inp = (args as [any])[0];
@@ -268,8 +268,8 @@ describe("runSchedulerTick", () => {
 			assert.equal(inp.text, "wake up");
 			return { channel_id: "ch", message_ids: ["m"] };
 		});
-		h.onDispatch("/gracie", "ingest", (args) => {
-			gracieCompositions++;
+		h.onDispatch("/holdfast", "ingest", (args) => {
+			agentCompositions++;
 			const [source, peer, text] = args as [string, string, string];
 			assert.equal(source, "scheduler");
 			assert.equal(peer, "grant");
@@ -277,14 +277,14 @@ describe("runSchedulerTick", () => {
 			return { finalText: "ok", iterations: 1, toolCalls: 0, inputTokens: 1, outputTokens: 1, peer: { display_name: "grant" } };
 		});
 
-		// Due: one discord, one gracie_compose. Not due: one in the future.
+		// Due: one discord, one agent_compose. Not due: one in the future.
 		const dueDiscord = await schedule(h.ctx, {
 			channel: "discord", target: "grant",
 			fire_at: Date.now() - 60_000, // 1 min ago
 			payload: { message: "wake up" },
 		}) as { id: string };
 		const dueGracie = await schedule(h.ctx, {
-			channel: "gracie_compose", target: "grant",
+			channel: "agent_compose", target: "grant",
 			fire_at: Date.now() - 30_000,
 			payload: { prompt: "think about dinner" },
 		}) as { id: string };
@@ -296,7 +296,7 @@ describe("runSchedulerTick", () => {
 
 		const result = await __test.runSchedulerTick(h.ctx);
 		assert.equal(discordSends, 1);
-		assert.equal(gracieCompositions, 1);
+		assert.equal(agentCompositions, 1);
 		assert.equal(result.fired, 2);
 		assert.equal(result.failed, 0);
 
@@ -370,6 +370,6 @@ describe("runSchedulerTick", () => {
 
 describe("CHANNELS", () => {
 	it("exposes the supported channels", () => {
-		assert.deepEqual([...CHANNELS].sort(), ["discord", "email", "gracie_compose"].sort());
+		assert.deepEqual([...CHANNELS].sort(), ["discord", "email", "agent_compose"].sort());
 	});
 });

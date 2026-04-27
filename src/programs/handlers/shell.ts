@@ -1,6 +1,6 @@
 // Shell — persistent bash sessions for Glon agents.
 //
-// Gracie (or any agent) gets full bash. Each session is a long-lived `bash -l`
+// The harness agent (or any agent) gets full bash. Each session is a long-lived `bash -l`
 // subprocess: cwd persists, env vars persist, aliases work, PATH is what a
 // human would see at their terminal. Commands are sent over stdin and we
 // detect completion via a per-call UUID sentinel printed on both stdout and

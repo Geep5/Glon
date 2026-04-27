@@ -17,7 +17,7 @@
 //
 // Retrieval is pull-based in Phase 1: callers (or tool-using agents) invoke
 // `recall` / `digest` / `list_*` actions. A later phase can inject a digest
-// into /agent.ask automatically; for now, Gracie carries memory tools and
+// into /agent.ask automatically; for now, the harness carries memory tools and
 // the model decides when to write and when to look.
 //
 // Owner scoping: every memory object carries an ObjectLink in its `owner`

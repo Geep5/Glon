@@ -38,7 +38,7 @@ The kernel knows nothing about LLMs. The fact that `/agent` exists at the progra
 
 **Prerequisites**
 - Node 20+ (the dev server uses the built-in `node:sqlite`).
-- An Anthropic API key if you want LLM agents. Discord bot token if you want the bridge.
+- For LLM agents: either an Anthropic API key (`ANTHROPIC_API_KEY`) or a Claude Pro/Max plan (set up via `/auth login anthropic`). Discord bot token if you want the bridge.
 
 **Install**
 ```bash
@@ -77,15 +77,16 @@ Every script auto-loads `.env` from the project root, so `ANTHROPIC_API_KEY` and
 | `/agent` | LLM agents with DAG-backed conversation, tool dispatch, auto-compaction, subagent spawning, and block recall |
 | `/task` | Thin CLI front-end for spawning subagent batches |
 | `/memory` | Durable agent memory: pinned facts and milestone arcs that survive compaction |
-| `/peer` | People and agents Gracie talks to: identity, trust level, contact handles |
+| `/peer` | People and agents the harness talks to: identity, trust level, contact handles |
 | `/remind` | Scheduled actions: DM at a time, prompt the agent to compose then send |
-| `/discord` | I/O bridge: Gateway WebSocket for online presence + 3s REST poll for DMs, routes to `/gracie.ingest`, posts replies back |
-| `/gracie` | Executive-assistant driver: wraps an `/agent` with identity-aware ingest + tools |
+| `/discord` | I/O bridge: Gateway WebSocket for online presence + 3s REST poll for DMs, routes to `/holdfast.ingest`, posts replies back |
+| `/holdfast` | Generic agent harness: wraps an `/agent` with identity-aware ingest, memory, scheduled reminders, Google Workspace bridges, shell access, and subagent spawning. Configure once with `/holdfast setup --name <NAME>` |
 | `/web` | HTTP client (fetch, get-text, get-json) with SSRF guard |
 | `/shell` | Persistent bash sessions an agent can drive |
 | `/google` | Bridge to Google Workspace CLI (calendar, gmail, drive, sheets, docs) |
 | `/gc` | Garbage collection with retention policies |
 | `/accounts` | Multi-user auth and per-object permissions |
+| `/auth` | Anthropic credential management: OAuth login for Claude Pro/Max, or fall back to API key |
 | `/sync` | P2P sync via mDNS discovery and HTTP |
 
 Every program `export default`s a `ProgramDef`:
@@ -113,7 +114,7 @@ An LLM agent is one configuration of the kernel's primitives — nothing about i
 | Compaction | A `compaction_summary` block that points at `firstKeptBlockId`. Older blocks remain in the DAG; the next ask just skips them |
 | Tool registration | A scalar field on the agent listing `{name, description, target_prefix, target_action, bound_args}` — at call time the agent dispatches via `ctx.dispatchProgram(prefix, action, args)`. Any program is a potential tool |
 | Memory | Separate `pinned_fact` / `milestone` objects with `owner` link back to the agent, `sourced_from_blocks` reference list. Survive compaction because they're independent objects with their own DAG |
-| Identity-aware ingest | `/peer` objects carry `display_name`, `kind`, `trust_level`, `email`, `discord_id`. `/gracie` tags inbound text with `[from {name} on {source}, trust={level}]` before reaching the model |
+| Identity-aware ingest | `/peer` objects carry `display_name`, `kind`, `trust_level`, `email`, `discord_id`. `/holdfast` tags inbound text with `[from {name} on {source}, trust={level}]` before reaching the model |
 | Subagents | More `objectActor`s of `typeKey="agent"`, with a `spawn_parent` link back to the caller. Conversation, tools, memory, and compaction all "just work" because they're real agents |
 | Block recall | A new `user_text` block that quotes a previous block (compacted or otherwise). Lands after the latest compaction's cut, so the model sees it on the next ask |
 
@@ -123,7 +124,7 @@ That's the entire picture. The agent doesn't have a database; the DAG is the dat
 
 Agents store every prompt and response as changes in the DAG — content-addressed, replayable, syncable. Any peer can replay the conversation without an API key.
 
-With `ANTHROPIC_API_KEY` in your `.env`:
+With Anthropic credentials configured (see [Anthropic plan setup](#anthropic-plan-setup-claude-promax) for the OAuth path, or set `ANTHROPIC_API_KEY` in your `.env`):
 
 ```
 glon> /agent new analyst --system "You are a concise data analyst."
@@ -195,24 +196,34 @@ The new block content is `[Recalled user turn from 2024-…]:\nMy wife's name is
 
 The 3D viewer [glonWorld](https://github.com/Geep5/glonWorld) wraps this with a click-to-recall affordance and a search panel that scans every block's raw text — find a forgotten turn by phrase, click to bring it back into context.
 
-### Example: Gracie conversation
+### Example: Holdfast in action
 
-Gracie is a configured `/agent` plus identity-aware ingest, a peer directory, a memory store, and bridge programs. Inbound messages from any source (shell, Discord, future bridges) get tagged with `[from {name} on {source}, trust={level}]` before reaching the model.
+Holdfast is the generic harness program. You configure it once with a name and a principal, and it wires an `/agent` with identity-aware ingest, a peer directory, durable memory, scheduled reminders, Google Workspace bridges, shell access, and subagent spawning. Inbound messages from any source (shell, Discord, future bridges) get tagged with `[from {name} on {source}, trust={level}]` before reaching the model.
 
 ```
-glon> /gracie say My wife's name is Sarah. Save that.
-  gracie (to Grant)
+glon> /holdfast setup --name Gracie --principal-name Grant --principal-discord 123456789012345678
+  Holdfast ready — Gracie
+  agent:     7f141408-… (created)
+  principal: 9a3c5d20-… (created)
+  tools:     peer_list, peer_get, peer_add, … (50 wired)
+
+  Next: `/holdfast say hello`
+
+glon> /holdfast say My wife's name is Sarah. Save that.
+  Gracie (to Grant)
   Saved. wife_name=Sarah.
   (one tool call: memory_upsert_fact)
 
 # Restart the daemon, start a fresh session — the fact survives.
-glon> /gracie say What's my wife's name?
-  gracie (to Grant)
+glon> /holdfast say What's my wife's name?
+  Gracie (to Grant)
   Sarah.
   (no tool calls — served from her memory digest)
 ```
 
-**How it survives compaction.** When the conversation crosses the auto-compact threshold, Gracie's compactor runs a tool-using extraction pass first: facts go to `pinned_fact` objects, multi-turn arcs go to `milestone` objects (with `supersedes` chains for amendments). A short narrative summary covers the kept region. Both are objects in the DAG — every prior value is recoverable via `object_history`.
+**Per-user configuration in a separate repo.** The harness ships with a generic default system prompt that substitutes the configured names into a sensible "executive assistant" template. For your own personality, system prompt, and bootstrap script, keep that in a separate repo that drives `/holdfast setup` over the daemon's HTTP dispatch endpoint with your specific `--name`, `--principal-*`, and `--system` overrides.
+
+**How it survives compaction.** When the conversation crosses the auto-compact threshold, the harness's compactor runs a tool-using extraction pass first: facts go to `pinned_fact` objects, multi-turn arcs go to `milestone` objects (with `supersedes` chains for amendments). A short narrative summary covers the kept region. Both are objects in the DAG — every prior value is recoverable via `object_history`.
 
 ### Example: multi-instance chat
 
@@ -253,13 +264,94 @@ glon> /ttt history a3f8
   d71da0218bb3  06:27:49  X wins
 ```
 
+## Anthropic plan setup (Claude Pro/Max)
+
+`/agent` and `/holdfast` work with two kinds of Anthropic credentials:
+
+- **API key** from [console.anthropic.com](https://console.anthropic.com) — set `ANTHROPIC_API_KEY` in your `.env`. Pay per token.
+- **Claude Pro/Max subscription** — run `/auth login anthropic` once. Requests authenticate as the official `claude` CLI and are billed against your plan instead of API credits.
+
+If both are configured, the OAuth credential wins.
+
+### First-time login
+
+1. **Start Glon and a shell.**
+   ```bash
+   npm run dev          # terminal 1 — RivetKit actor host
+   npm run bootstrap    # first time only — seeds programs as objects
+   npm run client       # terminal 2 — the shell you'll type into
+   ```
+2. **Run the login command.**
+   ```
+   glon> /auth login anthropic
+     Starting OAuth flow…
+
+     Open this URL in your browser:
+     https://claude.ai/oauth/authorize?code=true&client_id=…
+
+     Listening on http://localhost:54545/callback
+     (this command will return when the redirect arrives)
+   ```
+3. **Open the URL in your browser.** Sign in with the Claude.ai account that has the Pro/Max subscription, approve the requested scopes. The browser redirects to `localhost:54545/callback` and shows "You're signed in." — you can close that tab.
+4. **Back in the shell**, the command finishes:
+   ```
+     Logged in. Token expires in 23h 58m.
+     Stored in /Users/you/.glon/auth.json
+   ```
+
+Every `/agent ask`, `/holdfast say`, compaction summary, and subagent call from now on routes through your plan.
+
+### Inspecting and managing credentials
+
+```
+glon> /auth status
+  Glon auth
+  /Users/you/.glon/auth.json
+
+  anthropic  oauth (Claude Pro/Max)
+    access expires in 23h 58m
+    sk-ant-o…7q3a
+
+glon> /auth refresh         # force a token refresh now (rarely needed)
+glon> /auth logout          # delete the anthropic credential
+glon> /auth logout all      # delete every credential, remove auth.json entirely
+```
+
+Tokens auto-refresh in the background when within 5 minutes of expiry, and again on a 401 from the API. You only need `/auth refresh` if something looks wrong.
+
+### Where credentials live
+
+`${GLON_DATA}/auth.json` (default `~/.glon/auth.json`), mode `0600`, written atomically via `.tmp` + rename. Plain JSON; safe to inspect or delete by hand. **Never** synced to peers — unlike DAG objects, credentials are local-only.
+
+Schema:
+```json
+{
+  "version": 1,
+  "credentials": {
+    "anthropic": {
+      "type": "oauth",
+      "access": "sk-ant-oat…",
+      "refresh": "sk-ant-ort…",
+      "expires": 1735689600000
+    }
+  }
+}
+```
+
+### Caveats
+
+- **The OAuth path mimics the official `claude` CLI.** Anthropic could tighten its server-side checks at any time. If `/auth login` succeeds but agent calls start returning 4xx, the impersonation fingerprint (User-Agent, beta strings, X-Stainless headers) probably needs a refresh — see `CLAUDE_CODE_VERSION` and the surrounding constants in `src/programs/handlers/agent.ts`.
+- **It's your account on the line.** Use the OAuth path within the bounds of what your Pro/Max subscription allows. If in doubt, use an API key instead.
+- **Port 54545 must be free** during login — it's the local callback target. If something else owns it, login fails with a clear error.
+- **The daemon picks the token up automatically.** If you're running `scripts/daemon.ts` (Discord poller, reminder ticks, headless dispatch), it reads from the same `auth.json` and refreshes through the same actor. No restart needed after `/auth login`.
+
 ## Discord bridge setup
 
 1. **Create the application.** Visit [Discord Developer Portal](https://discord.com/developers/applications) and click **New Application**. The application name is what users see as the bot's handle in Discord — name it what you want your assistant to be called (e.g. "Gracie").
 2. **Grab the bot token.** Bot tab → **Reset Token** → copy into `.env` as `DISCORD_BOT_TOKEN=...`. The token is the ONLY credential the bridge uses; nothing is persisted to the DAG.
 3. **Invite the bot.** OAuth2 → URL Generator → scope `bot`, permissions `Send Messages` + `Read Message History`. Open the URL and add it to a guild you share with your user, or DM it directly.
-4. **Find your Discord user id.** Settings → Advanced → enable **Developer Mode**. Then right-click your name anywhere → **Copy User ID**. That 18-digit snowflake goes into `/gracie setup --grant-discord <id>`.
-5. **DM the bot.** Any future messages to the bot flow through `/discord`'s 3-second poll into `/gracie.ingest`, then Gracie's reply is posted back. The first poll processes messages from the last 15 minutes so your onboarding "hi" isn't dropped. The bridge also holds a Gateway WebSocket to Discord so the bot shows online — presence-only; messages still flow via the REST poll.
+4. **Find your Discord user id.** Settings → Advanced → enable **Developer Mode**. Then right-click your name anywhere → **Copy User ID**. That 18-digit snowflake goes into `/holdfast setup --principal-discord <id>`.
+5. **DM the bot.** Any future messages to the bot flow through `/discord`'s 3-second poll into `/holdfast.ingest`, then the agent's reply is posted back. The first poll processes messages from the last 15 minutes so your onboarding "hi" isn't dropped. The bridge also holds a Gateway WebSocket to Discord so the bot shows online — presence-only; messages still flow via the REST poll.
 
 **Note:** Discord's REST API doesn't let bots list their own DM inbox, so every peer must be registered with their `discord_id` up front. You can add more people later:
 
@@ -280,7 +372,7 @@ This loads every program, starts their actor instances, and exposes a local HTTP
 ```bash
 curl -sS -X POST http://127.0.0.1:6430/dispatch \
   -H 'Content-Type: application/json' \
-  -d '{"prefix":"/gracie","action":"say","args":["What is on my calendar today?"]}'
+  -d '{"prefix":"/holdfast","action":"say","args":["What is on my calendar today?"]}'
 ```
 
 The dispatch endpoint is also what [glonWorld](https://github.com/Geep5/glonWorld) uses to recall compacted blocks back into an agent's context, and what external orchestrators can drive without holding API keys themselves.
@@ -311,7 +403,7 @@ src/
   client.ts                   CLI shell (pure program loader)
   programs/
     runtime.ts                module bundler, actor lifecycle, validators
-    handlers/                 one file per program (19 today)
+    handlers/                 one file per program (21 today)
 scripts/
   daemon.ts                   headless host: load programs, run actors, HTTP dispatch
   dispatch.ts                 thin HTTP client for the daemon
@@ -324,11 +416,11 @@ test/
   agent-spawn.test.ts         core subagent spawning
   agent-spawn-advanced.test.ts schema validation, timeout, retry, progress events, tree
   agent-recall.test.ts        block recall framing + truncation
-  task-program.test.ts        /task CLI dispatch + Gracie wiring
+  task-program.test.ts        /task CLI dispatch + Holdfast wiring
   peer.test.ts                peer CRUD + find-or-create
   remind.test.ts              scheduling and tick
   discord.test.ts             bridge polling + send
-  gracie.test.ts              ingest wrapping + bootstrap idempotency
+  holdfast.test.ts            ingest wrapping + setup idempotency
   web.test.ts                 HTTP client + SSRF guard
   introspection.test.ts       agent reads its own source via /crud
 ```

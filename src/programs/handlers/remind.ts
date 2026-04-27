@@ -1,4 +1,4 @@
-// Remind — scheduled action scheduler for Gracie (and any Glon agent).
+// Remind — scheduled action scheduler for Holdfast (and any Glon agent).
 //
 // Reminders are first-class Glon objects (type "reminder"). They carry
 // an ISO fire time, a delivery channel, a target (peer id or address),
@@ -11,10 +11,10 @@
 //   3. Dispatch per channel:
 //        discord         → /discord.send { peer_id, text }
 //        email           → /mail.send    { to, subject, body }
-//        gracie_compose  → /gracie.ingest (scheduler, created_by, narrative)
+//        agent_compose   → /holdfast.ingest (scheduler, created_by, narrative)
 //   4. Mark status='sent' with sent_at_ms, or status='failed' with last_error.
 //
-// Actions exposed as Gracie tools:
+// Actions exposed as harness tools:
 //   - schedule({channel, target, fire_at, payload, created_by?, note?})
 //   - cancel(reminder_id)
 //   - list({peer_id?, status?, before_iso?})
@@ -46,7 +46,7 @@ function magenta(s: string) { return `${MAGENTA}${s}${RESET}`; }
 const DEFAULT_TICK_MS = 30_000;
 const TYPE_KEY = "reminder";
 
-export const CHANNELS = ["discord", "email", "gracie_compose"] as const;
+export const CHANNELS = ["discord", "email", "agent_compose"] as const;
 type Channel = typeof CHANNELS[number];
 
 export const STATUSES = ["pending", "sending", "sent", "failed", "cancelled"] as const;
@@ -236,11 +236,11 @@ async function dispatchReminder(rec: ReminderRecord, ctx: ProgramContext): Promi
 			}]);
 			return;
 		}
-		case "gracie_compose": {
+		case "agent_compose": {
 			const prompt = typeof rec.payload.prompt === "string"
 				? rec.payload.prompt
 				: `Follow up: ${JSON.stringify(rec.payload)}`;
-			await ctx.dispatchProgram("/gracie", "ingest", [
+			await ctx.dispatchProgram("/holdfast", "ingest", [
 				"scheduler",
 				rec.target || rec.created_by,
 				`[scheduled reminder fired] ${prompt}`,
@@ -312,7 +312,7 @@ function channelLabel(channel: Channel): string {
 	switch (channel) {
 		case "discord": return magenta("discord");
 		case "email": return cyan("email");
-		case "gracie_compose": return green("gracie-compose");
+		case "agent_compose": return green("agent-compose");
 		default: return channel;
 	}
 }
@@ -346,7 +346,7 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 			const payload: Record<string, unknown> = {};
 			if (channel === "discord" && message) payload.message = message;
 			if (channel === "email" && message) payload.body = message;
-			if (channel === "gracie_compose" && message) payload.prompt = message;
+			if (channel === "agent_compose" && message) payload.prompt = message;
 
 			try {
 				const r = await doSchedule({

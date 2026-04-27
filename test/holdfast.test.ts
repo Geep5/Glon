@@ -1,8 +1,8 @@
 /**
- * Gracie program tests.
+ * Holdfast program tests.
  *
- * Exercises the driver:
- *   - bootstrap creates Gracie agent + self peer idempotently
+ * Exercises the harness:
+ *   - setup creates the configured agent + self peer idempotently
  *   - ingest wraps message with peer identity before calling /agent.ask
  *   - say uses the principal peer as the caller
  *   - ensureBootstrapped rehydrates state from the store on a fresh actor
@@ -11,7 +11,7 @@
 
 import { describe, it } from "node:test";
 import { strict as assert } from "node:assert";
-import gracieProgram from "../src/programs/handlers/gracie.js";
+import holdfastProgram from "../src/programs/handlers/holdfast.js";
 import peerProgram from "../src/programs/handlers/peer.js";
 import { stringVal, intVal, floatVal, boolVal, mapVal, listVal, linkVal, displayValue } from "../src/proto.js";
 import type { ProgramContext } from "../src/programs/runtime.js";
@@ -91,8 +91,6 @@ function createHarness(opts: { askImpl?: (agentId: string, prompt: string) => st
 		objectActor: { getOrCreate: (args: string[]) => actorFor(args[0]) },
 	};
 
-	// Build a base ctx factory. We then layer program-specific ctx for
-	// dispatchProgram by re-using the base with per-call state.
 	function buildCtx(overrides: Partial<ProgramContext> = {}): ProgramContext {
 		return {
 			client,
@@ -141,19 +139,19 @@ function createHarness(opts: { askImpl?: (agentId: string, prompt: string) => st
 		};
 	}
 
-	// Gracie's own actor state and ctx.
-	const gracieState: Record<string, any> = gracieProgram.actor!.createState!();
-	const gracieCtx = buildCtx({ state: gracieState, programId: "test-gracie" });
+	const harnessState: Record<string, any> = holdfastProgram.actor!.createState!();
+	const harnessCtx = buildCtx({ state: harnessState, programId: "test-holdfast" });
 
-	return { ctx: gracieCtx, state: gracieState, objects, askCalls, toolRegistrations, buildCtx };
+	return { ctx: harnessCtx, state: harnessState, objects, askCalls, toolRegistrations, buildCtx };
 }
 
-describe("gracie bootstrap", () => {
-	it("creates Gracie agent and self peer on first setup", async () => {
+describe("holdfast setup", () => {
+	it("creates the named agent and self peer on first setup", async () => {
 		const h = createHarness();
-		const bootstrap = gracieProgram.actor!.actions!.bootstrap;
-		const result = await bootstrap(h.ctx, { grantName: "Grant" }) as {
-			gracieAgentId: string;
+		const setup = holdfastProgram.actor!.actions!.setup;
+		const result = await setup(h.ctx, { name: "Gracie", principalName: "Grant" }) as {
+			agentId: string;
+			agentName: string;
 			principalPeerId: string;
 			createdAgent: boolean;
 			createdPeer: boolean;
@@ -161,14 +159,15 @@ describe("gracie bootstrap", () => {
 
 		assert.equal(result.createdAgent, true);
 		assert.equal(result.createdPeer, true);
-		assert.ok(result.gracieAgentId);
+		assert.equal(result.agentName, "Gracie");
+		assert.ok(result.agentId);
 		assert.ok(result.principalPeerId);
 
-		const agent = h.objects.get(result.gracieAgentId)!;
+		const agent = h.objects.get(result.agentId)!;
 		assert.equal(agent.typeKey, "agent");
 		assert.equal(agent.fields.name.stringValue, "Gracie");
 		assert.ok(agent.fields.system.stringValue.length > 100, "system prompt should be populated");
-		// agent.principal should link to grant's peer
+		// agent.principal should link to the principal's peer
 		assert.equal(agent.fields.principal.linkValue.targetId, result.principalPeerId);
 
 		const peer = h.objects.get(result.principalPeerId)!;
@@ -178,38 +177,53 @@ describe("gracie bootstrap", () => {
 		assert.equal(peer.fields.trust_level.stringValue, "self");
 
 		// Actor state cached
-		assert.equal(h.state.gracieAgentId, result.gracieAgentId);
+		assert.equal(h.state.agentId, result.agentId);
+		assert.equal(h.state.agentName, "Gracie");
 		assert.equal(h.state.principalPeerId, result.principalPeerId);
 	});
 
-	it("is idempotent: second bootstrap reuses existing objects", async () => {
+	it("falls back to neutral defaults when --name and --principal-name are omitted", async () => {
 		const h = createHarness();
-		const bootstrap = gracieProgram.actor!.actions!.bootstrap;
-		const first = await bootstrap(h.ctx, {}) as { gracieAgentId: string; principalPeerId: string };
+		const setup = holdfastProgram.actor!.actions!.setup;
+		const result = await setup(h.ctx, {}) as {
+			agentId: string; agentName: string; principalPeerId: string;
+		};
+		const agent = h.objects.get(result.agentId)!;
+		const peer = h.objects.get(result.principalPeerId)!;
+		assert.equal(result.agentName, "Assistant");
+		assert.equal(agent.fields.name.stringValue, "Assistant");
+		assert.equal(peer.fields.display_name.stringValue, "Owner");
+	});
+
+	it("is idempotent: second setup with same name reuses existing objects", async () => {
+		const h = createHarness();
+		const setup = holdfastProgram.actor!.actions!.setup;
+		const first = await setup(h.ctx, { name: "Gracie" }) as { agentId: string; principalPeerId: string };
 		const sizeBefore = h.objects.size;
-		const second = await bootstrap(h.ctx, {}) as {
-			gracieAgentId: string; principalPeerId: string;
+		const second = await setup(h.ctx, { name: "Gracie" }) as {
+			agentId: string; principalPeerId: string;
 			createdAgent: boolean; createdPeer: boolean;
 		};
 		assert.equal(second.createdAgent, false);
 		assert.equal(second.createdPeer, false);
-		assert.equal(second.gracieAgentId, first.gracieAgentId);
+		assert.equal(second.agentId, first.agentId);
 		assert.equal(second.principalPeerId, first.principalPeerId);
-		assert.equal(h.objects.size, sizeBefore, "no new objects on second bootstrap");
+		assert.equal(h.objects.size, sizeBefore, "no new objects on second setup");
 	});
 
-	it("applies custom system prompt, model, grant fields", async () => {
+	it("applies custom system prompt, model, and principal fields", async () => {
 		const h = createHarness();
-		const bootstrap = gracieProgram.actor!.actions!.bootstrap;
-		const result = await bootstrap(h.ctx, {
+		const setup = holdfastProgram.actor!.actions!.setup;
+		const result = await setup(h.ctx, {
+			name: "Gracie",
 			systemPrompt: "custom prompt",
 			model: "claude-haiku-4-20250414",
-			grantName: "Grant F",
-			grantDiscordId: "111222",
-			grantEmail: "grant@example.com",
-		}) as { gracieAgentId: string; principalPeerId: string };
+			principalName: "Grant F",
+			principalDiscordId: "111222",
+			principalEmail: "grant@example.com",
+		}) as { agentId: string; principalPeerId: string };
 
-		const agent = h.objects.get(result.gracieAgentId)!;
+		const agent = h.objects.get(result.agentId)!;
 		assert.equal(agent.fields.system.stringValue, "custom prompt");
 		assert.equal(agent.fields.model.stringValue, "claude-haiku-4-20250414");
 
@@ -218,17 +232,27 @@ describe("gracie bootstrap", () => {
 		assert.equal(peer.fields.discord_id.stringValue, "111222");
 		assert.equal(peer.fields.email.stringValue, "grant@example.com");
 	});
+
+	it("default system prompt substitutes the configured names", async () => {
+		const h = createHarness();
+		const setup = holdfastProgram.actor!.actions!.setup;
+		const result = await setup(h.ctx, { name: "Gracie", principalName: "Grant" }) as { agentId: string };
+		const agent = h.objects.get(result.agentId)!;
+		const system = agent.fields.system.stringValue as string;
+		assert.match(system, /You are Gracie, Grant's executive assistant\./);
+		assert.match(system, /trust=self\s+Grant\./);
+	});
 });
 
-describe("gracie ingest + say", () => {
+describe("holdfast ingest + say", () => {
 	it("ingest wraps the message with peer identity and calls /agent.ask", async () => {
 		const h = createHarness({
 			askImpl: (_id, prompt) => `echo: ${prompt}`,
 		});
-		const bootstrap = gracieProgram.actor!.actions!.bootstrap;
-		await bootstrap(h.ctx, {});
+		const setup = holdfastProgram.actor!.actions!.setup;
+		await setup(h.ctx, { name: "Gracie", principalName: "Grant" });
 
-		// Add a peer that isn't Grant.
+		// Add a peer that isn't the principal.
 		const peerAdd = peerProgram.actor!.actions!.add;
 		const peerCtx = h.buildCtx({ state: {}, programId: "test-peer" });
 		const momId = await peerAdd(peerCtx, {
@@ -238,30 +262,35 @@ describe("gracie ingest + say", () => {
 			email: "mom@example.com",
 		}) as string;
 
-		const ingest = gracieProgram.actor!.actions!.ingest;
+		const ingest = holdfastProgram.actor!.actions!.ingest;
 		const result = await ingest(h.ctx, "email", momId, "Happy birthday!") as {
-			finalText: string; peer: { display_name: string; trust_level: string };
+			finalText: string;
+			peer: { display_name: string; trust_level: string };
+			agentName: string;
 		};
 
 		assert.equal(h.askCalls.length, 1);
-		assert.equal(h.askCalls[0].agentId, h.state.gracieAgentId);
+		assert.equal(h.askCalls[0].agentId, h.state.agentId);
 		assert.equal(
 			h.askCalls[0].prompt,
 			"[from Mom on email, trust=family] Happy birthday!",
 		);
 		assert.equal(result.peer.display_name, "Mom");
 		assert.equal(result.peer.trust_level, "family");
+		assert.equal(result.agentName, "Gracie");
 		assert.match(result.finalText, /Happy birthday/);
 	});
 
 	it("say uses the principal peer as the caller", async () => {
 		const h = createHarness({ askImpl: (_id, p) => `got: ${p}` });
-		const bootstrap = gracieProgram.actor!.actions!.bootstrap;
-		await bootstrap(h.ctx, { grantName: "Grant" });
+		const setup = holdfastProgram.actor!.actions!.setup;
+		await setup(h.ctx, { name: "Gracie", principalName: "Grant" });
 
-		const say = gracieProgram.actor!.actions!.say;
+		const say = holdfastProgram.actor!.actions!.say;
 		const result = await say(h.ctx, "what's on today?") as {
-			finalText: string; peer: { display_name: string; trust_level: string };
+			finalText: string;
+			peer: { display_name: string; trust_level: string };
+			agentName: string;
 		};
 
 		assert.equal(h.askCalls.length, 1);
@@ -270,15 +299,16 @@ describe("gracie ingest + say", () => {
 			"[from Grant on shell, trust=self] what's on today?",
 		);
 		assert.equal(result.peer.trust_level, "self");
+		assert.equal(result.agentName, "Gracie");
 		assert.match(result.finalText, /what's on today/);
 	});
 
 	it("degrades to stranger when the peer id is unknown", async () => {
 		const h = createHarness();
-		const bootstrap = gracieProgram.actor!.actions!.bootstrap;
-		await bootstrap(h.ctx, {});
+		const setup = holdfastProgram.actor!.actions!.setup;
+		await setup(h.ctx, { name: "Gracie" });
 
-		const ingest = gracieProgram.actor!.actions!.ingest;
+		const ingest = holdfastProgram.actor!.actions!.ingest;
 		const result = await ingest(h.ctx, "email", "unknown-peer-id-zzz", "hi") as {
 			peer: { trust_level: string; display_name: string };
 		};
@@ -288,41 +318,49 @@ describe("gracie ingest + say", () => {
 		assert.match(h.askCalls[0].prompt, /trust=stranger/);
 	});
 
-	it("ingest before bootstrap throws a clear error", async () => {
+	it("ingest before setup throws a clear error", async () => {
 		const h = createHarness();
-		const ingest = gracieProgram.actor!.actions!.ingest;
+		const ingest = holdfastProgram.actor!.actions!.ingest;
 		await assert.rejects(
 			() => ingest(h.ctx, "shell", "anyone", "hi"),
-			/not bootstrapped/,
+			/not set up/,
 		);
 	});
 });
 
-describe("gracie actor-state rehydration", () => {
+describe("holdfast actor-state rehydration", () => {
 	it("ensureBootstrapped reconstitutes state on a fresh actor from store objects", async () => {
 		const h = createHarness();
-		const bootstrap = gracieProgram.actor!.actions!.bootstrap;
-		const first = await bootstrap(h.ctx, {}) as { gracieAgentId: string; principalPeerId: string };
+		const setup = holdfastProgram.actor!.actions!.setup;
+		const first = await setup(h.ctx, { name: "Gracie", principalName: "Grant" }) as {
+			agentId: string; agentName: string; principalPeerId: string;
+		};
 
 		// Simulate an actor restart: new empty state, same store objects.
-		const freshState: Record<string, any> = gracieProgram.actor!.createState!();
-		const freshCtx = h.buildCtx({ state: freshState, programId: "test-gracie-restart" });
-		const status = gracieProgram.actor!.actions!.status;
-		const result = await status(freshCtx) as { gracieAgentId: string; principalPeerId: string };
+		const freshState: Record<string, any> = holdfastProgram.actor!.createState!();
+		const freshCtx = h.buildCtx({ state: freshState, programId: "test-holdfast-restart" });
+		const status = holdfastProgram.actor!.actions!.status;
+		const result = await status(freshCtx) as { agentId: string; agentName: string; principalPeerId: string };
 
-		assert.equal(result.gracieAgentId, first.gracieAgentId);
+		assert.equal(result.agentId, first.agentId);
+		assert.equal(result.agentName, "Gracie");
 		assert.equal(result.principalPeerId, first.principalPeerId);
 		// State cache was populated.
-		assert.equal(freshState.gracieAgentId, first.gracieAgentId);
+		assert.equal(freshState.agentId, first.agentId);
+		assert.equal(freshState.agentName, "Gracie");
 		assert.equal(freshState.principalPeerId, first.principalPeerId);
 	});
 });
 
-describe("gracie tool auto-wiring", () => {
+describe("holdfast tool auto-wiring", () => {
 	it("setup registers the expected tools on the agent", async () => {
 		const h = createHarness();
-		const bootstrap = gracieProgram.actor!.actions!.bootstrap;
-		const result = await bootstrap(h.ctx, {}) as { gracieAgentId: string; wiredTools: string[]; skippedTools: { name: string; reason: string }[] };
+		const setup = holdfastProgram.actor!.actions!.setup;
+		const result = await setup(h.ctx, { name: "Gracie" }) as {
+			agentId: string;
+			wiredTools: string[];
+			skippedTools: { name: string; reason: string }[];
+		};
 
 		const expected = [
 			"peer_list", "peer_get", "peer_add", "peer_set_trust",
@@ -333,7 +371,7 @@ describe("gracie tool auto-wiring", () => {
 			"object_create", "object_set_field", "object_delete_field",
 			"object_set_content", "object_remove", "object_add_block",
 			"web_fetch", "web_get_text", "web_get_json",
-			// Phase 1 memory tools (bound_args owner = gracieAgentId)
+			// Phase 1 memory tools (bound_args owner = agentId)
 			"memory_upsert_fact", "memory_list_facts",
 			"memory_upsert_milestone", "memory_amend_milestone",
 			"memory_list_milestones", "memory_get_milestone",
@@ -348,14 +386,14 @@ describe("gracie tool auto-wiring", () => {
 			"google_docs_get", "google_docs_write",
 			// Shell tools (via /shell → persistent bash)
 			"shell_exec", "shell_sessions", "shell_kill",
-			// Subagent spawning (M2)
+			// Subagent spawning
 			"spawn",
 		];
 		assert.deepEqual([...result.wiredTools].sort(), [...expected].sort());
 		assert.equal(result.skippedTools.length, 0);
 		assert.equal(h.toolRegistrations.length, expected.length);
 		for (const reg of h.toolRegistrations) {
-			assert.equal(reg.agentId, result.gracieAgentId);
+			assert.equal(reg.agentId, result.agentId);
 			assert.ok(reg.spec.name);
 			assert.ok(reg.spec.input_schema);
 			assert.ok(reg.spec.target_prefix);
@@ -368,7 +406,7 @@ describe("gracie tool auto-wiring", () => {
 		// Override the dispatch mock so registerTool always throws.
 		const brokenCtx = h.buildCtx({
 			state: h.state,
-			programId: "test-gracie",
+			programId: "test-holdfast",
 			dispatchProgram: async (prefix, action, args) => {
 				if (prefix === "/peer") return h.ctx.dispatchProgram(prefix, action, args);
 				if (prefix === "/agent" && action === "registerTool") {
@@ -377,8 +415,10 @@ describe("gracie tool auto-wiring", () => {
 				throw new Error(`unhandled ${prefix} ${action}`);
 			},
 		});
-		const bootstrap = gracieProgram.actor!.actions!.bootstrap;
-		const result = await bootstrap(brokenCtx, {}) as { wiredTools: string[]; skippedTools: any[] };
+		const setup = holdfastProgram.actor!.actions!.setup;
+		const result = await setup(brokenCtx, { name: "Gracie" }) as {
+			wiredTools: string[]; skippedTools: any[];
+		};
 		assert.equal(result.wiredTools.length, 0);
 		assert.ok(result.skippedTools.length >= 1);
 		for (const s of result.skippedTools) {
@@ -388,20 +428,21 @@ describe("gracie tool auto-wiring", () => {
 
 	it("re-setup does not duplicate registrations (registerTool is idempotent by tool name)", async () => {
 		const h = createHarness();
-		const bootstrap = gracieProgram.actor!.actions!.bootstrap;
-		const first = await bootstrap(h.ctx, {}) as { gracieAgentId: string; wiredTools: string[] };
+		const setup = holdfastProgram.actor!.actions!.setup;
+		const first = await setup(h.ctx, { name: "Gracie" }) as { agentId: string; wiredTools: string[] };
 		const registrationsAfterFirst = h.toolRegistrations.length;
-		const second = await bootstrap(h.ctx, {}) as { gracieAgentId: string; wiredTools: string[]; createdAgent: boolean };
+		const second = await setup(h.ctx, { name: "Gracie" }) as {
+			agentId: string; wiredTools: string[]; createdAgent: boolean;
+		};
 
 		// Both runs attempt to register (so total registration calls double),
 		// but the agent fields end up with the same set of tool names.
 		assert.equal(second.createdAgent, false);
-		assert.equal(second.gracieAgentId, first.gracieAgentId);
+		assert.equal(second.agentId, first.agentId);
 		assert.equal(h.toolRegistrations.length, registrationsAfterFirst * 2);
 		// Every registration targets the same agent.
 		for (const reg of h.toolRegistrations) {
-			assert.equal(reg.agentId, first.gracieAgentId);
+			assert.equal(reg.agentId, first.agentId);
 		}
 	});
-
 });
