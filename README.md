@@ -10,7 +10,7 @@ glon is inspired by [Anytype](https://anytype.io)'s philosophy — no hierarchy,
 
 ```
                 ┌───────────────────────────────────────────────────┐
-   apps         │  Gracie · custom assistants · automations · …     │   ← configurations of programs
+   apps         │  Holdfast · custom assistants · automations · …   │   ← configurations of programs
                 ├───────────────────────────────────────────────────┤
    programs     │  /agent /task /memory /chat /crud /graph /peer …  │   ← user-space, all hot-loadable
                 ├───────────────────────────────────────────────────┤
