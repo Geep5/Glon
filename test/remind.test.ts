@@ -283,7 +283,7 @@ describe("runSchedulerTick", () => {
 			fire_at: Date.now() - 60_000, // 1 min ago
 			payload: { message: "wake up" },
 		}) as { id: string };
-		const dueGracie = await schedule(h.ctx, {
+		const dueGraice = await schedule(h.ctx, {
 			channel: "agent_compose", target: "grant",
 			fire_at: Date.now() - 30_000,
 			payload: { prompt: "think about dinner" },
@@ -302,7 +302,7 @@ describe("runSchedulerTick", () => {
 
 		// Status transitions.
 		assert.equal(h.objects.get(dueDiscord.id)!.fields.status.stringValue, "sent");
-		assert.equal(h.objects.get(dueGracie.id)!.fields.status.stringValue, "sent");
+		assert.equal(h.objects.get(dueGraice.id)!.fields.status.stringValue, "sent");
 		assert.equal(h.objects.get(notDue.id)!.fields.status.stringValue, "pending");
 		assert.ok(h.objects.get(dueDiscord.id)!.fields.sent_at_ms.intValue > 0);
 	});

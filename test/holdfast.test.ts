@@ -149,7 +149,7 @@ describe("holdfast setup", () => {
 	it("creates the named agent and self peer on first setup", async () => {
 		const h = createHarness();
 		const setup = holdfastProgram.actor!.actions!.setup;
-		const result = await setup(h.ctx, { name: "Gracie", principalName: "Grant" }) as {
+		const result = await setup(h.ctx, { name: "Graice", principalName: "Grant" }) as {
 			agentId: string;
 			agentName: string;
 			principalPeerId: string;
@@ -159,13 +159,13 @@ describe("holdfast setup", () => {
 
 		assert.equal(result.createdAgent, true);
 		assert.equal(result.createdPeer, true);
-		assert.equal(result.agentName, "Gracie");
+		assert.equal(result.agentName, "Graice");
 		assert.ok(result.agentId);
 		assert.ok(result.principalPeerId);
 
 		const agent = h.objects.get(result.agentId)!;
 		assert.equal(agent.typeKey, "agent");
-		assert.equal(agent.fields.name.stringValue, "Gracie");
+		assert.equal(agent.fields.name.stringValue, "Graice");
 		assert.ok(agent.fields.system.stringValue.length > 100, "system prompt should be populated");
 		// agent.principal should link to the principal's peer
 		assert.equal(agent.fields.principal.linkValue.targetId, result.principalPeerId);
@@ -178,7 +178,7 @@ describe("holdfast setup", () => {
 
 		// Actor state cached
 		assert.equal(h.state.agentId, result.agentId);
-		assert.equal(h.state.agentName, "Gracie");
+		assert.equal(h.state.agentName, "Graice");
 		assert.equal(h.state.principalPeerId, result.principalPeerId);
 	});
 
@@ -198,9 +198,9 @@ describe("holdfast setup", () => {
 	it("is idempotent: second setup with same name reuses existing objects", async () => {
 		const h = createHarness();
 		const setup = holdfastProgram.actor!.actions!.setup;
-		const first = await setup(h.ctx, { name: "Gracie" }) as { agentId: string; principalPeerId: string };
+		const first = await setup(h.ctx, { name: "Graice" }) as { agentId: string; principalPeerId: string };
 		const sizeBefore = h.objects.size;
-		const second = await setup(h.ctx, { name: "Gracie" }) as {
+		const second = await setup(h.ctx, { name: "Graice" }) as {
 			agentId: string; principalPeerId: string;
 			createdAgent: boolean; createdPeer: boolean;
 		};
@@ -215,7 +215,7 @@ describe("holdfast setup", () => {
 		const h = createHarness();
 		const setup = holdfastProgram.actor!.actions!.setup;
 		const result = await setup(h.ctx, {
-			name: "Gracie",
+			name: "Graice",
 			systemPrompt: "custom prompt",
 			model: "claude-haiku-4-20250414",
 			principalName: "Grant F",
@@ -236,10 +236,10 @@ describe("holdfast setup", () => {
 	it("default system prompt substitutes the configured names", async () => {
 		const h = createHarness();
 		const setup = holdfastProgram.actor!.actions!.setup;
-		const result = await setup(h.ctx, { name: "Gracie", principalName: "Grant" }) as { agentId: string };
+		const result = await setup(h.ctx, { name: "Graice", principalName: "Grant" }) as { agentId: string };
 		const agent = h.objects.get(result.agentId)!;
 		const system = agent.fields.system.stringValue as string;
-		assert.match(system, /You are Gracie, Grant's executive assistant\./);
+		assert.match(system, /You are Graice, Grant's executive assistant\./);
 		assert.match(system, /trust=self\s+Grant\./);
 	});
 });
@@ -250,7 +250,7 @@ describe("holdfast ingest + say", () => {
 			askImpl: (_id, prompt) => `echo: ${prompt}`,
 		});
 		const setup = holdfastProgram.actor!.actions!.setup;
-		await setup(h.ctx, { name: "Gracie", principalName: "Grant" });
+		await setup(h.ctx, { name: "Graice", principalName: "Grant" });
 
 		// Add a peer that isn't the principal.
 		const peerAdd = peerProgram.actor!.actions!.add;
@@ -277,14 +277,14 @@ describe("holdfast ingest + say", () => {
 		);
 		assert.equal(result.peer.display_name, "Mom");
 		assert.equal(result.peer.trust_level, "family");
-		assert.equal(result.agentName, "Gracie");
+		assert.equal(result.agentName, "Graice");
 		assert.match(result.finalText, /Happy birthday/);
 	});
 
 	it("say uses the principal peer as the caller", async () => {
 		const h = createHarness({ askImpl: (_id, p) => `got: ${p}` });
 		const setup = holdfastProgram.actor!.actions!.setup;
-		await setup(h.ctx, { name: "Gracie", principalName: "Grant" });
+		await setup(h.ctx, { name: "Graice", principalName: "Grant" });
 
 		const say = holdfastProgram.actor!.actions!.say;
 		const result = await say(h.ctx, "what's on today?") as {
@@ -299,14 +299,14 @@ describe("holdfast ingest + say", () => {
 			"[from Grant on shell, trust=self] what's on today?",
 		);
 		assert.equal(result.peer.trust_level, "self");
-		assert.equal(result.agentName, "Gracie");
+		assert.equal(result.agentName, "Graice");
 		assert.match(result.finalText, /what's on today/);
 	});
 
 	it("degrades to stranger when the peer id is unknown", async () => {
 		const h = createHarness();
 		const setup = holdfastProgram.actor!.actions!.setup;
-		await setup(h.ctx, { name: "Gracie" });
+		await setup(h.ctx, { name: "Graice" });
 
 		const ingest = holdfastProgram.actor!.actions!.ingest;
 		const result = await ingest(h.ctx, "email", "unknown-peer-id-zzz", "hi") as {
@@ -332,7 +332,7 @@ describe("holdfast actor-state rehydration", () => {
 	it("ensureBootstrapped reconstitutes state on a fresh actor from store objects", async () => {
 		const h = createHarness();
 		const setup = holdfastProgram.actor!.actions!.setup;
-		const first = await setup(h.ctx, { name: "Gracie", principalName: "Grant" }) as {
+		const first = await setup(h.ctx, { name: "Graice", principalName: "Grant" }) as {
 			agentId: string; agentName: string; principalPeerId: string;
 		};
 
@@ -343,11 +343,11 @@ describe("holdfast actor-state rehydration", () => {
 		const result = await status(freshCtx) as { agentId: string; agentName: string; principalPeerId: string };
 
 		assert.equal(result.agentId, first.agentId);
-		assert.equal(result.agentName, "Gracie");
+		assert.equal(result.agentName, "Graice");
 		assert.equal(result.principalPeerId, first.principalPeerId);
 		// State cache was populated.
 		assert.equal(freshState.agentId, first.agentId);
-		assert.equal(freshState.agentName, "Gracie");
+		assert.equal(freshState.agentName, "Graice");
 		assert.equal(freshState.principalPeerId, first.principalPeerId);
 	});
 });
@@ -356,7 +356,7 @@ describe("holdfast tool auto-wiring", () => {
 	it("setup registers the expected tools on the agent", async () => {
 		const h = createHarness();
 		const setup = holdfastProgram.actor!.actions!.setup;
-		const result = await setup(h.ctx, { name: "Gracie" }) as {
+		const result = await setup(h.ctx, { name: "Graice" }) as {
 			agentId: string;
 			wiredTools: string[];
 			skippedTools: { name: string; reason: string }[];
@@ -416,7 +416,7 @@ describe("holdfast tool auto-wiring", () => {
 			},
 		});
 		const setup = holdfastProgram.actor!.actions!.setup;
-		const result = await setup(brokenCtx, { name: "Gracie" }) as {
+		const result = await setup(brokenCtx, { name: "Graice" }) as {
 			wiredTools: string[]; skippedTools: any[];
 		};
 		assert.equal(result.wiredTools.length, 0);
@@ -429,9 +429,9 @@ describe("holdfast tool auto-wiring", () => {
 	it("re-setup does not duplicate registrations (registerTool is idempotent by tool name)", async () => {
 		const h = createHarness();
 		const setup = holdfastProgram.actor!.actions!.setup;
-		const first = await setup(h.ctx, { name: "Gracie" }) as { agentId: string; wiredTools: string[] };
+		const first = await setup(h.ctx, { name: "Graice" }) as { agentId: string; wiredTools: string[] };
 		const registrationsAfterFirst = h.toolRegistrations.length;
-		const second = await setup(h.ctx, { name: "Gracie" }) as {
+		const second = await setup(h.ctx, { name: "Graice" }) as {
 			agentId: string; wiredTools: string[]; createdAgent: boolean;
 		};
 

@@ -297,10 +297,10 @@ describe("/crud actor — read", () => {
 	it("search finds matches across fields and content", async () => {
 		const h = createHarness();
 		h.seedObject("peer", { display_name: stringVal("Grant") });
-		h.seedObject("peer", { display_name: stringVal("Gracie"), notes: stringVal("the assistant") });
+		h.seedObject("peer", { display_name: stringVal("Graice"), notes: stringVal("the assistant") });
 		h.seedObject("program", { prefix: stringVal("/discord") });
 		const search = crudProgram.actor!.actions!.search;
-		const matches = await search(h.ctx, { query: "Gracie" }) as { matches: any[] };
+		const matches = await search(h.ctx, { query: "Graice" }) as { matches: any[] };
 		assert.equal(matches.matches.length, 1);
 		const filtered = await search(h.ctx, { query: "discord", type_key: "peer" }) as { matches: any[] };
 		assert.equal(filtered.matches.length, 0);

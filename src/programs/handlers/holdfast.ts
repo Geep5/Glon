@@ -12,7 +12,7 @@
 // world (peers, calendars, mailboxes, shells, the DAG) without being the
 // kelp itself. The kelp — your specific assistant's name, system prompt,
 // custom tools, preferred peers — lives in your own configuration. A
-// personal repo can drive `/holdfast setup --name "Gracie" --principal-name
+// personal repo can drive `/holdfast setup --name "Graice" --principal-name
 // "Grant" ...` from a bootstrap script and treat this program as the engine.
 //
 // What the harness wraps:
