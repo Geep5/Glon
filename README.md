@@ -152,7 +152,7 @@ glon> /task spawn c07aa4d3 '{
 
 glon> /agent tree c07aa4d3
 spawn tree rooted at c07aa4d3
-· Gracie [agent]  c07aa4d3
+· Graice [agent]  c07aa4d3
 ├─ ✓ explore-a [explore] task=a  child-12
 └─ ✓ explore-b [explore] task=b  child-13
   2 subagent(s) total
@@ -201,8 +201,8 @@ The 3D viewer [glonWorld](https://github.com/Geep5/glonWorld) wraps this with a 
 Holdfast is the generic harness program. You configure it once with a name and a principal, and it wires an `/agent` with identity-aware ingest, a peer directory, durable memory, scheduled reminders, Google Workspace bridges, shell access, and subagent spawning. Inbound messages from any source (shell, Discord, future bridges) get tagged with `[from {name} on {source}, trust={level}]` before reaching the model.
 
 ```
-glon> /holdfast setup --name Gracie --principal-name Grant --principal-discord 123456789012345678
-  Holdfast ready — Gracie
+glon> /holdfast setup --name Graice --principal-name Grant --principal-discord 123456789012345678
+  Holdfast ready — Graice
   agent:     7f141408-… (created)
   principal: 9a3c5d20-… (created)
   tools:     peer_list, peer_get, peer_add, … (50 wired)
@@ -210,13 +210,13 @@ glon> /holdfast setup --name Gracie --principal-name Grant --principal-discord 1
   Next: `/holdfast say hello`
 
 glon> /holdfast say My wife's name is Sarah. Save that.
-  Gracie (to Grant)
+  Graice (to Grant)
   Saved. wife_name=Sarah.
   (one tool call: memory_upsert_fact)
 
 # Restart the daemon, start a fresh session — the fact survives.
 glon> /holdfast say What's my wife's name?
-  Gracie (to Grant)
+  Graice (to Grant)
   Sarah.
   (no tool calls — served from her memory digest)
 ```
@@ -350,7 +350,7 @@ Schema:
 
 ## Discord bridge setup
 
-1. **Create the application.** Visit [Discord Developer Portal](https://discord.com/developers/applications) and click **New Application**. The application name is what users see as the bot's handle in Discord — name it what you want your assistant to be called (e.g. "Gracie").
+1. **Create the application.** Visit [Discord Developer Portal](https://discord.com/developers/applications) and click **New Application**. The application name is what users see as the bot's handle in Discord — name it what you want your assistant to be called (e.g. "Graice").
 2. **Grab the bot token.** Bot tab → **Reset Token** → copy into `.env` as `DISCORD_BOT_TOKEN=...`. The token is the ONLY credential the bridge uses; nothing is persisted to the DAG.
 3. **Invite the bot.** OAuth2 → URL Generator → scope `bot`, permissions `Send Messages` + `Read Message History`. Open the URL and add it to a guild you share with your user, or DM it directly.
 4. **Find your Discord user id.** Settings → Advanced → enable **Developer Mode**. Then right-click your name anywhere → **Copy User ID**. That 18-digit snowflake goes into `/holdfast setup --principal-discord <id>`.
