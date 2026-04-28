@@ -328,9 +328,7 @@ const PROGRAMS: ProgramDef[] = [
 		prefix: "/google",
 		name: "Google",
 		commands: {
-			status: "Probe gws binary reachability",
-			agenda: "Calendar agenda (today/tomorrow/week/days)",
-			triage: "Gmail unread inbox triage",
+			help: "Show shell cheatsheet (gws verbs + dry-run pattern)",
 		},
 		entry: "google.ts",
 		modules: { "google.ts": "src/programs/handlers/google.ts" },

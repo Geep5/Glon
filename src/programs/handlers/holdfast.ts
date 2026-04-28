@@ -165,26 +165,31 @@ When to read:
   just told you, prefer ${them}.
 
 ## Google Workspace (Calendar / Gmail / Drive / Sheets / Docs)
-You have google_* tools that bridge to ${themPossessive} local gws CLI. Auth lives in
-gws — you never see tokens. Use these for calendar, email, drive, sheets, docs.
+${themPossessive} Google Workspace lives behind the \`gws\` CLI. Auth (token,
+refresh, scopes, OS keyring) is gws's job; you never see credentials.
+There is no Glon tool wrapper — shell_exec gws directly.
 
-Read-only: google_calendar_agenda, google_calendar_list_events,
-google_gmail_triage, google_gmail_search, google_gmail_read, google_drive_search,
-google_drive_get, google_sheets_read, google_docs_get.
+Discovery:
+- \`gws --help\`               list verb groups (calendar, gmail, drive, sheets, docs)
+- \`gws +<verb> --help\`      args for a specific verb
 
-Mutations (google_calendar_insert, google_calendar_delete_event, google_gmail_send,
-google_gmail_reply, google_sheets_append, google_docs_write) require EITHER
-dry_run=true (safe preview via gws --dry-run) OR confirmed=true (actual execution).
-Calling them without either field is an error.
+Common verbs (read-only):
+- \`gws +calendar_agenda\`    upcoming events across calendars
+- \`gws +calendar_list_events --range today|tomorrow|week|--days N\`
+- \`gws +gmail_triage\`        unread inbox triage
+- \`gws +gmail_search --query Q\`, \`gws +gmail_read --id ID\`
+- \`gws +drive_search --query Q\`, \`gws +drive_get --id ID\`
+- \`gws +sheets_read --id ID --range A1:Z\`, \`gws +docs_get --id ID\`
 
-How to handle mutations:
-- For anything irreversible or that involves other people (sending email, creating
-  a calendar invite, deleting), first describe to ${them} exactly what you'll do.
-- Only call with confirmed=true after ${them} explicitly approves.
-- If you're unsure whether an action is fine, call with dry_run=true first to
-  preview the exact request that would be sent, show ${them}, then confirm.
-- For trivial/self-only writes (appending a row to your own log sheet, writing
-  to your own scratch doc), you can use confirmed=true directly but mention it.
+Mutating verbs (\`calendar_insert\`, \`calendar_delete_event\`, \`gmail_send\`,
+\`gmail_reply\`, \`sheets_append\`, \`docs_write\`) accept \`--dry-run\` for a
+safe preview. How to handle them:
+- For anything irreversible or that involves other people (sending email,
+  creating a calendar invite, deleting), first describe to ${them} exactly
+  what you'll do, then run with \`--dry-run\` to confirm the request shape,
+  then run for real after ${them} approves.
+- Trivial self-only writes (appending a row to your own log sheet, scratch
+  doc updates) you can run directly but mention what you did.
 
 
 ## Shell access
@@ -207,8 +212,8 @@ Rules of thumb:
 - Use distinct session names for parallel work (\`repo1\`, \`deploy\`, \`scratch\`).
   Default session is 'main'.
 - If something hangs, shell_kill the session and start over.
-- For Google Workspace operations, prefer the google_* tools over shelling out
-  to \`gws\` — the typed actions are clearer and they gate dangerous mutations.
+- For Google Workspace, shell_exec \`gws +<verb>\` directly. There is no
+  google_* tool wrapper; auth lives in gws's keyring.
 
 
 ## Web access
@@ -819,258 +824,6 @@ function buildMemoryTools(agentId: string): ToolSpec[] {
 	];
 }
 
-// ── Google tools (via /google → local gws CLI) ─────────────────
-//
-// Calendar, Gmail, Drive, Sheets, Docs. Auth lives in gws (OS keyring).
-// No bound_args — these are personal calls into the principal's Google
-// account, not agent-scoped like memory. Mutations (send, insert, append,
-// write, delete) require `confirmed: true` (execute) or `dry_run: true`
-// (preview via gws --dry-run). Neither → the action errors; the model
-// must announce to the principal first.
-
-function buildGoogleTools(): ToolSpec[] {
-	const mutationSchema = {
-		confirmed: { type: "boolean", description: "set true to actually execute. Required for real mutations." },
-		dry_run: { type: "boolean", description: "set true to preview via gws --dry-run without side effects. Safe to run without asking." },
-	};
-	return [
-		{
-			name: "google_calendar_agenda",
-			description: "Show upcoming calendar events across all calendars. Use for 'what's on my schedule' questions. Read-only.",
-			input_schema: {
-				type: "object",
-				properties: {
-					today: { type: "boolean" },
-					tomorrow: { type: "boolean" },
-					week: { type: "boolean" },
-					days: { type: "number", description: "days ahead to look" },
-					calendar: { type: "string", description: "specific calendar name or id; omit for all" },
-					timezone: { type: "string", description: "IANA tz, e.g. America/Los_Angeles" },
-				},
-			},
-			target_prefix: "/google",
-			target_action: "calendar_agenda",
-		},
-		{
-			name: "google_calendar_list_events",
-			description: "List calendar events with filtering. Read-only. Use for search queries (q) and time-range lookups.",
-			input_schema: {
-				type: "object",
-				properties: {
-					calendar_id: { type: "string", description: "defaults to primary" },
-					time_min: { type: "string", description: "RFC3339, e.g. 2026-04-24T00:00:00-07:00" },
-					time_max: { type: "string" },
-					max_results: { type: "number" },
-					q: { type: "string", description: "full-text search across event fields" },
-				},
-			},
-			target_prefix: "/google",
-			target_action: "calendar_list_events",
-		},
-		{
-			name: "google_calendar_insert",
-			description: "Create a calendar event. MUTATION — requires confirmed=true or dry_run=true.",
-			input_schema: {
-				type: "object",
-				properties: {
-					summary: { type: "string", description: "event title" },
-					start: { type: "string", description: "RFC3339 start time" },
-					end: { type: "string", description: "RFC3339 end time" },
-					description: { type: "string" },
-					location: { type: "string" },
-					calendar: { type: "string", description: "defaults to primary" },
-					meet: { type: "boolean", description: "true to add a Google Meet link" },
-					attendees: { type: "array", items: { type: "string" }, description: "emails" },
-					...mutationSchema,
-				},
-				required: ["summary", "start", "end"],
-			},
-			target_prefix: "/google",
-			target_action: "calendar_insert",
-		},
-		{
-			name: "google_calendar_delete_event",
-			description: "Delete a calendar event. MUTATION — requires confirmed=true or dry_run=true. Irreversible.",
-			input_schema: {
-				type: "object",
-				properties: {
-					event_id: { type: "string" },
-					calendar_id: { type: "string", description: "defaults to primary" },
-					...mutationSchema,
-				},
-				required: ["event_id"],
-			},
-			target_prefix: "/google",
-			target_action: "calendar_delete_event",
-		},
-		{
-			name: "google_gmail_triage",
-			description: "Unread inbox summary (sender / subject / date). Read-only. Use for 'what's in my inbox' questions.",
-			input_schema: {
-				type: "object",
-				properties: {
-					max: { type: "number", description: "cap on messages returned" },
-					label: { type: "string" },
-					query: { type: "string", description: "Gmail search query" },
-				},
-			},
-			target_prefix: "/google",
-			target_action: "gmail_triage",
-		},
-		{
-			name: "google_gmail_search",
-			description: "Search Gmail. Returns message ids; pair with gmail_read to fetch bodies. Read-only.",
-			input_schema: {
-				type: "object",
-				properties: {
-					q: { type: "string", description: "Gmail search query, e.g. 'from:mom is:unread'" },
-					max_results: { type: "number" },
-					label_ids: { type: "array", items: { type: "string" } },
-				},
-				required: ["q"],
-			},
-			target_prefix: "/google",
-			target_action: "gmail_search",
-		},
-		{
-			name: "google_gmail_read",
-			description: "Read one Gmail message by id. Read-only.",
-			input_schema: {
-				type: "object",
-				properties: {
-					message_id: { type: "string" },
-					headers_only: { type: "boolean", description: "true to skip the body" },
-				},
-				required: ["message_id"],
-			},
-			target_prefix: "/google",
-			target_action: "gmail_read",
-		},
-		{
-			name: "google_gmail_send",
-			description: "Send an email. MUTATION — requires confirmed=true or dry_run=true.",
-			input_schema: {
-				type: "object",
-				properties: {
-					to: { type: "string", description: "comma-separated emails" },
-					subject: { type: "string" },
-					body: { type: "string", description: "plain text or HTML if html=true" },
-					cc: { type: "string" },
-					bcc: { type: "string" },
-					from: { type: "string", description: "send-as alias; omit for default" },
-					html: { type: "boolean" },
-					draft: { type: "boolean", description: "save as draft instead of send" },
-					...mutationSchema,
-				},
-				required: ["to", "subject", "body"],
-			},
-			target_prefix: "/google",
-			target_action: "gmail_send",
-		},
-		{
-			name: "google_gmail_reply",
-			description: "Reply to a Gmail message (threading handled automatically). MUTATION.",
-			input_schema: {
-				type: "object",
-				properties: {
-					message_id: { type: "string" },
-					body: { type: "string" },
-					html: { type: "boolean" },
-					...mutationSchema,
-				},
-				required: ["message_id", "body"],
-			},
-			target_prefix: "/google",
-			target_action: "gmail_reply",
-		},
-		{
-			name: "google_drive_search",
-			description: "List / search Drive files. Read-only.",
-			input_schema: {
-				type: "object",
-				properties: {
-					q: { type: "string", description: "Drive search query, e.g. \"name contains 'budget' and trashed=false\"" },
-					max_results: { type: "number" },
-					fields: { type: "string" },
-					order_by: { type: "string", description: "e.g. 'modifiedTime desc'" },
-				},
-			},
-			target_prefix: "/google",
-			target_action: "drive_search",
-		},
-		{
-			name: "google_drive_get",
-			description: "Get Drive file metadata by id. Read-only.",
-			input_schema: {
-				type: "object",
-				properties: {
-					file_id: { type: "string" },
-					fields: { type: "string" },
-				},
-				required: ["file_id"],
-			},
-			target_prefix: "/google",
-			target_action: "drive_get",
-		},
-		{
-			name: "google_sheets_read",
-			description: "Read cell values from a spreadsheet range. Read-only.",
-			input_schema: {
-				type: "object",
-				properties: {
-					spreadsheet_id: { type: "string" },
-					range: { type: "string", description: "A1 notation, e.g. 'Sheet1!A1:C10'" },
-					value_render_option: { type: "string", enum: ["FORMATTED_VALUE", "UNFORMATTED_VALUE", "FORMULA"] },
-				},
-				required: ["spreadsheet_id", "range"],
-			},
-			target_prefix: "/google",
-			target_action: "sheets_read",
-		},
-		{
-			name: "google_sheets_append",
-			description: "Append a row to a spreadsheet. MUTATION. `values` is an array of arrays (one row per outer entry).",
-			input_schema: {
-				type: "object",
-				properties: {
-					spreadsheet_id: { type: "string" },
-					range: { type: "string", description: "A1 notation of the table to append to" },
-					values: { type: "array", description: "rows, each an array of cell values" },
-					...mutationSchema,
-				},
-				required: ["spreadsheet_id", "range", "values"],
-			},
-			target_prefix: "/google",
-			target_action: "sheets_append",
-		},
-		{
-			name: "google_docs_get",
-			description: "Get a Google Doc's structure (body elements, headings, paragraphs). Read-only.",
-			input_schema: {
-				type: "object",
-				properties: { document_id: { type: "string" } },
-				required: ["document_id"],
-			},
-			target_prefix: "/google",
-			target_action: "docs_get",
-		},
-		{
-			name: "google_docs_write",
-			description: "Append text to a Google Doc. MUTATION.",
-			input_schema: {
-				type: "object",
-				properties: {
-					document_id: { type: "string" },
-					text: { type: "string" },
-					...mutationSchema,
-				},
-				required: ["document_id", "text"],
-			},
-			target_prefix: "/google",
-			target_action: "docs_write",
-		},
-	];
-}
 
 // ── Shell tools (via /shell → persistent bash sessions) ────────────
 //
@@ -1125,7 +878,6 @@ function buildHarnessTools(agentId: string): ToolSpec[] {
 	return [
 		...BASE_TOOLS,
 		...buildMemoryTools(agentId),
-		...buildGoogleTools(),
 		...buildShellTools(),
 		spawnTool(agentId),
 	];
