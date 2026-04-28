@@ -378,7 +378,7 @@ describe("agent tool-use loop", () => {
 
 	it("iteration cap throws when tools never stop", async () => {
 		const h = createTestHarness();
-		const agentId = h.seedAgent("agent-7", { model: stringVal("test-model") });
+		const agentId = h.seedAgent("agent-7", { model: stringVal("test-model"), max_tool_iterations: stringVal("5") });
 		const register = agentProgram.actor!.actions!.registerTool;
 		await register(h.ctx, agentId, {
 			name: "loop", description: "", input_schema: { type: "object" },
@@ -398,7 +398,7 @@ describe("agent tool-use loop", () => {
 		const ask = agentProgram.actor!.actions!.ask;
 		await assert.rejects(
 			() => ask(h.ctx, agentId, "go forever"),
-			/exceeded 20 iterations/,
+			/exceeded 5 iterations/,
 		);
 	});
 

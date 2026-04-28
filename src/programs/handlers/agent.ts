@@ -45,7 +45,8 @@ function blue(s: string) { return `${BLUE}${s}${RESET}`; }
 // ── Constants ────────────────────────────────────────────────────
 
 const DEFAULT_MODEL = "claude-sonnet-4-20250514";
-const MAX_TOOL_ITERATIONS = 20;
+// Per-agent override: agent.fields.max_tool_iterations (int)
+const DEFAULT_MAX_TOOL_ITERATIONS = 100;
 const TOOL_RESULT_TRUNCATE = 8192;
 
 // Summarisation prompt settings (during compaction).
@@ -1708,6 +1709,7 @@ async function runLoop(
 	const tempStr = extractString(state.fields?.["temperature"]);
 	const temperature = tempStr ? parseFloat(tempStr) : undefined;
 	const tools = extractTools(state.fields?.["tools"]);
+	const maxToolIterations = extractInt(state.fields?.["max_tool_iterations"], DEFAULT_MAX_TOOL_ITERATIONS);
 
 	const actor = client.objectActor.getOrCreate([agentId]);
 
@@ -1751,8 +1753,8 @@ async function runLoop(
 	let lastRoundHadTools = false;
 
 	while (true) {
-		if (iterations >= MAX_TOOL_ITERATIONS) {
-			throw new Error(`Tool-use loop exceeded ${MAX_TOOL_ITERATIONS} iterations`);
+		if (iterations >= maxToolIterations) {
+			throw new Error(`Tool-use loop exceeded ${maxToolIterations} iterations`);
 		}
 
 		// Cancel signal (set externally via /agent.cancel or by a parent
@@ -2178,7 +2180,7 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 				print(dim("  Keys: model, system, name, temperature,"));
 				print(dim("        compaction_enabled, compaction_context_window,"));
 				print(dim("        compaction_reserve_tokens, compaction_keep_recent_tokens,"));
-				print(dim("        compaction_model"));
+				print(dim("        compaction_model, max_tool_iterations"));
 				break;
 			}
 			const allowed = [
@@ -2187,6 +2189,7 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 				"compaction_reserve_tokens", "compaction_keep_recent_tokens",
 				"compaction_model",
 				"memory_digest_enabled", "memory_extraction_enabled",
+				"max_tool_iterations",
 			];
 			if (!allowed.includes(key)) {
 				print(red(`Unknown config key: ${key}. Use: ${allowed.join(", ")}`));
