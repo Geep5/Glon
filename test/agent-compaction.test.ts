@@ -346,6 +346,38 @@ describe("repairToolPairs + mergeConsecutiveTurns", () => {
 		assert.equal(out[1].kind, "assistant_text");
 	});
 
+	it("hoists a tool_result up to immediately follow its tool_use when steered blocks intervened", () => {
+		// Reproduces the exact pattern observed in production: while a tool_use
+		// was in flight, a steered user_text + assistant reply (and even a fresh
+		// tool_use) landed in the DAG before the original tool_result did.
+		const items = [
+			{ kind: "tool_use" as const, blockId: "b1", toolUseId: "tu_lmc4", name: "register_tool", input: {}, timestamp: 1 },
+			{ kind: "user_text" as const, blockId: "b2", text: "i made you have 1000 iterations", timestamp: 2 },
+			{ kind: "assistant_text" as const, blockId: "b3", text: "Thanks!", timestamp: 3 },
+			{ kind: "user_text" as const, blockId: "b4", text: "yes please finish", timestamp: 4 },
+			{ kind: "assistant_text" as const, blockId: "b5", text: "Perfect, continuing.", timestamp: 5 },
+			{ kind: "tool_use" as const, blockId: "b6", toolUseId: "tu_bfvc", name: "shell_exec", input: {}, timestamp: 6 },
+			{ kind: "tool_result" as const, blockId: "b7", toolUseId: "tu_lmc4", content: "ok", isError: false, timestamp: 7 },
+			{ kind: "tool_result" as const, blockId: "b8", toolUseId: "tu_bfvc", content: "done", isError: false, timestamp: 8 },
+		];
+		const out = __test.repairToolPairs(items);
+		// tu_lmc4's tool_result must now sit at index 1 (immediately after its tool_use).
+		assert.equal(out[0].kind, "tool_use"); assert.equal((out[0] as any).toolUseId, "tu_lmc4");
+		assert.equal(out[1].kind, "tool_result"); assert.equal((out[1] as any).toolUseId, "tu_lmc4");
+		// The intervening user/assistant blocks shifted down but stayed in the conversation.
+		assert.equal(out[2].kind, "user_text");
+		assert.equal(out[3].kind, "assistant_text");
+		assert.equal(out[4].kind, "user_text");
+		assert.equal(out[5].kind, "assistant_text");
+		// tu_bfvc's tool_use is then immediately followed by its own tool_result.
+		assert.equal(out[6].kind, "tool_use"); assert.equal((out[6] as any).toolUseId, "tu_bfvc");
+		assert.equal(out[7].kind, "tool_result"); assert.equal((out[7] as any).toolUseId, "tu_bfvc");
+		assert.equal(out.length, 8, "no items dropped or duplicated");
+		// All synthetic stubs would have blockId starting with __synthetic; none here.
+		for (const it of out) assert.ok(!it.blockId.startsWith("__synthetic:"), "no stubs needed");
+	});
+
+
 	it("mergeConsecutiveTurns collapses adjacent same-role turns into one", () => {
 		const turns = [
 			{ role: "user" as const, content: "a", timestamp: 1 },

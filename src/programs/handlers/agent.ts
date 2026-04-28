@@ -353,46 +353,64 @@ function filterToKept(items: ClassifiedItem[], firstKeptBlockId: string): Classi
 }
 
 /**
- * Pair every `tool_use` with a `tool_result`, synthesizing a stub in-memory
- * when the DAG lacks one. Also drops `tool_result` blocks whose matching
- * `tool_use` no longer exists (e.g. filtered away by compaction).
+ * Pair every `tool_use` with a `tool_result` AND enforce strict adjacency:
+ * each `tool_use` is immediately followed by its matching `tool_result` in
+ * the returned items array. Synthesizes an error stub when the DAG has no
+ * matching result; drops orphan results whose `tool_use` is missing.
  *
- * Why: the Anthropic API rejects messages where a `tool_use` is not
- * immediately followed by a `tool_result` with the same id. Writes to the
- * agent object's block list go through RivetKit; if the connection drops
- * after the `tool_use` block lands but before its `tool_result` block does,
- * the on-disk conversation is left inconsistent. Fixing it at read time
- * means the malformed DAG self-heals on the next turn without surgery.
+ * Why adjacency, not just pairing: Anthropic rejects messages where a
+ * `tool_use` is not immediately followed by its `tool_result`. Two ways the
+ * DAG can land in a non-adjacent state:
+ *   1. Crash between the `tool_use` block write and the `tool_result` block
+ *      write \u2014 handled by the synthetic stub.
+ *   2. A steered user message arrives during tool execution, so the user
+ *      block (and any assistant reply to it) lands in the DAG with a
+ *      timestamp between the tool_use's and the tool_result's. After a
+ *      restart, classifyBlocks sorts by timestamp and the result is
+ *      tool_use \u2192 user \u2192 assistant \u2192 tool_result. This pass hoists the
+ *      tool_result up to immediately follow its tool_use; the intervening
+ *      user/assistant blocks shift down and remain in the conversation.
  *
  * The synthetic `tool_result` carries `isError=true` so the model sees the
  * interrupted call for what it was and does not mistake silence for success.
  */
 function repairToolPairs(items: ClassifiedItem[]): ClassifiedItem[] {
+	// Index real tool_results by their tool_use_id (first occurrence wins).
+	const resultByUseId = new Map<string, Extract<ClassifiedItem, { kind: "tool_result" }>>();
+	for (const item of items) {
+		if (item.kind === "tool_result" && item.toolUseId && !resultByUseId.has(item.toolUseId)) {
+			resultByUseId.set(item.toolUseId, item);
+		}
+	}
+	// Tool_uses present in the conversation \u2014 used to drop orphan results.
 	const toolUseIds = new Set<string>();
-	const resolvedIds = new Set<string>();
 	for (const item of items) {
 		if (item.kind === "tool_use" && item.toolUseId) toolUseIds.add(item.toolUseId);
-		if (item.kind === "tool_result" && item.toolUseId) resolvedIds.add(item.toolUseId);
 	}
 
 	const out: ClassifiedItem[] = [];
 	for (const item of items) {
 		if (item.kind === "tool_result") {
-			// Drop orphan tool_results whose tool_use was lost (e.g. trimmed by
-			// filterToKept). Sending them to the API would raise a symmetric error.
-			if (!item.toolUseId || !toolUseIds.has(item.toolUseId)) continue;
+			// Always skip in-place. A real tool_result is emitted immediately after
+			// its tool_use (below). An orphan tool_result (no matching tool_use)
+			// drops on the floor \u2014 sending it would raise a symmetric API error.
+			continue;
 		}
 		out.push(item);
-		if (item.kind === "tool_use" && item.toolUseId && !resolvedIds.has(item.toolUseId)) {
-			out.push({
-				kind: "tool_result",
-				blockId: `__synthetic:${item.toolUseId}`,
-				toolUseId: item.toolUseId,
-				content: "[tool call was interrupted before producing a result — treat this as a failed call and proceed.]",
-				isError: true,
-				timestamp: item.timestamp + 1,
-			});
-			resolvedIds.add(item.toolUseId);
+		if (item.kind === "tool_use" && item.toolUseId) {
+			const real = resultByUseId.get(item.toolUseId);
+			if (real) {
+				out.push(real);
+			} else {
+				out.push({
+					kind: "tool_result",
+					blockId: `__synthetic:${item.toolUseId}`,
+					toolUseId: item.toolUseId,
+					content: "[tool call was interrupted before producing a result \u2014 treat this as a failed call and proceed.]",
+					isError: true,
+					timestamp: item.timestamp + 1,
+				});
+			}
 		}
 	}
 	return out;
