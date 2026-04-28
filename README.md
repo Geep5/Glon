@@ -281,22 +281,25 @@ If both are configured, the OAuth credential wins.
    npm run bootstrap    # first time only — seeds programs as objects
    npm run client       # terminal 2 — the shell you'll type into
    ```
-2. **Run the login command.**
+2. **Start the OAuth flow.**
    ```
    glon> /auth login anthropic
-     Starting OAuth flow…
 
      Open this URL in your browser:
      https://claude.ai/oauth/authorize?code=true&client_id=…
 
-     Listening on http://localhost:54545/callback
-     (this command will return when the redirect arrives)
+     Sign in with the Claude account that owns your Pro/Max plan.
+     When approved, claude.ai will display a code (often as CODE#STATE).
+
+     Paste it back here with:
+       /auth login anthropic <code>
    ```
-3. **Open the URL in your browser.** Sign in with the Claude.ai account that has the Pro/Max subscription, approve the requested scopes. The browser redirects to `localhost:54545/callback` and shows "You're signed in." — you can close that tab.
-4. **Back in the shell**, the command finishes:
+3. **Open the URL in your browser.** Sign in with the Claude.ai account that has the Pro/Max subscription, approve the requested scopes. claude.ai then shows a success page with a code — typically `CODE#STATE`. Copy that whole string.
+4. **Paste it back into the shell.**
    ```
+   glon> /auth login anthropic CODE#STATE
      Logged in. Token expires in 23h 58m.
-     Stored in /Users/you/.glon/auth.json
+     Stored in /home/you/.glon/auth.json
    ```
 
 Every `/agent ask`, `/holdfast say`, compaction summary, and subagent call from now on routes through your plan.
@@ -340,9 +343,9 @@ Schema:
 
 ### Caveats
 
-- **The OAuth path mimics the official `claude` CLI.** Anthropic could tighten its server-side checks at any time. If `/auth login` succeeds but agent calls start returning 4xx, the impersonation fingerprint (User-Agent, beta strings, X-Stainless headers) probably needs a refresh — see `CLAUDE_CODE_VERSION` and the surrounding constants in `src/programs/handlers/agent.ts`.
+- **The OAuth path mimics the official `claude` CLI.** Anthropic could tighten its server-side checks at any time. If `/auth login` succeeds but agent calls start returning 4xx, the impersonation fingerprint (User-Agent, beta strings, X-Stainless headers) probably needs a refresh — see `CLAUDE_CODE_VERSION` and the surrounding constants in `src/programs/handlers/agent.ts`. If the authorize page itself rejects with HTTP 400 "invalid request format", the OAuth client config (redirect URI, scopes) has drifted — fix the constants in `src/programs/handlers/auth.ts`.
 - **It's your account on the line.** Use the OAuth path within the bounds of what your Pro/Max subscription allows. If in doubt, use an API key instead.
-- **Port 54545 must be free** during login — it's the local callback target. If something else owns it, login fails with a clear error.
+- **The pasted code is single-use.** If the token exchange fails, run `/auth login anthropic` again to get a fresh URL; the previous code is burned even on error.
 - **The daemon picks the token up automatically.** If you're running `scripts/daemon.ts` (Discord poller, reminder ticks, headless dispatch), it reads from the same `auth.json` and refreshes through the same actor. No restart needed after `/auth login`.
 
 ## Discord bridge setup

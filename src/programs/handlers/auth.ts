@@ -1,16 +1,28 @@
 // Auth — manage credentials for external LLM providers.
 //
 // First and only provider today: Anthropic via Claude Pro/Max. The OAuth
-// flow mimics the Claude Code CLI — we redirect the user to claude.ai,
-// catch the redirect on a local HTTP server, exchange the PKCE code for
-// a Bearer token, and persist it. Subsequent requests authenticate as
-// "Claude Code" so traffic bills against the user's Pro/Max subscription
-// rather than API credits.
+// flow uses Authorization Code + PKCE against claude.ai/oauth/authorize
+// with the public Claude Code client_id. We use Anthropic's hosted callback
+// (console.anthropic.com/oauth/code/callback) because that's the only
+// redirect URI registered against the public Claude Code client; localhost
+// callbacks are rejected with HTTP 400 "invalid request format". The flow
+// is two-step copy/paste:
+//
+//   /auth login anthropic           prints the PKCE URL
+//   /auth login anthropic <code>    exchanges the code from claude.ai's success page
+//
+// Subsequent requests authenticate as "Claude Code" so traffic bills against
+// the user's Pro/Max subscription rather than API credits.
 //
 // Storage is intentionally NOT in the DAG. Credentials expire and rotate;
 // committing every refresh to an append-only log is wasteful, leaks tokens
 // to peers when objects sync, and makes "logout" impossible. They live in
 // a flat JSON file under GLON_DATA, mode 0600, written atomically.
+//
+// The pending PKCE verifier between login start and finish lives in module
+// state, not actor state: the runtime hands CLI handlers a fresh per-call
+// ctx with `state: {}`, so the bundled module scope is the only place that
+// survives across two handler invocations in the same process.
 //
 // Other programs (currently /agent, in the future anything else that wants
 // to talk to Anthropic) consume credentials via the actor RPC:
@@ -24,16 +36,16 @@
 //     bundler only resolves bare requires for kernel modules, so this
 //     file MUST avoid importing from outside `runtime.js` types and
 //     `node:*` modules. Any helper used here lives in this file.
-//   - Anthropic's OAuth client_id is the public Claude Code one. If
-//     Anthropic ever introduces server-side allowlisting we'll get
-//     bounced — there is no Glon-specific client to register against.
+//   - The OAuth client_id, redirect URI, and scope set must match what
+//     Anthropic registered for the public Claude Code client. If any drifts
+//     server-side, requests are rejected before the token endpoint — fix
+//     the constants below to match the current claude code build.
 //   - The "Claude Code" version number, beta strings, and X-Stainless
 //     headers are part of the impersonation. They drift over time as the
 //     official CLI updates. Bump them in agent.ts when requests start
 //     failing with 4xx; this file owns the auth flow only.
 
 import type { ProgramDef, ProgramContext, ProgramActorDef } from "../runtime.js";
-import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
 import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync, existsSync, chmodSync } from "node:fs";
 import { join } from "node:path";
@@ -67,15 +79,12 @@ const ANTHROPIC_CLIENT_ID = Buffer.from(
 	"base64",
 ).toString("utf-8");
 const ANTHROPIC_AUTHORIZE_URL = "https://claude.ai/oauth/authorize";
-const ANTHROPIC_TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
-const ANTHROPIC_CALLBACK_PORT = 54545;
-const ANTHROPIC_CALLBACK_PATH = "/callback";
-const ANTHROPIC_SCOPES = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers";
+const ANTHROPIC_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token";
+const ANTHROPIC_REDIRECT_URI = "https://console.anthropic.com/oauth/code/callback";
+const ANTHROPIC_SCOPES = "org:create_api_key user:profile user:inference";
 
 // Refresh tokens once we're within this many ms of expiry.
 const REFRESH_BUFFER_MS = 5 * 60 * 1000;
-// Hard cap on the OAuth login interactive flow.
-const LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
 
 // ── File layout ──────────────────────────────────────────────────
 
@@ -164,80 +173,6 @@ function generatePkce(): Pkce {
 	return { verifier, challenge };
 }
 
-// ── Local callback server ───────────────────────────────────────
-
-interface CallbackResult {
-	code: string;
-	state: string;
-}
-
-/**
- * Start an HTTP server on `ANTHROPIC_CALLBACK_PORT` that resolves with the
- * first request to `ANTHROPIC_CALLBACK_PATH` carrying a `code` query param.
- * Anything else gets a 404 so a stray browser visit doesn't poison the flow.
- */
-function startCallbackServer(): { promise: Promise<CallbackResult>; close: () => void } {
-	let server: Server | null = null;
-	let resolve!: (r: CallbackResult) => void;
-	let reject!: (e: Error) => void;
-	const promise = new Promise<CallbackResult>((res, rej) => { resolve = res; reject = rej; });
-
-	server = createServer((req: IncomingMessage, res: ServerResponse) => {
-		try {
-			const url = new URL(req.url ?? "/", `http://localhost:${ANTHROPIC_CALLBACK_PORT}`);
-			if (url.pathname !== ANTHROPIC_CALLBACK_PATH) {
-				res.writeHead(404, { "Content-Type": "text/plain" });
-				res.end("Not found");
-				return;
-			}
-			const code = url.searchParams.get("code");
-			const state = url.searchParams.get("state") ?? "";
-			const error = url.searchParams.get("error");
-			if (error) {
-				res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
-				res.end(`<!doctype html><meta charset="utf-8"><title>Glon auth — error</title>
-<body style="font-family:system-ui,sans-serif;max-width:600px;margin:4em auto;padding:0 1em;">
-<h2>Authorization failed</h2>
-<p>${escapeHtml(error)}</p>
-<p>Close this tab and re-run <code>/auth login anthropic</code>.</p>
-</body>`);
-				reject(new Error(`OAuth error: ${error}`));
-				return;
-			}
-			if (!code) {
-				res.writeHead(400, { "Content-Type": "text/plain" });
-				res.end("Missing code");
-				return;
-			}
-			res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-			res.end(`<!doctype html><meta charset="utf-8"><title>Glon auth — done</title>
-<body style="font-family:system-ui,sans-serif;max-width:600px;margin:4em auto;padding:0 1em;">
-<h2>You're signed in.</h2>
-<p>You can close this tab and return to your terminal.</p>
-</body>`);
-			resolve({ code, state });
-		} catch (err) {
-			reject(err instanceof Error ? err : new Error(String(err)));
-		}
-	});
-
-	server.on("error", (err) => reject(err));
-	server.listen(ANTHROPIC_CALLBACK_PORT, "127.0.0.1");
-
-	return {
-		promise,
-		close: () => { try { server?.close(); } catch { /* best-effort */ } },
-	};
-}
-
-function escapeHtml(s: string): string {
-	return s.replace(/[&<>"']/g, (c) =>
-		c === "&" ? "&amp;" :
-		c === "<" ? "&lt;" :
-		c === ">" ? "&gt;" :
-		c === '"' ? "&quot;" : "&#39;"
-	);
-}
 
 // ── Anthropic OAuth flow ─────────────────────────────────────────
 
@@ -248,19 +183,22 @@ interface TokenResponse {
 }
 
 async function exchangeAnthropicCode(args: {
-	code: string;
-	state: string;
+	rawCode: string;
 	verifier: string;
 	redirectUri: string;
 }): Promise<AnthropicOAuthCredential> {
+	// claude.ai's success page may show the code as `CODE#STATE`; if so we
+	// forward the state. If not, the OAuth gist convention is to pass the
+	// PKCE verifier as the state value.
+	const [code, state] = args.rawCode.split("#");
 	const res = await fetch(ANTHROPIC_TOKEN_URL, {
 		method: "POST",
 		headers: { "Content-Type": "application/json", Accept: "application/json" },
 		body: JSON.stringify({
 			grant_type: "authorization_code",
 			client_id: ANTHROPIC_CLIENT_ID,
-			code: args.code,
-			state: args.state,
+			code,
+			state: state ?? args.verifier,
 			redirect_uri: args.redirectUri,
 			code_verifier: args.verifier,
 		}),
@@ -309,63 +247,42 @@ async function safeText(res: Response): Promise<string> {
 	try { return await res.text(); } catch { return `(unreadable response body)`; }
 }
 
-interface InteractiveLogin {
+/**
+ * Module-level state for an in-flight login. Not actor state: the CLI handler
+ * receives a fresh ctx with `state: {}` per invocation, so anything we need to
+ * carry between `/auth login anthropic` (start) and `/auth login anthropic
+ * <code>` (finish) lives here in the bundled module scope.
+ */
+let pendingAnthropicLogin: { verifier: string; redirectUri: string } | null = null;
+
+interface StartedLogin {
 	authUrl: string;
-	completion: Promise<AnthropicOAuthCredential>;
-	cancel: () => void;
+	verifier: string;
+	redirectUri: string;
 }
 
 /**
- * Begin the Anthropic OAuth flow. Returns immediately with the URL the
- * user must open and a promise that resolves when the callback fires.
- * The handler prints the URL synchronously so a slow `open` shell-out
- * never delays the visible prompt.
+ * Generate PKCE and return the URL the user opens in their browser. The user
+ * authenticates on claude.ai which then displays a code (or CODE#STATE) on a
+ * success page. They paste that back via `/auth login anthropic <code>`,
+ * which calls `exchangeAnthropicCode` with the verifier kept in module state.
  */
-function beginAnthropicLogin(): InteractiveLogin {
+function startAnthropicLogin(): StartedLogin {
 	const pkce = generatePkce();
-	const state = base64UrlEncode(randomBytes(16));
-	const redirectUri = `http://localhost:${ANTHROPIC_CALLBACK_PORT}${ANTHROPIC_CALLBACK_PATH}`;
 	const params = new URLSearchParams({
 		code: "true",
 		client_id: ANTHROPIC_CLIENT_ID,
 		response_type: "code",
-		redirect_uri: redirectUri,
+		redirect_uri: ANTHROPIC_REDIRECT_URI,
 		scope: ANTHROPIC_SCOPES,
 		code_challenge: pkce.challenge,
 		code_challenge_method: "S256",
-		state,
+		state: pkce.verifier,
 	});
-	const authUrl = `${ANTHROPIC_AUTHORIZE_URL}?${params.toString()}`;
-
-	const callback = startCallbackServer();
-
-	const completion = (async () => {
-		const timeoutMs = LOGIN_TIMEOUT_MS;
-		let timer: NodeJS.Timeout | undefined;
-		const timed = new Promise<never>((_, rej) => {
-			timer = setTimeout(() => rej(new Error(`OAuth login timed out after ${Math.round(timeoutMs / 1000)}s`)), timeoutMs);
-		});
-		try {
-			const result = await Promise.race([callback.promise, timed]);
-			if (result.state && result.state !== state) {
-				throw new Error("OAuth state mismatch — possible CSRF or stale tab");
-			}
-			return await exchangeAnthropicCode({
-				code: result.code,
-				state: result.state,
-				verifier: pkce.verifier,
-				redirectUri,
-			});
-		} finally {
-			if (timer) clearTimeout(timer);
-			callback.close();
-		}
-	})();
-
 	return {
-		authUrl,
-		completion,
-		cancel: () => callback.close(),
+		authUrl: `${ANTHROPIC_AUTHORIZE_URL}?${params.toString()}`,
+		verifier: pkce.verifier,
+		redirectUri: ANTHROPIC_REDIRECT_URI,
 	};
 }
 
@@ -514,31 +431,46 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 				print(dim(`  Supported: anthropic`));
 				break;
 			}
-			print(dim("  Starting OAuth flow…"));
-			let session: InteractiveLogin;
-			try {
-				session = beginAnthropicLogin();
-			} catch (err: any) {
-				print(red("  Could not start callback server: ") + (err?.message ?? String(err)));
-				print(dim(`  Is port ${ANTHROPIC_CALLBACK_PORT} already in use?`));
+			const code = args[1];
+
+			if (!code) {
+				// Step 1: print the URL, stash the verifier in module state.
+				const started = startAnthropicLogin();
+				pendingAnthropicLogin = {
+					verifier: started.verifier,
+					redirectUri: started.redirectUri,
+				};
+				print("");
+				print(`  ${bold("Open this URL in your browser:")}`);
+				print(`  ${cyan(started.authUrl)}`);
+				print("");
+				print(dim("  Sign in with the Claude account that owns your Pro/Max plan."));
+				print(dim("  When approved, claude.ai will display a code (often as CODE#STATE)."));
+				print("");
+				print(dim("  Paste it back here with:"));
+				print(`    ${cyan("/auth login anthropic <code>")}`);
 				break;
 			}
-			print("");
-			print(`  ${bold("Open this URL in your browser:")}`);
-			print(`  ${cyan(session.authUrl)}`);
-			print("");
-			print(dim(`  Listening on http://localhost:${ANTHROPIC_CALLBACK_PORT}${ANTHROPIC_CALLBACK_PATH}`));
-			print(dim("  (this command will return when the redirect arrives)"));
-			print("");
+
+			// Step 2: exchange the pasted code for a token.
+			if (!pendingAnthropicLogin) {
+				print(red("  No pending login."));
+				print(dim("  Run ") + cyan("/auth login anthropic") + dim(" first to get a URL."));
+				break;
+			}
+			const { verifier, redirectUri } = pendingAnthropicLogin;
 			try {
-				const cred = await session.completion;
+				const cred = await exchangeAnthropicCode({ rawCode: code, verifier, redirectUri });
 				const file = readAuthFile();
 				file.credentials.anthropic = cred;
 				writeAuthFile(file);
+				pendingAnthropicLogin = null;
 				print(green("  Logged in. ") + dim(`Token expires in ${formatExpiry(cred.expires)}.`));
 				print(dim("  Stored in ") + authFilePath());
 			} catch (err: any) {
 				print(red("  Login failed: ") + (err?.message ?? String(err)));
+				print(dim("  The code is single-use; restart with ") + cyan("/auth login anthropic"));
+				pendingAnthropicLogin = null;
 			}
 			break;
 		}
@@ -610,7 +542,8 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 		default: {
 			print([
 				bold("  Auth"),
-				`    ${cyan("auth login")} ${dim("[anthropic]")}            Run interactive OAuth, save token`,
+				`    ${cyan("auth login")} ${dim("[anthropic]")}            Start OAuth — prints a URL to approve in your browser`,
+				`    ${cyan("auth login")} ${dim("[anthropic] <code>")}     Finish OAuth — paste the code from claude.ai's success page`,
 				`    ${cyan("auth status")}                       Show current credential, expiry`,
 				`    ${cyan("auth refresh")} ${dim("[anthropic]")}          Force a token refresh`,
 				`    ${cyan("auth logout")} ${dim("[anthropic|all]")}        Delete stored credentials`,
