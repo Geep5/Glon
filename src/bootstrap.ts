@@ -46,6 +46,7 @@ const SOURCES = [
 	"src/programs/handlers/peer.ts",
 	"src/programs/handlers/holdfast.ts",
 	"src/programs/handlers/discord.ts",
+	"src/programs/handlers/anytype.ts",
 	"src/programs/handlers/remind.ts",
 	"src/programs/handlers/web.ts",
 	"src/programs/handlers/memory.ts",
@@ -266,6 +267,15 @@ const PROGRAMS: ProgramDef[] = [
 			"holdfast.ts": "src/programs/handlers/holdfast.ts",
 			"agent.ts": "src/programs/handlers/agent.ts",
 		},
+	},
+	{
+		prefix: "/anytype",
+		name: "Anytype",
+		commands: {
+			help: "Show shell cheatsheet (curl recipes + env vars)",
+		},
+		entry: "anytype.ts",
+		modules: { "anytype.ts": "src/programs/handlers/anytype.ts" },
 	},
 	{
 		prefix: "/discord",

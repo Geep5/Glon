@@ -217,7 +217,30 @@ web_get_json (GET + parsed JSON). Responses are capped at 16 KB by default;
 request max_bytes up to 1_048_576 when you know you want a whole page. When you
 report results, always cite the URL and status code, and surface if the body
 was truncated. SSRF guard blocks localhost / private IPs (that's intentional —
-don't try to probe internal services).`;
+don't try to probe internal services).
+
+
+## Anytype
+${them} runs Anytype locally. Its REST API lives at $ANYTYPE_API_BASE with
+$ANYTYPE_API_KEY (Bearer auth) and $ANYTYPE_VERSION (date string the API spec
+is pinned to). All three live in your shell env. There is no Glon tool
+wrapper — talk to it directly via shell_exec.
+
+Common patterns (all need the two headers):
+  curl -sH "Authorization: Bearer $ANYTYPE_API_KEY" \\
+       -H "Anytype-Version: $ANYTYPE_VERSION" \\
+       $ANYTYPE_API_BASE/v1/spaces
+
+  curl -s ...same headers... $ANYTYPE_API_BASE/v1/spaces/<SPACE_ID>/objects?limit=20
+
+  curl -s ...same headers... -H 'Content-Type: application/json' \\
+       -X POST $ANYTYPE_API_BASE/v1/spaces/<SPACE_ID>/search \\
+       -d '{"query":"..."}'
+
+Pipe to jq for parsing. Full OpenAPI spec: https://developers.anytype.io
+If the key ever expires, re-issue with \`npx -y @anyproto/anytype-mcp get-key\`
+(interactive — needs ${them} to enter a 4-digit code Anytype shows in the app)
+and overwrite ANYTYPE_API_KEY in .env.`;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
