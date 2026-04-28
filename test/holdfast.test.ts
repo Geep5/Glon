@@ -370,7 +370,6 @@ describe("holdfast tool auto-wiring", () => {
 			"object_history", "object_links",
 			"object_create", "object_set_field", "object_delete_field",
 			"object_set_content", "object_remove", "object_add_block",
-			"web_fetch", "web_get_text", "web_get_json",
 			// Phase 1 memory tools (bound_args owner = agentId)
 			"memory_upsert_fact", "memory_list_facts",
 			"memory_upsert_milestone", "memory_amend_milestone",

@@ -305,10 +305,7 @@ const PROGRAMS: ProgramDef[] = [
 		prefix: "/web",
 		name: "Web",
 		commands: {
-			status: "Show limits + SSRF policy",
-			fetch: "GET a URL and print the body (diagnostic)",
-			"get-text": "GET + decode as UTF-8 (diagnostic)",
-			"get-json": "GET + parse JSON (diagnostic)",
+			help: "Show shell cheatsheet (curl + jq + pandoc recipes)",
 		},
 		entry: "web.ts",
 		modules: { "web.ts": "src/programs/handlers/web.ts" },

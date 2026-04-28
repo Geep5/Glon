@@ -212,12 +212,18 @@ Rules of thumb:
 
 
 ## Web access
-You have HTTP tools: web_fetch (full control), web_get_text (GET + UTF-8),
-web_get_json (GET + parsed JSON). Responses are capped at 16 KB by default;
-request max_bytes up to 1_048_576 when you know you want a whole page. When you
-report results, always cite the URL and status code, and surface if the body
-was truncated. SSRF guard blocks localhost / private IPs (that's intentional —
-don't try to probe internal services).
+The shell has \`curl\`, \`jq\`, \`pandoc\`, and \`html2text\` on the path. There are
+no dedicated HTTP tools — shell_exec is the path. Cite the URL and HTTP
+status in any report; if the body was truncated, surface the byte count.
+Don't probe localhost / private IPs unless ${them} explicitly asks.
+
+Recipes:
+- JSON: \`curl -s URL | jq .\`
+- HTML → readable: \`curl -sL URL | pandoc -f html -t plain\`
+  (or \`html2text\`, or \`lynx -dump -nolist URL\`)
+- Bytes only: \`curl -sLI URL\` (HEAD; status + headers, no body)
+- Big page: \`curl -sL URL > /tmp/p && wc -c /tmp/p && head -c 16384 /tmp/p\`
+  (write to scratch first, then sample — don't blast unbounded text into a tool result)
 
 
 ## Anytype
@@ -673,65 +679,6 @@ const BASE_TOOLS: ToolSpec[] = [
 		},
 		target_prefix: "/crud",
 		target_action: "addBlock",
-	},
-
-	// ── Web (HTTP) ────────────────────────────────────────────────
-	// Shared primitive: any agent can opt in to web access. Default caps
-	// are conservative (16 KB body, 30s timeout); increase max_bytes when
-	// you know you want a full page. SSRF guard blocks localhost/private
-	// IPs unless allow_internal=true (for testing only).
-
-	{
-		name: "web_fetch",
-		description: [
-			"Make an HTTP request. Returns {status, status_text, headers, body, bytes, truncated, url_fetched}.",
-			"Always cite the URL and status in your reply. If truncated=true, tell your principal the full byte size.",
-			"Default body cap is 16 KB; pass max_bytes up to 1_048_576 when you genuinely need the full page.",
-		].join(" "),
-		input_schema: {
-			type: "object",
-			properties: {
-				url: { type: "string" },
-				method: { type: "string", description: "GET | POST | PUT | PATCH | DELETE (default GET)" },
-				headers: { type: "object", description: "header name → value" },
-				body: { description: "string body; non-strings are JSON-stringified" },
-				max_bytes: { type: "number", description: "truncate beyond this (default 16384, max 1048576)" },
-				timeout_ms: { type: "number", description: "request timeout (default 30000, max 120000)" },
-			},
-			required: ["url"],
-		},
-		target_prefix: "/web",
-		target_action: "fetch",
-	},
-	{
-		name: "web_get_text",
-		description: "Shorthand for an HTTP GET that returns UTF-8 text. Use for reading webpages, markdown, plain text. Default 16 KB cap.",
-		input_schema: {
-			type: "object",
-			properties: {
-				url: { type: "string" },
-				max_bytes: { type: "number" },
-				timeout_ms: { type: "number" },
-			},
-			required: ["url"],
-		},
-		target_prefix: "/web",
-		target_action: "get_text",
-	},
-	{
-		name: "web_get_json",
-		description: "Shorthand for an HTTP GET that parses the response as JSON. Returns {status, json, parse_error?, truncated, url_fetched}. Use for APIs.",
-		input_schema: {
-			type: "object",
-			properties: {
-				url: { type: "string" },
-				headers: { type: "object" },
-				timeout_ms: { type: "number" },
-			},
-			required: ["url"],
-		},
-		target_prefix: "/web",
-		target_action: "get_json",
 	},
 ];
 
