@@ -270,7 +270,9 @@ src/programs/
     remind.ts                scheduled actions (DM, agent-compose, email)
     discord.ts               Discord bridge: Gateway WS for online presence + REST poll for DMs -> /holdfast.ingest
     holdfast.ts              generic agent harness: identity-aware ingest + tools, configured per setup
-    web.ts                   HTTP client with SSRF guard
+    web.ts                   shell cheatsheet (curl/jq/pandoc recipes; no actor)
+    google.ts                shell cheatsheet for the gws CLI (no actor)
+    anytype.ts               shell cheatsheet for the local Anytype REST API (no actor)
     gc.ts                    reachability-based garbage collection
     accounts.ts              multi-user auth & per-object permissions
     sync.ts                  P2P synchronization & discovery

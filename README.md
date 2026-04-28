@@ -80,10 +80,11 @@ Every script auto-loads `.env` from the project root, so `ANTHROPIC_API_KEY` and
 | `/peer` | People and agents the harness talks to: identity, trust level, contact handles |
 | `/remind` | Scheduled actions: DM at a time, prompt the agent to compose then send |
 | `/discord` | I/O bridge: Gateway WebSocket for online presence + 3s REST poll for DMs, routes to `/holdfast.ingest`, posts replies back |
-| `/holdfast` | Generic agent harness: wraps an `/agent` with identity-aware ingest, memory, scheduled reminders, Google Workspace bridges, shell access, and subagent spawning. Configure once with `/holdfast setup --name <NAME>` |
-| `/web` | HTTP client (fetch, get-text, get-json) with SSRF guard |
+| `/holdfast` | Generic agent harness: wraps an `/agent` with identity-aware ingest, memory, scheduled reminders, shell access, and subagent spawning. Configure once with `/holdfast setup --name <NAME>` |
+| `/web` | Shell cheatsheet — `curl` + `jq` + `pandoc` recipes for HTTP from agents (no actor; the agent shells out directly) |
 | `/shell` | Persistent bash sessions an agent can drive |
-| `/google` | Bridge to Google Workspace CLI (calendar, gmail, drive, sheets, docs) |
+| `/google` | Shell cheatsheet for the `gws` CLI (calendar / gmail / drive / sheets / docs). Auth lives in gws's keyring; the agent invokes it via `shell_exec gws +<verb>` |
+| `/anytype` | Shell cheatsheet for the local Anytype REST API on `127.0.0.1:31009`. Optional — only useful if Anytype Desktop is running |
 | `/gc` | Garbage collection with retention policies |
 | `/accounts` | Multi-user auth and per-object permissions |
 | `/auth` | Anthropic credential management: OAuth login for Claude Pro/Max, or fall back to API key |
@@ -198,7 +199,7 @@ The 3D viewer [glonWorld](https://github.com/Geep5/glonWorld) wraps this with a 
 
 ### Example: Holdfast in action
 
-Holdfast is the generic harness program. You configure it once with a name and a principal, and it wires an `/agent` with identity-aware ingest, a peer directory, durable memory, scheduled reminders, Google Workspace bridges, shell access, and subagent spawning. Inbound messages from any source (shell, Discord, future bridges) get tagged with `[from {name} on {source}, trust={level}]` before reaching the model.
+Holdfast is the generic harness program. You configure it once with a name and a principal, and it wires an `/agent` with identity-aware ingest, a peer directory, durable memory, scheduled reminders, shell access, and subagent spawning. Inbound messages from any source (shell, Discord, future bridges) get tagged with `[from {name} on {source}, trust={level}]` before reaching the model.
 
 ```
 glon> /holdfast setup --name Graice --principal-name Grant --principal-discord 123456789012345678
@@ -424,7 +425,6 @@ test/
   remind.test.ts              scheduling and tick
   discord.test.ts             bridge polling + send
   holdfast.test.ts            ingest wrapping + setup idempotency
-  web.test.ts                 HTTP client + SSRF guard
   introspection.test.ts       agent reads its own source via /crud
 ```
 
