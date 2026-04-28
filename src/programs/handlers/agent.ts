@@ -456,7 +456,12 @@ function groupIntoTurns(items: ClassifiedItem[]): Turn[] {
 
 		if (item.kind === "user_text" || item.kind === "assistant_text") {
 			if (typeof current.content === "string") {
-				current.content = current.content + item.text;
+				// Separate distinct blocks with a blank line so the model can
+				// see them as separate inputs (e.g. a user message and a
+				// steered follow-up landing in the same turn).
+				current.content = current.content
+					? current.content + "\n\n" + item.text
+					: item.text;
 			} else {
 				current.content.push({ type: "text", text: item.text });
 			}
@@ -1500,11 +1505,184 @@ async function shouldAutoCompact(agentId: string, ctx: ProgramContext): Promise<
 	return est > config.contextWindow - config.reserveTokens;
 }
 
-async function runAsk(
+ // ── Run coordination (steering) ──────────────────────────────────
+ //
+ // A "steered" message is a user prompt that arrives while a model run for
+ // the same agent is already in flight. Spawning a parallel runAsk would
+ // race on the agent's DAG and confuse the model with overlapping context.
+ // Instead we serialize per agent: one runner owns the loop, late callers
+ // attach as steerers and wait.
+ //
+ // Glon-spirit choices:
+ //   - The queue isn't a sidecar structure. Every prompt is committed as
+ //     a normal `user_text` block via objectActor.addBlock — DAG-native,
+ //     sync'd to peers, visible to /inspect, replayable. The runner's
+ //     loop rebuilds messages from the agent's blocks each iteration, so
+ //     steered blocks naturally enter the next model call (the same
+ //     mechanism compaction relies on).
+ //   - The lock is a synchronous in-process flag (`slot.running`). In a
+ //     single-process deployment (REPL or daemon, not both racing on the
+ //     same agent) this is sound. Multi-process deployments would still
+ //     produce parallel runs, the same as before this patch — fix when
+ //     glon's kernel grows a `tryAcquire` action on objectActor.
+ //   - Per-message attribution: each pending steerer's promise resolves
+ //     with the slice of assistant text generated between their user
+ //     block and the next user block (or end of run). When two prompts
+ //     are batched into the same iteration, both callers get the same
+ //     slice — that's truthful: one model response covered both questions.
+ //   - The runner is just a steerer that also owns the loop. Their own
+ //     promise rides slot.pending alongside the others; the loop's tail
+ //     resolves everyone uniformly.
+ //
+ // Race tail: a late-arriving steerer can push to slot.pending between
+ // the runner's last `pending.length === 0` check and the lock release.
+ // We close it by re-checking pending in a synchronous loop in runAsk —
+ // single-threaded JS guarantees no microtask interleaves between the
+ // check and the `slot.running = null` write below.
+ 
+ interface PendingSteerer {
+ 	userBlockId: string;
+ 	resolve: (r: AskResult) => void;
+ 	reject: (e: Error) => void;
+ }
+ 
+ interface RunSlot {
+	running: boolean;
+ 	pending: PendingSteerer[];
+ }
+ 
+ const runSlots = new Map<string, RunSlot>();
+ 
+ function ensureSlot(agentId: string): RunSlot {
+ 	let slot = runSlots.get(agentId);
+ 	if (!slot) {
+		slot = { running: false, pending: [] };
+ 		runSlots.set(agentId, slot);
+ 	}
+ 	return slot;
+ }
+ 
+ /**
+ * True iff at least one assistant_text block exists strictly after the
+ * given user block. Used by the runner to decide whether a pending
+ * steerer still needs a model round.
+ */
+ function hasAssistantTextAfter(blocks: any[], userBlockId: string): boolean {
+ 	const idx = blocks.findIndex((b) => b.id === userBlockId);
+ 	if (idx < 0) return false;
+ 	for (let i = idx + 1; i < blocks.length; i++) {
+ 		const text = blocks[i].content?.text;
+ 		if (!text) continue;
+ 		if ((text.style ?? 0) === STYLE_ASSISTANT) return true;
+ 	}
+ 	return false;
+ }
+ 
+ /**
+ * Slice of the assistant response that addresses a given user block.
+ *
+ * Walks blocks forward from the user block. Co-drained user blocks
+ * (consecutive user_text with no intervening assistant_text) share the
+ * next assistant response — both callers get the same slice. Tool blocks
+ * are transparent. Stops at the next user_text once at least one
+ * assistant_text has been collected, so a steerer arriving after the
+ * runner's reply doesn't accidentally swallow a later, unrelated
+ * response.
+ */
+ function computeAssistantSlice(blocks: any[], userBlockId: string): string {
+ 	const idx = blocks.findIndex((b) => b.id === userBlockId);
+ 	if (idx < 0) return "";
+ 	const out: string[] = [];
+ 	let foundAssistant = false;
+ 	for (let i = idx + 1; i < blocks.length; i++) {
+ 		const text = blocks[i].content?.text;
+ 		if (!text) continue;
+ 		const style = text.style ?? 0;
+ 		if (style === STYLE_USER) {
+ 			if (foundAssistant) break;
+ 			continue;
+ 		}
+ 		if (style === STYLE_ASSISTANT) {
+ 			out.push(text.text);
+ 			foundAssistant = true;
+ 		}
+ 	}
+ 	return out.join("\n\n");
+ }
+ 
+ /**
+ * Public entry point. Owns lock acquisition and the runner-vs-steerer
+ * decision. The actual model loop lives in runLoop.
+ */
+ async function runAsk(
+ 	agentId: string,
+ 	prompt: string,
+ 	ctx: ProgramContext,
+ 	opts: { printStream?: boolean } = {},
+ ): Promise<AskResult> {
+ 	const slot = ensureSlot(agentId);
+ 	const userBlockId = ctx.randomUUID();
+ 	const actor = (ctx.client as any).objectActor.getOrCreate([agentId]);
+ 
+	// Synchronous lock decision. Single-threaded JS guarantees no other
+	// caller can interleave between the read and the write.
+	const isRunner = !slot.running;
+ 
+ 	if (!isRunner) {
+ 		// Steerer path: commit the user block, then park on a promise the
+ 		// runner will resolve from runLoop's tail.
+ 		await actor.addBlock(JSON.stringify(textBlock(userBlockId, prompt, STYLE_USER)));
+ 		return new Promise<AskResult>((resolve, reject) => {
+ 			slot.pending.push({ userBlockId, resolve, reject });
+ 		});
+ 	}
+ 
+	// Runner path. The runner does NOT join slot.pending — their result is
+	// returned directly from runLoop. Only late steerers ride pending.
+	slot.running = true;
+	await actor.addBlock(JSON.stringify(textBlock(userBlockId, prompt, STYLE_USER)));
+
+	try {
+		while (true) {
+			const result = await runLoop(agentId, userBlockId, slot, ctx, opts);
+			// Synchronous re-check: any straggler pushed during the gap between
+			// runLoop's last `pending.length === 0` check and its return? Loop
+			// again to address them. Subsequent runLoop calls have nothing to
+			// do for the runner (their result is final after the first call).
+			if (slot.pending.length === 0) return result;
+		}
+	} catch (err: any) {
+		// Propagate the error to any steerer waiting on a result and to the
+		// runner's caller (via this throw).
+		const stragglers = slot.pending.splice(0);
+		for (const p of stragglers) p.reject(err instanceof Error ? err : new Error(String(err)));
+		throw err;
+	} finally {
+		slot.running = false;
+		if (slot.pending.length === 0) runSlots.delete(agentId);
+	}
+ }
+ 
+ /**
+ * Inner model loop. Drives one or more model calls until:
+ *   - the model produced an assistant text without tool_use, AND
+ *   - every pending steerer has assistant text after their user block
+ *     (i.e. the model has spoken to all queued questions).
+ *
+ * The loop rebuilds messages from the agent's DAG blocks at the top of
+ * every iteration. Steered user blocks added between iterations are
+ * therefore picked up automatically — no in-memory queue drain needed.
+ *
+ * On exit, every entry in slot.pending is removed and resolved with its
+ * computed assistant slice (which may be the empty string if the model
+ * never spoke after that user block — truthful and observable).
+ */
+async function runLoop(
 	agentId: string,
-	prompt: string,
+	originalUserBlockId: string,
+	slot: RunSlot,
 	ctx: ProgramContext,
-	opts: { printStream?: boolean } = {},
+	opts: { printStream?: boolean },
 ): Promise<AskResult> {
 	const store = ctx.store as any;
 	const client = ctx.client as any;
@@ -1513,7 +1691,9 @@ async function runAsk(
 	let compactedBeforeAsk = false;
 	let compactedOnOverflow = false;
 
-	// Pre-flight: auto-compact if threshold tripped.
+	// Pre-flight auto-compact. Re-evaluates current context size every time
+	// runLoop is invoked; if the runner re-enters the loop for a late
+	// straggler (extremely rare race), the second call gets a fresh check.
 	if (await shouldAutoCompact(agentId, ctx)) {
 		const res = await doCompact(agentId, undefined, ctx);
 		compactedBeforeAsk = res.compacted;
@@ -1529,34 +1709,111 @@ async function runAsk(
 	const temperature = tempStr ? parseFloat(tempStr) : undefined;
 	const tools = extractTools(state.fields?.["tools"]);
 
-	const view = buildConversationView(state.blocks ?? [], state.blockProvenance ?? {});
-	const memoryDigest = await resolveMemoryDigest(agentId, ctx);
-	let effectiveSystem = buildEffectiveSystem(baseSystem, view.systemExtension, memoryDigest);
-	const messages: { role: string; content: string | AnthropicContent[] }[] = view.turns.map((t) => ({
+	const actor = client.objectActor.getOrCreate([agentId]);
+
+	// Initial messages: compaction-aware translation of every block already
+	// in the DAG. From this point we maintain `messages` incrementally so
+	// the temporal order the model sees mirrors the order the runner
+	// produced it — not the order the DAG happens to record (steered
+	// user blocks can land between a model call's submit and its response,
+	// so DAG-order rebuilds would interleave them incorrectly).
+	const initialView = buildConversationView(state.blocks ?? [], state.blockProvenance ?? {});
+	const initialMemoryDigest = await resolveMemoryDigest(agentId, ctx);
+	let effectiveSystem = buildEffectiveSystem(baseSystem, initialView.systemExtension, initialMemoryDigest);
+	const messages: { role: string; content: string | AnthropicContent[] }[] = initialView.turns.map((t) => ({
 		role: t.role,
 		content: t.content,
 	}));
-	messages.push({ role: "user", content: prompt });
 
-	const actor = client.objectActor.getOrCreate([agentId]);
-	await actor.addBlock(JSON.stringify(textBlock(randomUUID(), prompt, STYLE_USER)));
+	// Track every block already represented in `messages`. Anything in the
+	// DAG that isn't in this set at the top of an iteration is new — in
+	// practice that means a steered user_text block from another caller.
+	const incorporatedBlockIds = new Set<string>();
+	for (const b of state.blocks ?? []) incorporatedBlockIds.add(b.id);
+
+	// Per-iteration attribution. We track which iteration first submitted each
+	// pending user_block to the model, and the assistant text emitted at each
+	// iteration. At run-end, every pending caller's slice is determined by
+	// the first text-emitting iteration whose batch (users submitted since
+	// the previous text-emitting iteration) includes them. This produces:
+	//   - co-drained users (submitted in same batch) share the response,
+	//   - tool-loop interruptions: the steerer's batch extends through tool
+	//     iterations until the model finally emits text addressing all of them,
+	//   - the original caller's slice is computed by the same rule.
+	const firstSubmittedAtIter = new Map<string, number>();
+	const iterationTexts = new Map<number, string>();
+	const addressedUserBlockIds = new Set<string>();
 
 	let iterations = 0;
 	let toolCalls = 0;
 	let totalInputTokens = 0;
 	let totalOutputTokens = 0;
-	let finalText = "";
+	let lastRoundHadTools = false;
 
 	while (true) {
 		if (iterations >= MAX_TOOL_ITERATIONS) {
 			throw new Error(`Tool-use loop exceeded ${MAX_TOOL_ITERATIONS} iterations`);
 		}
-		// Cancel check (honoured by spawned subagents whose parent called `/agent.cancel`).
-		const curState = await store.get(agentId);
-		if (curState && extractString(curState.fields?.cancel_requested) === "true") {
+
+		// Cancel signal (set externally via /agent.cancel or by a parent
+		// during a subagent run).
+		state = await store.get(agentId);
+		if (state && extractString(state.fields?.cancel_requested) === "true") {
 			throw new Error("cancelled: cancel_requested was set on this agent");
 		}
+
+		// Drain new user_text blocks committed since last iteration. These
+		// are steered messages from other callers — their addBlock landed in
+		// the DAG, but they aren't in `messages` yet. Append as a fresh user
+		// turn (or merge with the previous user turn if that turn was also
+		// pure user content; this happens when a steerer arrives before the
+		// runner has emitted any assistant_text).
+		const newUserBlocks: { id: string; text: string }[] = [];
+		for (const block of state?.blocks ?? []) {
+			if (incorporatedBlockIds.has(block.id)) continue;
+			const text = block.content?.text;
+			if (!text) continue;
+			if ((text.style ?? 0) !== STYLE_USER) continue;
+			newUserBlocks.push({ id: block.id, text: text.text });
+		}
+		if (newUserBlocks.length > 0) {
+			const joined = newUserBlocks.map((b) => b.text).join("\n\n");
+			const last = messages[messages.length - 1];
+			if (last && last.role === "user" && typeof last.content === "string") {
+				last.content = last.content + "\n\n" + joined;
+			} else if (last && last.role === "user" && Array.isArray(last.content)) {
+				last.content.push({ type: "text", text: joined });
+			} else {
+				messages.push({ role: "user", content: joined });
+			}
+			for (const b of newUserBlocks) incorporatedBlockIds.add(b.id);
+		}
+
+		// Decide whether another model round is needed: only break if no
+		// pending steerer is still waiting on the model to address them.
+		if (!lastRoundHadTools) {
+			// Runner needs to be addressed too. Their userBlockId isn't in
+			// slot.pending, but we still owe them a slice.
+			const runnerNeedsAnswer = !addressedUserBlockIds.has(originalUserBlockId);
+			const hasUnaddressed = runnerNeedsAnswer || slot.pending.some(
+				(p) => !addressedUserBlockIds.has(p.userBlockId),
+			);
+			if (!hasUnaddressed) break;
+		}
+
 		iterations++;
+
+		// Record submission iteration. The runner's userBlockId is incorporated
+		// from the initial view; we ensure it's tracked here. Steerers added
+		// to slot.pending are also tracked.
+		if (!firstSubmittedAtIter.has(originalUserBlockId)) {
+			firstSubmittedAtIter.set(originalUserBlockId, iterations);
+		}
+		for (const p of slot.pending) {
+			if (!firstSubmittedAtIter.has(p.userBlockId) && incorporatedBlockIds.has(p.userBlockId)) {
+				firstSubmittedAtIter.set(p.userBlockId, iterations);
+			}
+		}
 
 		let streamBuffer = "";
 		const canStream = opts.printStream && tools.length === 0;
@@ -1574,19 +1831,20 @@ async function runAsk(
 			result = await callAnthropic(messages, effectiveSystem, model, temperature, tools.length > 0 ? tools : undefined, onChunk, undefined, ctx);
 		} catch (err: any) {
 			if (iterations === 1 && !compactedOnOverflow && isContextOverflowError(err)) {
-				// Overflow recovery: compact once and retry.
+				// Overflow recovery: compact, then rebuild messages from the
+				// new (smaller) DAG view and retry. Steered user blocks added
+				// before this point are preserved — they're still in the DAG
+				// and the rebuild picks them up.
 				await doCompact(agentId, undefined, ctx);
 				compactedOnOverflow = true;
 				state = await store.get(agentId);
 				const reView = buildConversationView(state.blocks ?? [], state.blockProvenance ?? {});
-				// Memory digest may have grown (compaction could have extracted new facts); re-resolve.
 				const reDigest = await resolveMemoryDigest(agentId, ctx);
 				effectiveSystem = buildEffectiveSystem(baseSystem, reView.systemExtension, reDigest);
-				// Rebuild messages (already persisted the user prompt once — don't persist again).
 				messages.length = 0;
 				for (const t of reView.turns) messages.push({ role: t.role, content: t.content });
-				// Rehydrate the new-prompt at the end (it's already a block; but we need it in-flight).
-				// The new prompt IS in reView.turns as the last user turn, so no extra push.
+				incorporatedBlockIds.clear();
+				for (const b of state.blocks ?? []) incorporatedBlockIds.add(b.id);
 				iterations--;
 				continue;
 			}
@@ -1605,19 +1863,41 @@ async function runAsk(
 			(c): c is Extract<AnthropicContent, { type: "tool_use" }> => c.type === "tool_use",
 		);
 
+		// Append the assistant message (text + tool_uses) to local messages.
+		if (result.content.length > 0) {
+			messages.push({ role: "assistant", content: result.content });
+		}
+
+		// Persist to DAG and record text-emitting iterations for attribution.
 		if (assistantText) {
-			await actor.addBlock(JSON.stringify(textBlock(randomUUID(), assistantText, STYLE_ASSISTANT)));
+			const id = randomUUID();
+			await actor.addBlock(JSON.stringify(textBlock(id, assistantText, STYLE_ASSISTANT)));
+			incorporatedBlockIds.add(id);
+			iterationTexts.set(iterations, assistantText);
+			// Mark every user (runner + pending) submitted up to this iteration
+			// as addressed. They share this iteration's text if they were
+			// submitted since the previous text-emitting iteration.
+			for (const [blockId, fi] of firstSubmittedAtIter) {
+				if (fi <= iterations) addressedUserBlockIds.add(blockId);
+			}
 		}
 		for (const tu of toolUses) {
-			await actor.addBlock(JSON.stringify(toolUseBlock(randomUUID(), tu.id, tu.name, tu.input)));
+			const id = randomUUID();
+			await actor.addBlock(JSON.stringify(toolUseBlock(id, tu.id, tu.name, tu.input)));
+			incorporatedBlockIds.add(id);
 		}
 
 		if (toolUses.length === 0) {
-			finalText = assistantText;
-			break;
+			lastRoundHadTools = false;
+			// Loop's top will recheck pending and break if all are addressed,
+			// or drain a steered prompt and run another iteration.
+			continue;
 		}
 
-		const toolResults: Extract<AnthropicContent, { type: "tool_result" }>[] = [];
+		// Run tools sequentially. Each tool_result is appended to a fresh
+		// user-role turn (per the Anthropic API contract: tool_result blocks
+		// must follow their corresponding tool_use in the next user turn).
+		const toolResults: AnthropicContent[] = [];
 		for (const tu of toolUses) {
 			toolCalls++;
 			const tool = tools.find((t) => t.name === tu.name);
@@ -1629,7 +1909,7 @@ async function runAsk(
 			} else {
 				try {
 					const dispatchInput = tool.bound_args && Object.keys(tool.bound_args).length > 0
-						? { ...(tu.input ?? {}), ...tool.bound_args }   // bound_args override model input
+						? { ...(tu.input ?? {}), ...tool.bound_args }
 						: tu.input;
 					const raw = await ctx.dispatchProgram(tool.target_prefix, tool.target_action, [dispatchInput]);
 					contentText = typeof raw === "string" ? raw : JSON.stringify(raw, null, 2);
@@ -1647,15 +1927,64 @@ async function runAsk(
 				content: contentText,
 				is_error: isError,
 			});
-			await actor.addBlock(JSON.stringify(toolResultBlock(randomUUID(), tu.id, contentText, isError)));
+			const id = randomUUID();
+			await actor.addBlock(JSON.stringify(toolResultBlock(id, tu.id, contentText, isError)));
+			incorporatedBlockIds.add(id);
 		}
-
-		messages.push({ role: "assistant", content: result.content });
 		messages.push({ role: "user", content: toolResults });
+		lastRoundHadTools = true;
 	}
 
-	return { finalText, iterations, toolCalls, inputTokens: totalInputTokens, outputTokens: totalOutputTokens, compactedBeforeAsk, compactedOnOverflow };
+	// Resolve every pending caller with their slice. Attribution rule:
+	// each user's batch is iterations [fi, nextGreaterFi), where fi is the
+	// iteration that first submitted them and nextGreaterFi is the first
+	// iteration submitting a strictly later user. The slice is the LAST
+	// text-emitting iteration inside that batch (so tool-loop runs that
+	// emit text in their final iteration give the caller the final answer,
+	// not the partial preamble). Co-drained users (same fi) share the
+	// batch and therefore the same slice.
+	const sortedTextIters = [...iterationTexts.keys()].sort((a, b) => a - b);
+	const userToTextIter = new Map<string, number>();
+	for (const [userId, fi] of firstSubmittedAtIter) {
+		let nextGreaterFi = Infinity;
+		for (const otherFi of firstSubmittedAtIter.values()) {
+			if (otherFi > fi && otherFi < nextGreaterFi) nextGreaterFi = otherFi;
+		}
+		let last = -1;
+		for (const ti of sortedTextIters) {
+			if (ti >= fi && ti < nextGreaterFi) last = ti;
+		}
+		if (last !== -1) userToTextIter.set(userId, last);
+	}
+
+	const metrics = {
+		iterations,
+		toolCalls,
+		inputTokens: totalInputTokens,
+		outputTokens: totalOutputTokens,
+		compactedBeforeAsk,
+		compactedOnOverflow,
+	};
+
+	const pending = slot.pending.splice(0);
+	for (const p of pending) {
+		const textIter = userToTextIter.get(p.userBlockId);
+		const finalText = textIter !== undefined ? iterationTexts.get(textIter) ?? "" : "";
+		p.resolve({ ...metrics, finalText });
+	}
+
+	// Return the runner's own slice. The runner's userBlockId was tracked in
+	// firstSubmittedAtIter at the start of iteration 1, so it has an entry
+	// in userToTextIter unless the model never emitted text — in which
+	// case the runner gets the empty string (truthful and observable).
+	const runnerTextIter = userToTextIter.get(originalUserBlockId);
+	const runnerFinalText = runnerTextIter !== undefined
+		? iterationTexts.get(runnerTextIter) ?? ""
+		: "";
+	return { ...metrics, finalText: runnerFinalText };
 }
+
+
 
 // ── Handler (CLI subcommands) ────────────────────────────────────
 
@@ -2979,6 +3308,11 @@ export const __test = {
 	countDescendants,
 	doRecall,
 	renderBlockForRecall,
+	// Test-only: clear in-memory run coordination state. Tests using
+	// mockHangForever leave runners suspended on never-resolving promises;
+	// clearing runSlots between such tests prevents cross-test interference
+	// in node:test's async tracking.
+	_resetRunSlots: () => runSlots.clear(),
 	Semaphore,
 	maxSpawnDepth,
 };

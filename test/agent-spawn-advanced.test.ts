@@ -129,7 +129,10 @@ function mockPayloadsInOrder(payloads: unknown[]) {
 	};
 }
 
-function restore() { delete (globalThis as any).__ANTHROPIC_FETCH; }
+function restore() {
+	delete (globalThis as any).__ANTHROPIC_FETCH;
+	__test._resetRunSlots();
+}
 
 function wireSubmit(h: ReturnType<typeof createHarness>) {
 	h.onDispatch("/agent", "submitResult", async (_a, args) => __test.doSubmitResult(args[0] as any, h.ctx));
