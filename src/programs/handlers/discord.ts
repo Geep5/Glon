@@ -77,7 +77,7 @@ async function discord(method: string, path: string, body?: unknown): Promise<an
 
 	const headers: Record<string, string> = {
 		"Authorization": `Bot ${token()}`,
-		"User-Agent": "Glon/Holdfast (+https://github.com/Geep5/Glon)",
+		"User-Agent": "Glon/Holdfast (+https://github.com/Geep5/glon)",
 	};
 	if (body !== undefined) headers["Content-Type"] = "application/json";
 
@@ -202,7 +202,7 @@ export function snowflakeTimestampMs(id: string): number {
 // Watermarks and the peer → DM channel map live on the /discord program
 // object in the DAG, keyed by `PERSISTED_STATE_FIELD`. Without this, a
 // daemon restart within `FIRST_POLL_RECENCY_MS` of any inbound would
-// re-ingest the same user message and Gracie would answer it twice.
+// re-ingest the same user message and the agent would answer it twice.
 //
 // The field holds a single JSON string, refreshed after every poll cycle
 // only when the snapshot actually changed. We never persist gateway state
@@ -354,7 +354,12 @@ async function runPoll(state: Record<string, any>, ctx: ProgramContext): Promise
 // the daemon is restarted.
 
 const GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json";
-const GATEWAY_PRESENCE_ACTIVITY_NAME = "Grant's Companion";
+// Bot presence shown next to the bot's name in Discord ("<bot> · <text>").
+// Set GLON_DISCORD_PRESENCE in env to override; set it to an empty string to
+// suppress the activity entirely. Activity type 4 (Custom status) is the
+// least overbearing — it just shows the text without a "Playing"/"Listening"
+// verb in front.
+const GATEWAY_PRESENCE_ACTIVITY_NAME = process.env.GLON_DISCORD_PRESENCE ?? "glon";
 const GATEWAY_PRESENCE_ACTIVITY_TYPE = 4; // 4 = Custom status
 
 // Gateway opcodes — see https://discord.com/developers/docs/events/gateway-events
@@ -419,9 +424,9 @@ export function buildIdentifyPayload(token: string): unknown {
 				status: "online",
 				since: null,
 				afk: false,
-				activities: [
-					{ name: GATEWAY_PRESENCE_ACTIVITY_NAME, type: GATEWAY_PRESENCE_ACTIVITY_TYPE },
-				],
+				activities: GATEWAY_PRESENCE_ACTIVITY_NAME
+					? [{ name: GATEWAY_PRESENCE_ACTIVITY_NAME, type: GATEWAY_PRESENCE_ACTIVITY_TYPE }]
+					: [],
 			},
 		},
 	};

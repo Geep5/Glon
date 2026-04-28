@@ -1,7 +1,8 @@
 // Peer — identity + trust for every human and agent the harness talks to.
 //
-// A peer is a first-class Glon object (type "peer"). Grant, Grant's mom,
-// FIG, future external bots — all peers, unified under one abstraction.
+// A peer is a first-class Glon object (type "peer"). The principal, their
+// family, trusted contacts, external agents — all peers, unified under one
+// abstraction.
 // Because peers are Glon objects, they sync across instances and carry
 // replayable history (when was trust bumped, when was a note added).
 //

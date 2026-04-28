@@ -1,6 +1,6 @@
 // Holdfast — the generic agent harness.
 //
-// Holdfast is the structural part of running a Gracie-class agent on Glon:
+// Holdfast is the structural part of running an LLM-driven assistant on Glon:
 // identity-aware ingest, a peer directory wired in, durable memory tools,
 // scheduled reminders, Google Workspace bridges, shell access, and subagent
 // spawning. It does not have an opinion about who the agent is — you give

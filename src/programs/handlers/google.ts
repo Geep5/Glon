@@ -1,6 +1,6 @@
 // Google — bridge to the Google Workspace CLI (`gws`).
 //
-// Wraps gws's +helper commands as typed actor actions so Gracie can reach
+// Wraps gws's +helper commands as typed actor actions so the agent can reach
 // Calendar, Gmail, Drive, Sheets, and Docs via normal tool calls. gws itself
 // handles OAuth, token refresh, scope gating, and encrypted credential
 // storage in the OS keyring — we just spawn it.
@@ -19,8 +19,8 @@
 //
 // Why a subprocess and not a Node SDK: gws already solves auth, refresh,
 // keyring, scopes, and the entire discovery-driven command surface. Using
-// googleapis in-process would duplicate that work and fork Gracie's auth
-// state from Grant's own gws use. The subprocess boundary is correct here.
+// googleapis in-process would duplicate that work and fork the agent's auth
+// state from the principal's own gws use. The subprocess boundary is correct here.
 
 import type { ProgramDef, ProgramContext, ProgramActorDef } from "../runtime.js";
 import { spawn } from "node:child_process";
@@ -170,13 +170,13 @@ function asObj(input: unknown): Record<string, unknown> {
 
 /** Mutation actions must pass either `confirmed: true` (execute) or
  *  `dry_run: true` (preview via --dry-run). Neither → error the model can
- *  observe and act on (it should announce to Grant first, then retry). */
+ *  observe and act on (it should announce to the principal first, then retry). */
 function resolveMutationMode(input: Record<string, unknown>, actionName: string): "execute" | "dry_run" {
 	if (input.confirmed === true) return "execute";
 	if (input.dry_run === true) return "dry_run";
 	throw new Error(
 		`${actionName}: mutating action requires either confirmed=true (execute) or dry_run=true (preview). ` +
-		`Announce to Grant what you're about to do, then retry with confirmed=true.`,
+		`Announce to the principal what you're about to do, then retry with confirmed=true.`,
 	);
 }
 
@@ -431,7 +431,7 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 				`    ${cyan("google agenda")} ${dim("[--today|--tomorrow|--week|--days N] [--calendar NAME]")}`,
 				`    ${cyan("google triage")} ${dim("[--max N] [--label L] [--query Q]")}`,
 				"",
-				dim("  Full action list (via dispatch from Gracie or programs):"),
+				dim("  Full action list (via dispatch from the agent or programs):"),
 				dim("    calendar_agenda, calendar_list_events, calendar_insert, calendar_delete_event"),
 				dim("    gmail_triage, gmail_search, gmail_read, gmail_send, gmail_reply"),
 				dim("    drive_search, drive_get"),

@@ -4,7 +4,7 @@
  *   npx tsx scripts/dispatch.ts <prefix> <action> '<argsJson>'
  *
  * Example:
- *   npx tsx scripts/dispatch.ts /gracie bootstrap '{"grantName":"Grant"}'
+ *   npx tsx scripts/dispatch.ts /holdfast setup '{"name":"Gracie","principalName":"Grant"}'
  *   npx tsx scripts/dispatch.ts /discord send '[{"peer_id":"abc","text":"hi"}]'
  *
  * argsJson is either a JSON array (positional args) or any other JSON
