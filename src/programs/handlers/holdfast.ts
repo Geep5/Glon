@@ -343,6 +343,7 @@ interface SetupResult {
 	createdPeer: boolean;
 	wiredTools: string[];
 	skippedTools: { name: string; reason: string }[];
+	prunedTools: string[];
 }
 
 // ── Tool registry ────────────────────────────────────────────────
@@ -883,7 +884,7 @@ function buildHarnessTools(agentId: string): ToolSpec[] {
 	];
 }
 
-async function autoWireTools(agentId: string, ctx: ProgramContext): Promise<{ wired: string[]; skipped: { name: string; reason: string }[] }> {
+async function autoWireTools(agentId: string, ctx: ProgramContext): Promise<{ wired: string[]; skipped: { name: string; reason: string }[]; pruned: string[] }> {
 	const wired: string[] = [];
 	const skipped: { name: string; reason: string }[] = [];
 	const tools = buildHarnessTools(agentId);
@@ -895,7 +896,35 @@ async function autoWireTools(agentId: string, ctx: ProgramContext): Promise<{ wi
 			skipped.push({ name: spec.name, reason: err?.message ?? String(err) });
 		}
 	}
-	return { wired, skipped };
+
+	// Prune stale tools: registerTool is upsert-only by name, so when the
+	// authoritative tool list shrinks (for example when a /web wrapper is
+	// removed in favour of shell_exec), the old entries linger in the agent's
+	// `tools` map and the model is told to call programs that no longer
+	// exist. Diff against the current map and rewrite without the strays.
+	const pruned: string[] = [];
+	try {
+		const store = ctx.store as any;
+		const client = ctx.client as any;
+		const agent = await store.get(agentId);
+		const entries = agent?.fields?.tools?.mapValue?.entries ?? {};
+		const keep = new Set(wired);
+		const keptEntries: Record<string, unknown> = {};
+		for (const [k, v] of Object.entries(entries)) {
+			if (keep.has(k)) keptEntries[k] = v;
+			else pruned.push(k);
+		}
+		if (pruned.length > 0) {
+			const newToolsValue = { mapValue: { entries: keptEntries, kind: "mapValue" }, kind: "mapValue" };
+			const actor = client.objectActor.getOrCreate([agentId]);
+			await actor.setField("tools", JSON.stringify(newToolsValue));
+		}
+	} catch {
+		// Best-effort prune. If the store call fails (no client, transient), the
+		// next refresh will catch it.
+	}
+
+	return { wired, skipped, pruned };
 }
 
 interface HarnessState {
@@ -950,7 +979,7 @@ async function doSetup(opts: SetupOpts, ctx: ProgramContext): Promise<SetupResul
 		await agentActor.setField("principal", JSON.stringify(linkVal(principalPeerId, "principal")));
 	}
 
-	const { wired, skipped } = await autoWireTools(agentId, ctx);
+	const { wired, skipped, pruned } = await autoWireTools(agentId, ctx);
 
 	return {
 		agentId,
@@ -960,6 +989,7 @@ async function doSetup(opts: SetupOpts, ctx: ProgramContext): Promise<SetupResul
 		createdPeer,
 		wiredTools: wired,
 		skippedTools: skipped,
+		prunedTools: pruned,
 	};
 }
 
@@ -968,6 +998,7 @@ interface RefreshResult {
 	systemChanged: boolean;
 	wiredTools: string[];
 	skippedTools: { name: string; reason: string }[];
+	prunedTools: string[];
 }
 
 /**
@@ -1003,8 +1034,8 @@ async function doRefreshPrompt(state: HarnessState, ctx: ProgramContext): Promis
 		systemChanged = true;
 	}
 
-	const { wired, skipped } = await autoWireTools(state.agentId, ctx);
-	return { agentId: state.agentId, systemChanged, wiredTools: wired, skippedTools: skipped };
+	const { wired, skipped, pruned } = await autoWireTools(state.agentId, ctx);
+	return { agentId: state.agentId, systemChanged, wiredTools: wired, skippedTools: skipped, prunedTools: pruned };
 }
 
 async function ensureBootstrapped(
@@ -1206,7 +1237,7 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 				print(bold(green(`  Holdfast refreshed — ${info.agentName}`)));
 				print(dim(`  agent:  ${info.agentId}`));
 				print(dim(`  system: ${result.systemChanged ? green("rewritten") : dim("unchanged")}`));
-				print(dim(`  tools:  ${result.wiredTools.length} wired, ${result.skippedTools.length} skipped`));
+				print(dim(`  tools:  ${result.wiredTools.length} wired, ${result.skippedTools.length} skipped, ${result.prunedTools.length} pruned`));
 			} catch (err: any) {
 				print(red("  Error: ") + (err?.message ?? String(err)));
 			}

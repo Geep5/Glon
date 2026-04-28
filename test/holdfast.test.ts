@@ -436,4 +436,33 @@ describe("holdfast tool auto-wiring", () => {
 			assert.equal(reg.agentId, first.agentId);
 		}
 	});
+	it("refresh-prompt prunes stale tool entries from agent.fields.tools", async () => {
+		const h = createHarness();
+		const setup = holdfastProgram.actor!.actions!.setup;
+		const result = await setup(h.ctx, { name: "Graice" }) as { agentId: string; wiredTools: string[] };
+
+		// Inject two stale tool entries that are NOT in the canonical wired list.
+		// These simulate tools that were wired by a previous version of holdfast
+		// (e.g. google_calendar_agenda) and never cleaned up.
+		const agent = h.objects.get(result.agentId)!;
+		const staleEntries: Record<string, any> = {};
+		for (const name of result.wiredTools) {
+			staleEntries[name] = stringVal("existing");
+		}
+		staleEntries["stale_legacy_tool"] = stringVal("this should be pruned");
+		staleEntries["another_stale_one"] = stringVal("and so should this");
+		agent.fields.tools = mapVal(staleEntries);
+
+		const refresh = holdfastProgram.actor!.actions!.refreshPrompt;
+		const refreshed = await refresh(h.ctx) as { wiredTools: string[]; prunedTools: string[] };
+
+		const keys = Object.keys((agent.fields.tools as any).mapValue.entries).sort();
+		assert.ok(!keys.includes("stale_legacy_tool"), "stale_legacy_tool should be pruned");
+		assert.ok(!keys.includes("another_stale_one"), "another_stale_one should be pruned");
+		for (const wired of refreshed.wiredTools) {
+			assert.ok(keys.includes(wired), `wired tool ${wired} survives the prune`);
+		}
+		assert.deepEqual(refreshed.prunedTools.sort(), ["another_stale_one", "stale_legacy_tool"]);
+	});
+
 });

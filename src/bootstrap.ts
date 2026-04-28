@@ -369,6 +369,19 @@ function kindOf(file: string): string {
 	return KIND_MAP[extname(file)] ?? "unknown";
 }
 
+// Canonicalize a fields object so insertion-order doesn't change equality.
+// Used by the bootstrap loop to compare desired vs stored shapes byte-for-byte.
+function canonicalFields(value: unknown): string {
+	return JSON.stringify(value, function sortKeys(_k, v) {
+		if (v && typeof v === "object" && !Array.isArray(v)) {
+			const sorted: Record<string, unknown> = {};
+			for (const k of Object.keys(v as Record<string, unknown>).sort()) sorted[k] = (v as Record<string, unknown>)[k];
+			return sorted;
+		}
+		return v;
+	});
+}
+
 async function main() {
 	const FORCE = process.argv.includes("--force");
 	const projectRoot = resolve(import.meta.dirname ?? ".", "..");
@@ -405,13 +418,7 @@ async function main() {
 		const name = basename(relPath);
 		const kind = kindOf(relPath);
 
-		// Idempotency: skip (or update on --force) if an object of this type+name already exists.
 		const existingSourceId = existingByKey.get(`${kind}::${name}`);
-		if (existingSourceId && !FORCE) {
-			console.log(`  EXIST ${relPath.padEnd(28)} ${kind.padEnd(12)} ${existingSourceId.slice(0, 12)}...`);
-			skipped++;
-			continue;
-		}
 
 		let raw: Buffer;
 		try {
@@ -432,25 +439,38 @@ async function main() {
 			size: intVal(raw.byteLength),
 		});
 
+		// Content-aware idempotency: skip only when the on-disk content matches
+		// what's already stored. --force rewrites unconditionally (useful when
+		// you've manually corrupted an object and want a clean reseed).
+		if (existingSourceId && !FORCE) {
+			const existing = await store.get(existingSourceId);
+			const existingContent = String(existing?.content ?? "");
+			if (existingContent === contentBase64) {
+				console.log(`  UNCHANGED ${relPath.padEnd(24)} ${kind.padEnd(12)} ${existingSourceId.slice(0, 12)}...`);
+				skipped++;
+				continue;
+			}
+		}
+
 		try {
 			if (existingSourceId) {
-				// Force-update: overwrite content and size/lines fields on the existing object.
 				const actor = client.objectActor.getOrCreate([existingSourceId]);
 				await actor.setContent(contentBase64);
 				await actor.setFields(JSON.stringify({
 					lines: intVal(lineCount),
 					size: intVal(raw.byteLength),
 				}));
-				console.log(`  UPD   ${relPath.padEnd(28)} ${kind.padEnd(12)} ${existingSourceId.slice(0, 12)}...`);
+				const tag = FORCE ? "FORCED" : "UPDATE";
+				console.log(`  ${tag.padEnd(9)} ${relPath.padEnd(24)} ${kind.padEnd(12)} ${existingSourceId.slice(0, 12)}...`);
 				updated++;
 			} else {
 				const id = await store.create(kind, fieldsJson, contentBase64);
-				console.log(`  OK    ${relPath.padEnd(28)} ${kind.padEnd(12)} ${id.slice(0, 12)}...`);
+				console.log(`  CREATE    ${relPath.padEnd(24)} ${kind.padEnd(12)} ${id.slice(0, 12)}...`);
 				created++;
 			}
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
-			console.log(`  ERR   ${relPath} — ${msg}`);
+			console.log(`  ERR       ${relPath} \u2014 ${msg}`);
 			skipped++;
 		}
 	}
@@ -460,23 +480,17 @@ async function main() {
 
 	for (const prog of PROGRAMS) {
 		const existingProgId = existingByKey.get(`program::${prog.prefix}`);
-		if (existingProgId && !FORCE) {
-			console.log(`  EXIST ${prog.prefix.padEnd(10)} ${prog.name.padEnd(16)} ${existingProgId.slice(0, 12)}...`);
-			skipped++;
-			continue;
-		}
 
-		// Load all module files and build the manifest
+		// Load all module files and build the manifest.
 		const moduleEntries: Record<string, ReturnType<typeof stringVal>> = {};
 		let allOk = true;
 		for (const [filename, relPath] of Object.entries(prog.modules)) {
 			const absPath = resolve(projectRoot, relPath);
 			try {
 				const raw = readFileSync(absPath);
-				// Store module source as base64 in the manifest map
 				moduleEntries[filename] = stringVal(raw.toString("base64"));
 			} catch {
-				console.log(`  SKIP  ${prog.prefix} (missing ${relPath})`);
+				console.log(`  SKIP      ${prog.prefix} (missing ${relPath})`);
 				allOk = false;
 				break;
 			}
@@ -498,9 +512,22 @@ async function main() {
 			}),
 		});
 
+		// Content-aware idempotency: compare the full fields shape (commands +
+		// manifest + name) against what's already stored. Only skip when nothing
+		// changed; --force rewrites unconditionally.
+		if (existingProgId && !FORCE) {
+			const existing = await store.get(existingProgId);
+			const existingFields = canonicalFields(existing?.fields);
+			const desiredFields = canonicalFields(JSON.parse(fieldsJson));
+			if (existingFields === desiredFields) {
+				console.log(`  UNCHANGED ${prog.prefix.padEnd(10)} ${prog.name.padEnd(16)} ${existingProgId.slice(0, 12)}...`);
+				skipped++;
+				continue;
+			}
+		}
+
 		try {
 			if (existingProgId) {
-				// Force-update: overwrite commands + manifest on the existing program object.
 				const actor = client.objectActor.getOrCreate([existingProgId]);
 				await actor.setFields(JSON.stringify({
 					commands: mapVal(commandEntries),
@@ -509,16 +536,17 @@ async function main() {
 						modules: mapVal(moduleEntries),
 					}),
 				}));
-				console.log(`  UPD   ${prog.prefix.padEnd(10)} ${prog.name.padEnd(16)} ${existingProgId.slice(0, 12)}... (${Object.keys(prog.modules).length} modules)`);
+				const tag = FORCE ? "FORCED" : "UPDATE";
+				console.log(`  ${tag.padEnd(9)} ${prog.prefix.padEnd(10)} ${prog.name.padEnd(16)} ${existingProgId.slice(0, 12)}... (${Object.keys(prog.modules).length} modules)`);
 				updated++;
 			} else {
 				const id = await store.create("program", fieldsJson);
-				console.log(`  OK    ${prog.prefix.padEnd(10)} ${prog.name.padEnd(16)} ${id.slice(0, 12)}... (${Object.keys(prog.modules).length} modules)`);
+				console.log(`  CREATE    ${prog.prefix.padEnd(10)} ${prog.name.padEnd(16)} ${id.slice(0, 12)}... (${Object.keys(prog.modules).length} modules)`);
 				created++;
 			}
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
-			console.log(`  ERR   ${prog.name} — ${msg}`);
+			console.log(`  ERR       ${prog.name} \u2014 ${msg}`);
 			skipped++;
 		}
 	}
