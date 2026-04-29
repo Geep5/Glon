@@ -307,6 +307,79 @@ describe("runSchedulerTick", () => {
 		assert.ok(h.objects.get(dueDiscord.id)!.fields.sent_at_ms.intValue > 0);
 	});
 
+	it("retries once on transient errors (e.g. fetch failed) and recovers", async () => {
+		__test.setRetryDelayMs(0);
+		const h = createHarness();
+		const schedule = remindProgram.actor!.actions!.schedule;
+
+		let attempts = 0;
+		h.onDispatch("/discord", "send", () => {
+			attempts++;
+			if (attempts === 1) throw new Error("fetch failed");
+			return { channel_id: "ch", message_ids: ["m"] };
+		});
+
+		const r = await schedule(h.ctx, {
+			channel: "discord", target: "grant",
+			fire_at: Date.now() - 1000,
+			payload: { message: "survive a blip" },
+		}) as { id: string };
+
+		const result = await __test.runSchedulerTick(h.ctx);
+		assert.equal(attempts, 2, "retry attempted");
+		assert.equal(result.fired, 1);
+		assert.equal(result.failed, 0);
+		assert.equal(h.objects.get(r.id)!.fields.status.stringValue, "sent");
+	});
+
+	it("retries on transient and gives up after the second attempt also fails", async () => {
+		__test.setRetryDelayMs(0);
+		const h = createHarness();
+		const schedule = remindProgram.actor!.actions!.schedule;
+
+		let attempts = 0;
+		h.onDispatch("/discord", "send", () => {
+			attempts++;
+			throw new Error("fetch failed");
+		});
+
+		const r = await schedule(h.ctx, {
+			channel: "discord", target: "grant",
+			fire_at: Date.now() - 1000,
+			payload: { message: "persistent outage" },
+		}) as { id: string };
+
+		const result = await __test.runSchedulerTick(h.ctx);
+		assert.equal(attempts, 2, "two attempts before giving up");
+		assert.equal(result.fired, 0);
+		assert.equal(result.failed, 1);
+		const obj = h.objects.get(r.id)!;
+		assert.equal(obj.fields.status.stringValue, "failed");
+		assert.match(obj.fields.last_error.stringValue, /fetch failed/);
+	});
+
+	it("non-transient errors (e.g. unknown peer) bypass retry and fail immediately", async () => {
+		const h = createHarness();
+		const schedule = remindProgram.actor!.actions!.schedule;
+
+		let attempts = 0;
+		h.onDispatch("/discord", "send", () => {
+			attempts++;
+			throw new Error("peer Grant has no discord_id");
+		});
+
+		const r = await schedule(h.ctx, {
+			channel: "discord", target: "grant",
+			fire_at: Date.now() - 1000,
+			payload: { message: "misconfig" },
+		}) as { id: string };
+
+		const result = await __test.runSchedulerTick(h.ctx);
+		assert.equal(attempts, 1, "non-transient errors aren't retried");
+		assert.equal(result.failed, 1);
+		assert.match(h.objects.get(r.id)!.fields.last_error.stringValue, /no discord_id/);
+	});
+
 	it("records last_error and status=failed when the dispatcher throws", async () => {
 		const h = createHarness();
 		const schedule = remindProgram.actor!.actions!.schedule;

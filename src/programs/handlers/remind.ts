@@ -218,6 +218,43 @@ async function doGet(reminderId: string, ctx: ProgramContext): Promise<ReminderR
 
 // ── Dispatch a single reminder ───────────────────────────────────
 
+// Transient error patterns that warrant one retry before giving up. These
+// are network-blip signatures (most often `fetch failed` from Node when a
+// TCP/TLS handshake is interrupted). A single retry has been observed to
+// recover the recurring 'Auth-driven job scheduler' chain that otherwise
+// dies permanently on a one-off blip — once a reminder is marked failed,
+// nothing reschedules the next cycle.
+const TRANSIENT_ERROR_PATTERNS = [
+	/fetch failed/i,
+	/econnreset/i,
+	/etimedout/i,
+	/enotfound/i,
+	/eai_again/i,
+	/socket hang up/i,
+	/network error/i,
+];
+const DEFAULT_SCHEDULER_RETRY_DELAY_MS = 2000;
+let schedulerRetryDelayMs = DEFAULT_SCHEDULER_RETRY_DELAY_MS;
+
+function isTransientError(err: unknown): boolean {
+	const msg = String((err as any)?.message ?? err);
+	return TRANSIENT_ERROR_PATTERNS.some(p => p.test(msg));
+}
+
+/** Dispatch with one retry on transient (network-blip) errors. */
+async function dispatchWithRetry(rec: ReminderRecord, ctx: ProgramContext): Promise<void> {
+	try {
+		await dispatchReminder(rec, ctx);
+		return;
+	} catch (err) {
+		if (!isTransientError(err)) throw err;
+		const raw = String((err as any)?.message ?? err);
+		ctx.print(yellow(`  [remind] transient on ${rec.id.slice(0, 8)}: ${raw.slice(0, 120)} — retrying in ${schedulerRetryDelayMs}ms`));
+		await new Promise(r => setTimeout(r, schedulerRetryDelayMs));
+		await dispatchReminder(rec, ctx);
+	}
+}
+
 async function dispatchReminder(rec: ReminderRecord, ctx: ProgramContext): Promise<void> {
 	switch (rec.channel) {
 		case "discord": {
@@ -277,17 +314,19 @@ export async function runSchedulerTick(ctx: ProgramContext): Promise<{ scanned: 
 		await actor.setField("status", JSON.stringify(ctx.stringVal("sending")));
 
 		try {
-			await dispatchReminder(rec, ctx);
+			await dispatchWithRetry(rec, ctx);
 			await actor.setFields(JSON.stringify({
 				status: ctx.stringVal("sent"),
 				sent_at_ms: ctx.intVal(Date.now()),
 			}));
 			fired++;
 		} catch (err: any) {
+			const raw = String(err?.message ?? err);
 			await actor.setFields(JSON.stringify({
 				status: ctx.stringVal("failed"),
-				last_error: ctx.stringVal(String(err?.message ?? err).slice(0, 1000)),
+				last_error: ctx.stringVal(raw.slice(0, 1000)),
 			}));
+			ctx.print(red(`  [remind] FAILED ${rec.id.slice(0, 8)} (${rec.channel}→${rec.target.slice(0, 8)}): ${raw.slice(0, 200)}`));
 			failed++;
 		}
 	}
@@ -498,4 +537,8 @@ export const __test = {
 	runSchedulerTick,
 	parseFireAt,
 	recordFromState,
+	/** Override scheduler retry delay (tests). Reset by passing undefined. */
+	setRetryDelayMs(ms: number | undefined) {
+		schedulerRetryDelayMs = ms ?? DEFAULT_SCHEDULER_RETRY_DELAY_MS;
+	},
 };
