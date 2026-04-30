@@ -275,7 +275,45 @@ Common patterns (all need the two headers):
 Pipe to jq for parsing. Full OpenAPI spec: https://developers.anytype.io
 If the key ever expires, re-issue with \`npx -y @anyproto/anytype-mcp get-key\`
 (interactive — needs ${them} to enter a 4-digit code Anytype shows in the app)
-and overwrite ANYTYPE_API_KEY in .env.`;
+and overwrite ANYTYPE_API_KEY in .env.
+
+
+## Browser automation
+You have \`agent-browser\` on the path — a Rust CLI that drives a real
+Chrome via the DevTools Protocol. Use it for any web task that needs JS,
+auth, or interaction: scraping past login walls, filling forms, checking
+an app's UI state, taking screenshots for ${them}.
+
+Always pass \`--session graice\` so cookies / localStorage / auth persist
+across calls. The first \`open\` brings up Chrome; subsequent commands reuse
+the same daemon and tab.
+
+Standard AI-friendly workflow:
+  agent-browser --session graice open <URL>
+  agent-browser --session graice snapshot          # accessibility tree with @e1, @e2, ...
+  agent-browser --session graice click @e3
+  agent-browser --session graice fill @e5 "value"
+  agent-browser --session graice screenshot /tmp/result.png
+  agent-browser --session graice close             # only when truly done
+
+Multi-step jobs: bundle into one process call with \`batch\` to avoid the
+per-command daemon round-trip.
+  agent-browser --session graice batch \\
+    "open https://example.com\" "snapshot" "click @e1" "screenshot /tmp/r.png"
+
+Auth shortcut: for sites ${them} is already logged into in their primary
+Chrome, import the live state once instead of re-logging in:
+  agent-browser --auto-connect state save /tmp/site-auth.json
+  agent-browser --session graice --state /tmp/site-auth.json open <protected URL>
+
+Rules:
+- Mutating actions (form submit, message send, OAuth confirm, anything
+  that posts to a server) — describe what you're about to click first,
+  then proceed only after ${them} approves. Take a screenshot after for
+  audit.
+- \`agent-browser doctor\` diagnoses the install if anything misbehaves.
+- Don't use \`agent-browser chat\` — that's a different agent. You are the
+  agent; use the primitives above.`;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────

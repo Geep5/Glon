@@ -47,6 +47,7 @@ const SOURCES = [
 	"src/programs/handlers/holdfast.ts",
 	"src/programs/handlers/discord.ts",
 	"src/programs/handlers/anytype.ts",
+	"src/programs/handlers/browser.ts",
 	"src/programs/handlers/remind.ts",
 	"src/programs/handlers/web.ts",
 	"src/programs/handlers/memory.ts",
@@ -276,6 +277,15 @@ const PROGRAMS: ProgramDef[] = [
 		},
 		entry: "anytype.ts",
 		modules: { "anytype.ts": "src/programs/handlers/anytype.ts" },
+	},
+	{
+		prefix: "/browser",
+		name: "Browser",
+		commands: {
+			help: "Show shell cheatsheet (agent-browser primitives + session pattern)",
+		},
+		entry: "browser.ts",
+		modules: { "browser.ts": "src/programs/handlers/browser.ts" },
 	},
 	{
 		prefix: "/discord",
