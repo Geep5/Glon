@@ -55,8 +55,15 @@ const SUMMARY_MAX_TOKENS = 2048;
 const SUMMARY_TEMPERATURE = 0.3;
 
 // Compaction defaults (override per-agent via /agent config).
+//
+// `reserveTokens` is intentionally generous: the cheap chars/token
+// estimator drifts up to ~30% for tool-I/O-heavy conversations vs.
+// what Anthropic actually counts (every JSON wrapper, framing token,
+// and tool definition adds up). 32k of headroom keeps long-running
+// agents below the hard 200k context ceiling even when the estimate
+// runs cool.
 const DEFAULT_COMPACTION_CONTEXT_WINDOW = 200000;
-const DEFAULT_COMPACTION_RESERVE_TOKENS = 16384;
+const DEFAULT_COMPACTION_RESERVE_TOKENS = 32768;
 const DEFAULT_COMPACTION_KEEP_RECENT_TOKENS = 20000;
 
 // ── Subagent spawning ───────────────────────────────────────────
@@ -241,12 +248,17 @@ function safeJsonParse(s: string): unknown {
 
 // ── Token estimator ──────────────────────────────────────────────
 //
-// Cheap heuristic: roughly 3.5 chars per token for English text. Good
-// enough for threshold decisions — swap in the real Anthropic tokeniser
-// later if precision matters.
+// Cheap heuristic without a network round-trip. We pick a ratio that
+// runs slightly conservative against typical agent-harness traffic
+// (tool_use/tool_result JSON, code, terse natural language) so the
+// compaction trigger fires before Anthropic's hard 200k-token ceiling
+// rather than after. Pure prose runs even cheaper and just compacts a
+// bit sooner than strictly necessary — fine.
+// Swap in Anthropic's count_tokens API later if precision matters.
+const CHARS_PER_TOKEN = 2.8;
 
 function estimateTextTokens(s: string): number {
-	return Math.ceil(s.length / 3.5);
+	return Math.ceil(s.length / CHARS_PER_TOKEN);
 }
 
 export function estimateTokens(input: string | AnthropicContent[]): number {
@@ -272,6 +284,41 @@ function estimateItemTokens(item: ClassifiedItem): number {
 		case "compaction":
 			return estimateTextTokens(item.summary);
 	}
+}
+
+/** Estimate the tokens consumed by tool definitions in the API request.
+ *  Each tool sends `name + description + JSON-stringified input_schema`,
+ *  plus a constant ~12 tokens of per-tool framing overhead Anthropic adds. */
+function estimateToolDefinitionsTokens(tools: ToolSpec[]): number {
+	let total = 0;
+	for (const t of tools) {
+		total += estimateTextTokens(t.name);
+		total += estimateTextTokens(t.description);
+		total += estimateTextTokens(JSON.stringify(t.input_schema));
+		total += 12;
+	}
+	return total;
+}
+
+/** Estimate the total tokens that will be sent to Anthropic for the next ask:
+ *  base system prompt + summary extension + memory digest + tool definitions
+ *  + every conversation turn. Mirrors what callAnthropic packs into the body. */
+function estimateAskTokens(
+	state: any,
+	view: { turns: { content: string | AnthropicContent[] }[]; systemExtension?: string },
+	memoryDigest?: string,
+): number {
+	const baseSystem = extractString(state?.fields?.system);
+	const tools = extractTools(state?.fields?.tools);
+	let total = 0;
+	if (baseSystem) total += estimateTextTokens(baseSystem);
+	if (view.systemExtension) total += estimateTextTokens(view.systemExtension);
+	if (memoryDigest) total += estimateTextTokens(memoryDigest);
+	total += estimateToolDefinitionsTokens(tools);
+	for (const t of view.turns) {
+		total += typeof t.content === "string" ? estimateTextTokens(t.content) : estimateTokens(t.content);
+	}
+	return total;
 }
 
 // ── Block classification ─────────────────────────────────────────
@@ -1436,10 +1483,8 @@ async function doStatus(agentId: string, ctx: ProgramContext): Promise<AgentStat
 	const config = extractCompactionConfig(state.fields ?? {});
 	const threshold = config.contextWindow - config.reserveTokens;
 
-	const estimatedTokens = view.turns.reduce(
-		(acc, t) => acc + (typeof t.content === "string" ? estimateTextTokens(t.content) : estimateTokens(t.content)),
-		view.systemExtension ? estimateTextTokens(view.systemExtension) : 0,
-	);
+	const memoryDigest = await resolveMemoryDigest(agentId, ctx);
+	const estimatedTokens = estimateAskTokens(state, view, memoryDigest);
 
 	return {
 		id: agentId,
@@ -1516,11 +1561,7 @@ async function shouldAutoCompact(agentId: string, ctx: ProgramContext): Promise<
 
 	const view = buildConversationView(state.blocks ?? [], state.blockProvenance ?? {});
 	const memoryDigest = await resolveMemoryDigest(agentId, ctx);
-	const est = view.turns.reduce(
-		(acc, t) => acc + (typeof t.content === "string" ? estimateTextTokens(t.content) : estimateTokens(t.content)),
-		(view.systemExtension ? estimateTextTokens(view.systemExtension) : 0)
-			+ (memoryDigest ? estimateTextTokens(memoryDigest) : 0),
-	);
+	const est = estimateAskTokens(state, view, memoryDigest);
 	return est > config.contextWindow - config.reserveTokens;
 }
 
@@ -3300,6 +3341,12 @@ export const __test = {
 	mergeConsecutiveTurns,
 	buildConversationView,
 	findCutIndex,
+	estimateAskTokens,
+	estimateToolDefinitionsTokens,
+	CHARS_PER_TOKEN,
+	DEFAULT_COMPACTION_CONTEXT_WINDOW,
+	DEFAULT_COMPACTION_RESERVE_TOKENS,
+	DEFAULT_COMPACTION_KEEP_RECENT_TOKENS,
 	estimateItemTokens,
 	serializeItemsForSummary,
 	buildSummaryPrompt,

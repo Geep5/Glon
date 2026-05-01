@@ -200,12 +200,14 @@ function compactionCustom(summary: string, firstKeptBlockId: string, tokensBefor
 // ── estimator ────────────────────────────────────────────────────
 
 describe("estimateTokens", () => {
-	it("estimates text length / 3.5 for strings", () => {
-		assert.equal(estimateTokens("hello world"), Math.ceil(11 / 3.5));
+	it("estimates text length / CHARS_PER_TOKEN for strings", () => {
+		const R = __test.CHARS_PER_TOKEN;
+		assert.equal(estimateTokens("hello world"), Math.ceil(11 / R));
 		assert.equal(estimateTokens(""), 0);
 	});
 
 	it("sums across content arrays with tool blocks weighted", () => {
+		const R = __test.CHARS_PER_TOKEN;
 		const content = [
 			{ type: "text" as const, text: "abc" },
 			{ type: "tool_use" as const, id: "x", name: "calc", input: { a: 1 } },
@@ -213,9 +215,9 @@ describe("estimateTokens", () => {
 		];
 		const total = estimateTokens(content);
 		const expected =
-			Math.ceil(3 / 3.5) +
-			Math.ceil(("calc" + JSON.stringify({ a: 1 })).length / 3.5) +
-			Math.ceil("result body".length / 3.5);
+			Math.ceil(3 / R) +
+			Math.ceil(("calc" + JSON.stringify({ a: 1 })).length / R) +
+			Math.ceil("result body".length / R);
 		assert.equal(total, expected);
 	});
 });
@@ -756,5 +758,114 @@ describe("buildEffectiveSystem", () => {
 	it("returns only the summary block when base is empty", () => {
 		const sys = __test.buildEffectiveSystem(undefined, "S");
 		assert.equal(sys, "<conversation-summary>\nS\n</conversation-summary>");
+	});
+});
+
+
+// ── estimateToolDefinitionsTokens ────────────────────────────────
+//
+// Tool schemas show up in the API request body, so they count against
+// the context window. The estimator must include them, otherwise an
+// agent with a big tool surface (Holdfast wires ~50) under-counts by
+// thousands of tokens and never trips compaction.
+
+describe("estimateToolDefinitionsTokens", () => {
+	it("returns 0 when there are no tools", () => {
+		assert.equal(__test.estimateToolDefinitionsTokens([]), 0);
+	});
+
+	it("sums name + description + serialized schema + per-tool framing for each tool", () => {
+		const R = __test.CHARS_PER_TOKEN;
+		const tools = [
+			{
+				name: "x",
+				description: "desc",
+				input_schema: { type: "object" },
+				target_prefix: "/p",
+				target_action: "a",
+			},
+		];
+		const expected =
+			Math.ceil("x".length / R) +
+			Math.ceil("desc".length / R) +
+			Math.ceil(JSON.stringify({ type: "object" }).length / R) +
+			12;
+		assert.equal(__test.estimateToolDefinitionsTokens(tools), expected);
+	});
+});
+
+// ── shouldAutoCompact ────────────────────────────────────────────
+//
+// The Graice 200k-overflow that motivated this fix happened because
+// shouldAutoCompact was missing the base system prompt and every tool
+// definition from its estimate. We pin the trigger semantics so the
+// next regression is loud.
+
+describe("shouldAutoCompact", () => {
+	it("returns false on a fresh agent with no blocks", async () => {
+		const h = createHarness();
+		const id = h.seedAgent({
+			system: stringVal("You are a tiny assistant."),
+		});
+		assert.equal(await __test.shouldAutoCompact(id, h.ctx), false);
+	});
+
+	it("respects the compaction_enabled=false flag", async () => {
+		const h = createHarness();
+		const id = h.seedAgent({
+			system: stringVal("x".repeat(10_000)),
+			compaction_enabled: stringVal("false"),
+			compaction_context_window: stringVal("1000"),
+			compaction_reserve_tokens: stringVal("100"),
+		});
+		assert.equal(await __test.shouldAutoCompact(id, h.ctx), false);
+	});
+
+	it("counts the base system prompt against the threshold", async () => {
+		const h = createHarness();
+		const R = __test.CHARS_PER_TOKEN;
+		// System prompt alone exceeds the (window - reserve) threshold.
+		const sysChars = Math.ceil((1000 - 100 + 50) * R);
+		const id = h.seedAgent({
+			system: stringVal("x".repeat(sysChars)),
+			compaction_context_window: stringVal("1000"),
+			compaction_reserve_tokens: stringVal("100"),
+		});
+		assert.equal(await __test.shouldAutoCompact(id, h.ctx), true);
+	});
+
+	it("counts tool definitions against the threshold", async () => {
+		const h = createHarness();
+		const R = __test.CHARS_PER_TOKEN;
+		// Many tools whose definitions together blow the budget.
+		const toolsEntries: Record<string, any> = {};
+		for (let i = 0; i < 20; i++) {
+			toolsEntries[`tool_${i}`] = mapVal({
+				description: stringVal("d".repeat(Math.ceil(60 * R))),
+				input_schema: stringVal(JSON.stringify({ type: "object" })),
+				target_prefix: stringVal("/p"),
+				target_action: stringVal("a"),
+			});
+		}
+		const id = h.seedAgent({
+			tools: mapVal(toolsEntries),
+			compaction_context_window: stringVal("1000"),
+			compaction_reserve_tokens: stringVal("100"),
+		});
+		assert.equal(await __test.shouldAutoCompact(id, h.ctx), true);
+	});
+
+	it("stays below threshold when only the conversation is small", async () => {
+		const h = createHarness();
+		const id = h.seedAgent({
+			system: stringVal("short system"),
+			compaction_context_window: stringVal("100000"),
+			compaction_reserve_tokens: stringVal("10000"),
+		});
+		h.seedBlocks(id, [
+			{ content: userText("hello") },
+			{ content: assistantText("hi") },
+		]);
+		assert.equal(await __test.shouldAutoCompact(id, h.ctx), false);
 	});
 });
