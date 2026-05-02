@@ -19,6 +19,7 @@
 // in the DAG — any peer can replay the full history by ignoring compaction
 // blocks.
 
+
 import type { ProgramDef, ProgramContext, ProgramActorDef } from "../runtime.js";
 
 // ── ANSI ─────────────────────────────────────────────────────────
@@ -136,6 +137,10 @@ interface InferenceResult {
 	model: string;
 	inputTokens: number;
 	outputTokens: number;
+	/** Tokens written into the prompt cache this turn (1.25\u00d7 normal input price). */
+	cacheCreationTokens?: number;
+	/** Tokens read from the prompt cache this turn (~10% of normal input price). */
+	cacheReadTokens?: number;
 }
 
 interface CompactionConfig {
@@ -844,6 +849,44 @@ function buildOAuthSystemBlocks(system: string | undefined): { type: "text"; tex
 	return blocks;
 }
 
+/** Mark the request body for Anthropic prompt caching:
+ *  - last system block,
+ *  - last tool definition,
+ *  - last content block of the last message.
+ *
+ *  All three breakpoints together cap at Anthropic's 4-cache_control limit.
+ *  Mutates the last message defensively (clones it) so we don't poison the
+ *  caller's messages array on the next iteration of the runAsk loop. */
+function applyPromptCaching(body: Record<string, any>): void {
+	const stamp = { type: "ephemeral" } as const;
+	if (Array.isArray(body.system) && body.system.length > 0) {
+		const tail = body.system[body.system.length - 1];
+		if (tail && typeof tail === "object") tail.cache_control = stamp;
+	}
+	if (Array.isArray(body.tools) && body.tools.length > 0) {
+		const tail = body.tools[body.tools.length - 1];
+		if (tail && typeof tail === "object") tail.cache_control = stamp;
+	}
+	if (Array.isArray(body.messages) && body.messages.length > 0) {
+		const lastIdx = body.messages.length - 1;
+		const lastMsg = body.messages[lastIdx];
+		if (!lastMsg || typeof lastMsg !== "object") return;
+		let newContent: any;
+		if (typeof lastMsg.content === "string") {
+			newContent = [{ type: "text", text: lastMsg.content, cache_control: stamp }];
+		} else if (Array.isArray(lastMsg.content) && lastMsg.content.length > 0) {
+			newContent = lastMsg.content.slice();
+			newContent[newContent.length - 1] = { ...newContent[newContent.length - 1], cache_control: stamp };
+		} else {
+			return;
+		}
+		body.messages = body.messages.slice();
+		body.messages[lastIdx] = { ...lastMsg, content: newContent };
+	}
+}
+
+
+
 async function callAnthropic(
 	messages: { role: string; content: string | AnthropicContent[] }[],
 	system: string | undefined,
@@ -884,8 +927,8 @@ async function callAnthropic(
 
 	if (auth.isOAuth) {
 		body.system = buildOAuthSystemBlocks(system);
-	} else if (system) {
-		body.system = system;
+	} else if (typeof system === "string" && system.length > 0) {
+		body.system = [{ type: "text", text: system }];
 	}
 
 	if (tools && tools.length > 0) {
@@ -895,6 +938,15 @@ async function callAnthropic(
 			input_schema: t.input_schema,
 		}));
 	}
+
+	// Apply prompt-cache breakpoints: last system block, last tool definition,
+	// and the last content block of the last message. Each cache_control marks
+	// "everything up to here is cacheable for 5 min". First call writes the
+	// cache (1.25\u00d7 normal input price on the prefix); subsequent calls within
+	// the TTL read it back at ~10% of normal price. For an agent with a stable
+	// system prompt + tool surface and a long conversation, this is an order-
+	// of-magnitude per-ask cost reduction.
+	applyPromptCaching(body);
 
 	const headers: Record<string, string> = {
 		"Content-Type": "application/json",
@@ -941,6 +993,8 @@ async function callAnthropic(
 		let textAccum = "";
 		let inputTokens = 0;
 		let outputTokens = 0;
+		let cacheCreationTokens = 0;
+		let cacheReadTokens = 0;
 		const decoder = new TextDecoder();
 		const reader = res.body!.getReader();
 		while (true) {
@@ -958,6 +1012,8 @@ async function callAnthropic(
 						if (t) { textAccum += t; onChunk!(t); }
 					} else if (parsed.type === "message_start") {
 						inputTokens = parsed.message?.usage?.input_tokens ?? 0;
+						cacheCreationTokens = parsed.message?.usage?.cache_creation_input_tokens ?? 0;
+						cacheReadTokens = parsed.message?.usage?.cache_read_input_tokens ?? 0;
 					} else if (parsed.type === "message_delta") {
 						outputTokens = parsed.usage?.output_tokens ?? 0;
 					}
@@ -970,6 +1026,8 @@ async function callAnthropic(
 			model,
 			inputTokens,
 			outputTokens,
+			cacheCreationTokens,
+			cacheReadTokens,
 		};
 	}
 
@@ -983,12 +1041,15 @@ async function callAnthropic(
 		}
 		return c as AnthropicContent;
 	});
+
 	return {
 		content,
 		stopReason: data.stop_reason ?? "end_turn",
 		model: data.model ?? model,
 		inputTokens: data.usage?.input_tokens ?? 0,
 		outputTokens: data.usage?.output_tokens ?? 0,
+		cacheCreationTokens: data.usage?.cache_creation_input_tokens ?? 0,
+		cacheReadTokens: data.usage?.cache_read_input_tokens ?? 0,
 	};
 }
 
@@ -1517,6 +1578,10 @@ interface AskResult {
 	toolCalls: number;
 	inputTokens: number;
 	outputTokens: number;
+	/** Sum of cache_creation_input_tokens across every Anthropic call this ask. */
+	cacheCreationTokens: number;
+	/** Sum of cache_read_input_tokens across every Anthropic call this ask. */
+	cacheReadTokens: number;
 	compactedBeforeAsk: boolean;
 	compactedOnOverflow: boolean;
 }
@@ -1809,6 +1874,8 @@ async function runLoop(
 	let toolCalls = 0;
 	let totalInputTokens = 0;
 	let totalOutputTokens = 0;
+	let totalCacheCreationTokens = 0;
+	let totalCacheReadTokens = 0;
 	let lastRoundHadTools = false;
 
 	while (true) {
@@ -1915,6 +1982,8 @@ async function runLoop(
 		if (canStream && streamBuffer) print(`  ${streamBuffer}`);
 		totalInputTokens += result.inputTokens;
 		totalOutputTokens += result.outputTokens;
+		totalCacheCreationTokens += result.cacheCreationTokens ?? 0;
+		totalCacheReadTokens += result.cacheReadTokens ?? 0;
 
 		const assistantText = result.content
 			.filter((c): c is Extract<AnthropicContent, { type: "text" }> => c.type === "text")
@@ -2023,6 +2092,8 @@ async function runLoop(
 		toolCalls,
 		inputTokens: totalInputTokens,
 		outputTokens: totalOutputTokens,
+		cacheCreationTokens: totalCacheCreationTokens,
+		cacheReadTokens: totalCacheReadTokens,
 		compactedBeforeAsk,
 		compactedOnOverflow,
 	};
@@ -2112,7 +2183,10 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 				if (result.compactedBeforeAsk) compactionNotes.push("auto-compacted before ask");
 				if (result.compactedOnOverflow) compactionNotes.push("compacted on overflow + retried");
 				const compactionSuffix = compactionNotes.length ? `, ${compactionNotes.join("; ")}` : "";
-				print(dim(`  (${result.inputTokens} input + ${result.outputTokens} output = ${result.inputTokens + result.outputTokens} tokens${toolSuffix}${compactionSuffix})`));
+				const cacheNote = result.cacheReadTokens > 0 || result.cacheCreationTokens > 0
+					? `, cache: ${result.cacheReadTokens} read + ${result.cacheCreationTokens} written`
+					: "";
+				print(dim(`  (${result.inputTokens} input + ${result.outputTokens} output = ${result.inputTokens + result.outputTokens} tokens${toolSuffix}${compactionSuffix}${cacheNote})`));
 				print("");
 			} catch (err: any) {
 				print(red("  Error: ") + (err?.message ?? String(err)));
