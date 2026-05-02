@@ -39,7 +39,7 @@ The kernel knows nothing about LLMs. The fact that `/agent` exists at the progra
 **Prerequisites**
 - Node 20+ (the dev server uses the built-in `node:sqlite`).
 - For LLM agents: either an Anthropic API key (`ANTHROPIC_API_KEY`) or a Claude Pro/Max plan (set up via `/auth login anthropic`). Discord bot token if you want the bridge.
-- For agents that browse the web: [Skyvern](https://github.com/Skyvern-AI/skyvern) running locally as a long-lived service on `127.0.0.1:8000`. Skyvern is a Python service (planner + actor + validator agents on top of Playwright + a vision LLM); the default Holdfast system prompt teaches agents to drive it via REST, and without it running any browser task will fail. Install once on the host:
+- For agents that browse the web: [Skyvern](https://github.com/Skyvern-AI/skyvern) running locally on `127.0.0.1:8000`. Skyvern is a Python service (planner + actor + validator agents on top of Playwright + a vision LLM) that the default Holdfast system prompt teaches agents to drive via REST. Easiest install path is the upstream Docker Compose (see Install snippet below) since the bare `pip install skyvern` path is currently broken upstream. Without Skyvern running, agents fall back to whatever they can do via `shell_exec` + `curl` (read-only HTTP, basically) and any task that needs a real browser will fail.
 
 **Install**
 ```bash
@@ -47,14 +47,22 @@ git clone https://github.com/Geep5/glon.git
 cd glon && npm install
 cp .env.example .env        # fill in secrets (see sections below)
 
-# If any agent on this harness will browse the web, also install Skyvern:
-pip install skyvern         # or: pipx install skyvern
-skyvern quickstart          # one-time setup: ~/.skyvern (DB, .env with API key)
-skyvern run server &        # long-running service on 127.0.0.1:8000
-# Configure an LLM key in ~/.skyvern/.env (LLM_KEY=ANTHROPIC + ANTHROPIC_API_KEY=...,
-# or LLM_KEY=OPENAI_GPT4O + OPENAI_API_KEY=...). For sites with active Chrome
-# logins, also enable Chrome remote debugging and set BROWSER_TYPE=cdp-connect
-# in ~/.skyvern/.env.
+# If any agent on this harness will browse the web, also install Skyvern.
+# As of May 2026 the upstream `pip install skyvern` path has dependency-resolution
+# bugs (skyvern 1.0.31 hits a SQLite COUNT-DISTINCT bug on Postgres-only SQL,
+# and 1.0.32 conflicts with litellm's pinned jsonschema). Use Docker Compose:
+git clone https://github.com/Skyvern-AI/skyvern.git ~/skyvern
+cd ~/skyvern && cp .env.example .env
+# add LLM_KEY=ANTHROPIC_CLAUDE4_SONNET, ENABLE_ANTHROPIC=true, ANTHROPIC_API_KEY=...
+# (or OPENAI_GPT4O / OPENAI_API_KEY for OpenAI) to .env
+docker compose up -d         # postgres + skyvern + UI on :8000 + :8080
+
+# Grab the auto-generated API key Skyvern writes for the local org:
+SKYVERN_KEY=$(docker exec skyvern-postgres-1 \
+  psql -U skyvern -d skyvern -t -c \
+  "SELECT token FROM organization_auth_tokens WHERE token_type='api' AND valid=true LIMIT 1" \
+  | head -1 | tr -d ' ')
+# add SKYVERN_API_KEY=<that token> to glon's .env so the daemon's shell_exec inherits it
 ```
 
 **Run**
