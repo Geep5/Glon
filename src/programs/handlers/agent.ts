@@ -73,7 +73,7 @@ const DEFAULT_COMPACTION_KEEP_RECENT_TOKENS = 20000;
 // (typeKey="agent" like any other). The parent's DAG records a single
 // tool_use/tool_result pair whose content is the *compressed* batch result;
 // per-child ObjectLink references are embedded in the tool_use input so
-// glonWorld can render lineage edges. Each child's full transcript remains
+// glonAstrolabe can render lineage edges. Each child's full transcript remains
 // inspectable as its own agent object.
 //
 // See `buildSubagentSystemPrompt`, `doSpawn`, `doSubmitResult`, `doCancel`.

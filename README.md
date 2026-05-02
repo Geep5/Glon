@@ -185,11 +185,11 @@ agent templates:
 
 Each child agent gets a `submit_result` tool bound to its own id. Per-task knobs: `timeoutMs` (cancel and mark `status=timeout`), `maxAttempts` (retry on timeout/error), `schema` (JSON Schema subset; violations surface as `is_error` tool_results so the model can self-correct, and the parent sees `status=schema_invalid`). Depth-capped via `GLON_AGENT_MAX_DEPTH` (default 4).
 
-Progress is broadcast on `ctx.emit`: `spawn:start`, `spawn:child_created`, `spawn:child_done`, `spawn:complete` — useful for live UIs like [glonWorld](https://github.com/Geep5/glonWorld).
+Progress is broadcast on `ctx.emit`: `spawn:start`, `spawn:child_created`, `spawn:child_done`, `spawn:complete` — useful for live UIs like [glonAstrolabe](https://github.com/Geep5/glonAstrolabe).
 
 ### Example: user-curated memory
 
-Compaction skips old turns when context fills, but they remain in the DAG. `/agent recall` re-injects a specific block as a new user turn so the agent sees it on the next ask. Find the block id from `/agent history` (the timestamps line up with the visible turns) or from the search panel in [glonWorld](https://github.com/Geep5/glonWorld):
+Compaction skips old turns when context fills, but they remain in the DAG. `/agent recall` re-injects a specific block as a new user turn so the agent sees it on the next ask. Find the block id from `/agent history` (the timestamps line up with the visible turns) or from the search panel in [glonAstrolabe](https://github.com/Geep5/glonAstrolabe):
 
 ```
 glon> /agent recall a3f8 7f141408
@@ -198,7 +198,7 @@ glon> /agent recall a3f8 7f141408
 
 The new block content is `[Recalled user turn from 2024-…]:\nMy wife's name is Sarah. Save that.` — short framing so the model knows it's a deliberate recall. Truncates at 8 KB. Works on any block kind (text, tool_use, tool_result, compaction_summary).
 
-The 3D viewer [glonWorld](https://github.com/Geep5/glonWorld) wraps this with a click-to-recall affordance and a search panel that scans every block's raw text — find a forgotten turn by phrase, click to bring it back into context.
+The 3D viewer [glonAstrolabe](https://github.com/Geep5/glonAstrolabe) wraps this with a click-to-recall affordance and a search panel that scans every block's raw text — find a forgotten turn by phrase, click to bring it back into context.
 
 ### Example: Holdfast in action
 
@@ -382,7 +382,7 @@ curl -sS -X POST http://127.0.0.1:6430/dispatch \
   -d '{"prefix":"/holdfast","action":"say","args":["What is on my calendar today?"]}'
 ```
 
-The dispatch endpoint is also what [glonWorld](https://github.com/Geep5/glonWorld) uses to recall compacted blocks back into an agent's context, and what external orchestrators can drive without holding API keys themselves.
+The dispatch endpoint is also what [glonAstrolabe](https://github.com/Geep5/glonAstrolabe) uses to recall compacted blocks back into an agent's context, and what external orchestrators can drive without holding API keys themselves.
 
 ## Deploying handler changes
 
@@ -476,7 +476,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for internals: DAG replay, actor state mo
 
 ## Companion projects
 
-- **[glonWorld](https://github.com/Geep5/glonWorld)** — interactive 3D viewer for any glon environment. Visualizes objects, programs, the agent's full conversation, memory-surfaced blocks (glow), subagent lineage (amber arcs), and adds a click-to-recall affordance for user-curated memory management.
+- **[glonAstrolabe](https://github.com/Geep5/glonAstrolabe)** — interactive 3D viewer for any glon environment. Visualizes objects, programs, the agent's full conversation, memory-surfaced blocks (glow), subagent lineage (amber arcs), and adds a click-to-recall affordance for user-curated memory management.
 
 ## License
 
