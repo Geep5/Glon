@@ -36,6 +36,7 @@ const SOURCES = [
 	"src/programs/handlers/inspect.ts",
 	"src/programs/handlers/ipc.ts",
 	"src/programs/handlers/ttt.ts",
+	"src/programs/handlers/comment.ts",
 	"src/programs/handlers/chat.ts",
 	"src/programs/handlers/agent.ts",
 	"src/programs/handlers/task.ts",
@@ -133,6 +134,20 @@ const PROGRAMS: ProgramDef[] = [
 		modules: { "ttt.ts": "src/programs/handlers/ttt.ts" },
 	},
 	{
+		prefix: "/comment",
+		name: "Comment",
+		commands: {
+			post: "Post a message on any object",
+			reply: "Reply to a message",
+			react: "React to a message with an emoji",
+			unreact: "Remove a reaction",
+			list: "List messages on an object",
+			thread: "List a single thread (root + descendants)",
+		},
+		entry: "comment.ts",
+		modules: { "comment.ts": "src/programs/handlers/comment.ts" },
+	},
+	{
 		prefix: "/chat",
 		name: "Chat",
 		commands: {
@@ -143,7 +158,7 @@ const PROGRAMS: ProgramDef[] = [
 			react: "React to a message",
 		},
 		entry: "chat.ts",
-		modules: { "chat.ts": "src/programs/handlers/chat.ts" },
+		modules: { "chat.ts": "src/programs/handlers/chat.ts", "comment.ts": "src/programs/handlers/comment.ts" },
 	},
 	{
 		prefix: "/agent",

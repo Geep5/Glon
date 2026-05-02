@@ -73,7 +73,8 @@ Every script auto-loads `.env` from the project root, so `ANTHROPIC_API_KEY` and
 | `/ipc` | Inter-object messaging (inbox/outbox) |
 | `/graph` | Object link traversal, neighbours, BFS |
 | `/ttt` | Tic-tac-toe — every move is a content-addressed change |
-| `/chat` | Chat rooms — messages are blocks in the DAG |
+| `/chat` | Chat rooms — thin alias around `/comment`. Reads still render legacy TextContent messages from before the migration |
+| `/comment` | Discussions on any object. `message` + `reaction` block convention; reply_to threading, attachments, reactions live with the message rather than in the parent's field map |
 | `/agent` | LLM agents with DAG-backed conversation, tool dispatch, auto-compaction, subagent spawning, block recall, and Anthropic prompt caching of system + tools + history (~95% steady-state cost reduction) |
 | `/task` | Thin CLI front-end for spawning subagent batches |
 | `/memory` | Durable agent memory: pinned facts and milestone arcs that survive compaction |
@@ -435,7 +436,7 @@ src/
   client.ts                   CLI shell (pure program loader)
   programs/
     runtime.ts                module bundler, actor lifecycle, validators
-    handlers/                 one file per program (23 today)
+    handlers/                 one file per program (24 today)
 scripts/
   daemon.ts                   headless host: load programs, run actors, HTTP dispatch
   dispatch.ts                 thin HTTP client for the daemon
@@ -466,6 +467,8 @@ test/
   remind.test.ts              scheduling, tick, payload + target validation
   discord.test.ts             bridge polling + send
   holdfast.test.ts            ingest wrapping + setup idempotency
+  comment.test.ts             /comment post / reply / react / unreact / list / thread
+  chat.test.ts                /chat alias to /comment dispatch + legacy block render
   introspection.test.ts       agent reads its own source via /crud
 ```
 

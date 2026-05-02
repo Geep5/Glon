@@ -235,6 +235,11 @@ const objectActor = actor({
 			const change = createChange(c.state.id, [{ blockAdd: { parentId: "", afterId: "", block } }], headBytes(c));
 			commitChange(c, change);
 		},
+		removeBlock: (c, blockId: string) => {
+			const change = createChange(c.state.id, [{ blockRemove: { blockId } }], headBytes(c));
+			commitChange(c, change);
+		},
+
 
 		createSnapshot: (c): string => {
 			const result = loadFromDisk(c.state.id);

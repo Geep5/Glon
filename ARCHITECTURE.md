@@ -541,6 +541,57 @@ glon stores, content-addresses, syncs, and replays custom blocks
 through the standard Change DAG. Peers that don't understand a
 `CustomContent` block fall back to displaying the `meta` map.
 
+### Discussion convention: `message` and `reaction` blocks
+
+Glon doesn't have a built-in comment type. Instead, two `CustomContent`
+content_type values "message" and "reaction" carry a discussion-on-any-object
+convention that the `/comment` program implements and any other program can
+host. The convention pins per-message metadata onto the message itself
+(rather than the parent object's field map), which keeps each post atomic
+across sync, deletion, and rendering.
+
+**`message` block**
+
+```
+CustomContent {
+  content_type: "message"
+  data: <unused>
+  meta: {
+    text: <required, the message body>,
+    creator?: <object_id of the peer/agent who posted>,
+    reply_to?: <block_id of the parent message, for threading>,
+    attachments?: <JSON-encoded [{object_id, kind}, ...]>,
+    created_at?: <epoch ms as string>
+  }
+}
+```
+
+**`reaction` block**
+
+```
+CustomContent {
+  content_type: "reaction"
+  meta: {
+    target: <required, block_id of the message being reacted to>,
+    emoji: <required>,
+    creator?: <object_id of the reactor>,
+    created_at?: <epoch ms as string>
+  }
+}
+```
+
+Reactions live as siblings of the message they target rather than children
+of it; the relationship is logical (`meta.target`), not structural. Removing
+a reaction is `removeBlock(reaction_block_id)`. Threading is logical too:
+replies are sibling messages with `meta.reply_to` pointing at the parent.
+/comment's `thread` action walks the implied DAG.
+
+Programs that want comments on their own object types just dispatch
+`/comment.post` (and friends) at any object id. `/chat` is the canonical
+consumer; future programs (per-milestone notes, per-reminder annotations,
+per-peer threads) reuse the same primitive without introducing new types.
+
+
 ### Why Not Program-Defined Protobufs?
 
 **Custom Operations (programs bring their own reducers):** glon
