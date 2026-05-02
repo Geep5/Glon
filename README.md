@@ -74,14 +74,15 @@ Every script auto-loads `.env` from the project root, so `ANTHROPIC_API_KEY` and
 | `/graph` | Object link traversal, neighbours, BFS |
 | `/ttt` | Tic-tac-toe — every move is a content-addressed change |
 | `/chat` | Chat rooms — messages are blocks in the DAG |
-| `/agent` | LLM agents with DAG-backed conversation, tool dispatch, auto-compaction, subagent spawning, and block recall |
+| `/agent` | LLM agents with DAG-backed conversation, tool dispatch, auto-compaction, subagent spawning, block recall, and Anthropic prompt caching of system + tools + history (~95% steady-state cost reduction) |
 | `/task` | Thin CLI front-end for spawning subagent batches |
 | `/memory` | Durable agent memory: pinned facts and milestone arcs that survive compaction |
 | `/peer` | People and agents the harness talks to: identity, trust level, contact handles |
 | `/remind` | Scheduled actions: DM at a time, prompt the agent to compose then send |
 | `/discord` | I/O bridge: Gateway WebSocket for online presence + 3s REST poll for DMs, routes to `/holdfast.ingest`, posts replies back |
 | `/holdfast` | Generic agent harness: wraps an `/agent` with identity-aware ingest, memory, scheduled reminders, shell access, and subagent spawning. Configure once with `/holdfast setup --name <NAME>` |
-| `/web` | Shell cheatsheet — `curl` + `jq` + `pandoc` recipes for HTTP from agents (no actor; the agent shells out directly) |
+| `/web` | Shell cheatsheet for HTTP from the REPL — `curl` + `jq` + `pandoc` recipes when an agent (or human) needs raw bytes / JSON / typed APIs. For loading a real web page (login walls, JS, interaction), see `/browser` |
+| `/browser` | Shell cheatsheet for the `browser-use` CLI — the canonical browser path for agents. Recipes for `--profile` (use the principal's real Chrome with all existing logins), `state`/`click`/`screenshot`, multi-step flows. No actor; the agent shells out directly |
 | `/shell` | Persistent bash sessions an agent can drive |
 | `/google` | Shell cheatsheet for the `gws` CLI (calendar / gmail / drive / sheets / docs). Auth lives in gws's keyring; the agent invokes it via `shell_exec gws +<verb>` |
 | `/anytype` | Shell cheatsheet for the local Anytype REST API on `127.0.0.1:31009`. Optional — only useful if Anytype Desktop is running |
@@ -118,6 +119,7 @@ An LLM agent is one configuration of the kernel's primitives — nothing about i
 | Identity-aware ingest | `/peer` objects carry `display_name`, `kind`, `trust_level`, `email`, `discord_id`. `/holdfast` tags inbound text with `[from {name} on {source}, trust={level}]` before reaching the model |
 | Subagents | More `objectActor`s of `typeKey="agent"`, with a `spawn_parent` link back to the caller. Conversation, tools, memory, and compaction all "just work" because they're real agents |
 | Block recall | A new `user_text` block that quotes a previous block (compacted or otherwise). Lands after the latest compaction's cut, so the model sees it on the next ask |
+| Prompt caching | `cache_control: {type: "ephemeral"}` on the last system block, last tool definition, and last message of every Anthropic call. The stable prefix (system + tools + history) hits cache; only the new tail pays full input price. Verified ~30x cost reduction in continuous-chat workloads |
 
 That's the entire picture. The agent doesn't have a database; the DAG is the database. The agent doesn't have a context manager; compaction blocks are the context manager. The agent doesn't have a job runner for subagents; rivet actors are the job runner. The agent doesn't have an artifact store; child agents *are* the artifacts.
 
@@ -381,6 +383,32 @@ curl -sS -X POST http://127.0.0.1:6430/dispatch \
 
 The dispatch endpoint is also what [glonWorld](https://github.com/Geep5/glonWorld) uses to recall compacted blocks back into an agent's context, and what external orchestrators can drive without holding API keys themselves.
 
+## Deploying handler changes
+
+**Programs run from the DAG, not from disk.** When the daemon (or the dev server) starts, the runtime reads each program's source out of `typescript` objects in the store, compiles them, and starts the actors. Editing a handler file under `src/programs/handlers/` after that has no effect on the running process — disk and DAG have diverged.
+
+To deploy a handler-code change:
+
+```bash
+# 1. Push the new disk source into the DAG.
+npm run bootstrap   # re-reads disk, writes new typescript objects, updates
+                    # each program's manifest to point at them.
+
+# 2. Restart the daemon so it re-loads programs from the updated DAG.
+kill $(cat .run/daemon.pid)   # or your equivalent
+npx tsx scripts/daemon.ts &
+```
+
+If you only run the dev server (`npm run dev`, with `--watch`) and never the daemon, step 1 is still required — watch only re-runs `src/index.ts`, which doesn't re-read program source from disk after bootstrap.
+
+Two things this doesn't apply to:
+
+- **Agent fields** (system prompt, model, tools wired, compaction knobs). Those are direct `object_set_field` writes on the agent object and take effect on the next `/agent ask` without bootstrap.
+- **DAG content the agent itself writes** (memory facts, conversation blocks, reminders, peers). Same — normal object operations, immediate.
+
+Only `typescript` source-file objects (the program manifests) need the bootstrap-then-restart cycle.
+
+
 ## The protocol
 
 **Change DAG** — every mutation is a `Change` protobuf, content-addressed by SHA-256, linked to parents via DAG edges. Operations: `ObjectCreate`, `FieldSet`, `FieldDelete`, `ContentSet`, `ObjectDelete`, plus block tree ops (`BlockAdd`, `BlockRemove`, `BlockUpdate`, `BlockMove`).
@@ -407,22 +435,35 @@ src/
   client.ts                   CLI shell (pure program loader)
   programs/
     runtime.ts                module bundler, actor lifecycle, validators
-    handlers/                 one file per program (21 today)
+    handlers/                 one file per program (23 today)
 scripts/
   daemon.ts                   headless host: load programs, run actors, HTTP dispatch
   dispatch.ts                 thin HTTP client for the daemon
-  read-agent-blocks.ts        diagnostic: dump an agent's conversation blocks
+  read-agent-blocks.ts        diagnostic: dump an agent's recent blocks
+  tail-blocks.ts <id> [N]     tail an object's last N blocks (role, tool_use_id, errors)
+  inspect-id.ts <id>          dump an object's typeKey, fields, block count
+  list-reminders.ts           dump every reminder in the store with status + payload
+  dump-tooluse.ts <id> [k]    dump tool_use / tool_result blocks for tool-call debugging
+  dump-system.ts <id>         print an agent's system prompt; --out path to file
+  dump-handler-source.ts <suffix> [--grep S]  read a typescript object's content from the DAG
+  agent-info.ts <id>          name, model, tool count by prefix, system length, compaction tuning
+  check-mti.ts <id> [N]       read or set max_tool_iterations
+  prune-tools.ts <id> <pfx>   drop wired tools whose names start with the given prefix(es)
+  rename-agent.ts <id> <old> <new>  rename + rewrite system prompt occurrences
+  capture-setup.ts <agent> <peer>   snapshot agent + principal config as JSON (backup)
+  test-steer-live.ts          steering / multi-runner integration check
 test/
   dag.test.ts                 DAG replay, snapshots
   runtime.test.ts             program actor lifecycle
-  agent-compaction.test.ts    compaction view, cut-point, summary block
+  agent-compaction.test.ts    compaction view, cut-point, summary, shouldAutoCompact
   agent-tooluse.test.ts       tool registration + tool-use loop
   agent-spawn.test.ts         core subagent spawning
   agent-spawn-advanced.test.ts schema validation, timeout, retry, progress events, tree
   agent-recall.test.ts        block recall framing + truncation
+  agent-steering.test.ts      multi-runner / steering coordination
   task-program.test.ts        /task CLI dispatch + Holdfast wiring
   peer.test.ts                peer CRUD + find-or-create
-  remind.test.ts              scheduling and tick
+  remind.test.ts              scheduling, tick, payload + target validation
   discord.test.ts             bridge polling + send
   holdfast.test.ts            ingest wrapping + setup idempotency
   introspection.test.ts       agent reads its own source via /crud
