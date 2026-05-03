@@ -720,14 +720,78 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 			break;
 		}
 
+		case "transfer": {
+			const rawTokenId = args[0];
+			const toPubkey = args[1];
+			const amount = args[2];
+			const keyArg = args.find((a) => a.startsWith("--key="));
+			const keyName = keyArg ? keyArg.split("=")[1] : "default";
+
+			if (!rawTokenId || !toPubkey || !amount) {
+				print(red("Usage: token transfer <token_id> <to_pubkey> <amount> [--key=name]"));
+				break;
+			}
+			if (!/^[0-9a-f]{64}$/.test(toPubkey)) {
+				print(red("recipient pubkey must be 64 hex chars"));
+				break;
+			}
+			try {
+				const tokenId = (await resolveId(rawTokenId)) ?? rawTokenId;
+
+				// Get sender's pubkey from wallet
+				const keyInfo: any = await dispatchProgram("/wallet", "show", [keyName]);
+				if (!keyInfo) {
+					print(red(`Wallet key "${keyName}" not found. Run: wallet new ${keyName}`));
+					break;
+				}
+				const senderPubkey = keyInfo.pubkey as string;
+
+				// Read token to get current head IDs for parentIds
+				const objActor = ctx.objectActor(tokenId);
+				const obj = await objActor.read() as any;
+				const parentIds: string[] = obj?.headIds ?? [];
+
+				// Build unsigned Transfer op change
+				const { changeB64 } = await dispatchProgram("/token", "buildOp", [{
+					tokenId,
+					parentIds,
+					timestamp: Date.now(),
+					author: "token-transfer",
+					op: { kind: "Transfer", to: toPubkey, amount },
+					signerPubkeyHex: senderPubkey,
+					blockId: randomUUID().replace(/-/g, "").slice(0, 16),
+				}]) as { changeB64: string };
+
+				// Get nonce from consensus
+				const nonce: number = await dispatchProgram("/consensus", "getNonce", [senderPubkey]) as number;
+
+				// Sign
+				const { changeB64: signedB64 } = await dispatchProgram("/wallet", "signChange", [{
+					name: keyName,
+					changeB64,
+					nonce: nonce + 1,
+					fee: 1, // Transfer = 1x base fee
+				}]) as { changeB64: string };
+
+				// Push
+				await objActor.pushChanges(signedB64);
+
+				print(green(`Transferred ${amount} to ${toPubkey.slice(0, 16)}...`));
+				print(dim("  token: ") + tokenId);
+			} catch (err: any) {
+				print(red("Error: ") + (err?.message ?? String(err)));
+			}
+			break;
+		}
+
 		default: {
 			print([
 				bold("  Token") + dim(" — chain-mode fungible token (chain.token)"),
 				`    ${cyan("token deploy")} ${dim("<name> <symbol> <supply> [--decimals=N] [--key=name]")}  deploy a new token`,
+				`    ${cyan("token transfer")} ${dim("<token_id> <to_pubkey> <amount> [--key=name]")}  send tokens to a pubkey`,
 				`    ${cyan("token info")} ${dim("<token_id>")}            metadata + supply + owner`,
 				`    ${cyan("token balance")} ${dim("<token_id> <pubkey>")} balance for one holder`,
 				`    ${cyan("token holders")} ${dim("<token_id>")}          all balances, descending`,
-				dim(`  Mint/transfer/etc happen via signed Changes; see the actor API.`),
 			].join("\n"));
 		}
 	}
