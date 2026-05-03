@@ -52,6 +52,7 @@ const SOURCES = [
 	"src/programs/handlers/remind.ts",
 	"src/programs/handlers/web.ts",
 	"src/programs/handlers/memory.ts",
+	"src/programs/handlers/todo.ts",
 	"src/programs/handlers/google.ts",
 	"src/programs/handlers/shell.ts",
 	"src/programs/handlers/auth.ts",
@@ -282,6 +283,7 @@ const PROGRAMS: ProgramDef[] = [
 		modules: {
 			"holdfast.ts": "src/programs/handlers/holdfast.ts",
 			"agent.ts": "src/programs/handlers/agent.ts",
+			"todo.ts": "src/programs/handlers/todo.ts",
 		},
 	},
 	{
@@ -348,6 +350,17 @@ const PROGRAMS: ProgramDef[] = [
 		},
 		entry: "memory.ts",
 		modules: { "memory.ts": "src/programs/handlers/memory.ts" },
+	},
+	{
+		prefix: "/todo",
+		name: "Todo",
+		commands: {
+			show: "Render an agent's phased task list",
+			incomplete: "List pending/in_progress tasks only",
+			clear: "Reset list to empty (history preserved)",
+		},
+		entry: "todo.ts",
+		modules: { "todo.ts": "src/programs/handlers/todo.ts" },
 	},
 	{
 		prefix: "/google",

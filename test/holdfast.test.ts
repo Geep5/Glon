@@ -377,6 +377,8 @@ describe("holdfast tool auto-wiring", () => {
 			"memory_recall",
 			// Shell tools (via /shell → persistent bash)
 			"shell_exec", "shell_sessions", "shell_kill",
+			// Phased task list (drives the /agent follow-up reminder loop)
+			"todo_write",
 			// Subagent spawning
 			"spawn",
 		];

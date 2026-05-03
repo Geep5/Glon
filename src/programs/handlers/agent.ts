@@ -1584,6 +1584,87 @@ interface AskResult {
 	cacheReadTokens: number;
 	compactedBeforeAsk: boolean;
 	compactedOnOverflow: boolean;
+	/** Number of follow-up turns the harness drove past the model's natural stop. 0 = none. */
+	followUpAttempts: number;
+}
+
+/** Context passed to a follow-up hook on each "would-stop" boundary. */
+export interface FollowUpHookContext {
+	agentId: string;
+	ctx: ProgramContext;
+	/** 0 on the first call after the original prompt's runLoop, then 1, 2, … */
+	attempt: number;
+	/** Result from the most recent runLoop iteration. */
+	lastResult: AskResult;
+}
+
+/**
+ * A follow-up hook decides whether the agent should keep working past the
+ * model's natural stop. Returns:
+ *   - `null`/`undefined` → done; runAsk returns
+ *   - `{ text }` → the harness commits `text` as a new user_text block on
+ *     the agent's DAG and re-enters the model loop
+ *
+ * Capping is the hook's responsibility. Hooks MUST return null after their
+ * own configured max_attempts to prevent runaway grinding; runAsk does not
+ * impose its own cap. See `makeTodoFollowUpHook` for the reference impl.
+ */
+export type FollowUpHook = (c: FollowUpHookContext) => Promise<{ text: string } | null | undefined>;
+
+/**
+ * Merge two AskResult slices into a running aggregate. Used by runAsk's
+ * outer follow-up loop. Counters sum; flags OR; `finalText` keeps the most
+ * recent non-empty assistant slice (so the caller sees the model's last
+ * words, not a stale preamble).
+ */
+function mergeAskResults(a: AskResult, b: AskResult): AskResult {
+	return {
+		iterations: a.iterations + b.iterations,
+		toolCalls: a.toolCalls + b.toolCalls,
+		inputTokens: a.inputTokens + b.inputTokens,
+		outputTokens: a.outputTokens + b.outputTokens,
+		compactedBeforeAsk: a.compactedBeforeAsk || b.compactedBeforeAsk,
+		compactedOnOverflow: a.compactedOnOverflow || b.compactedOnOverflow,
+		finalText: b.finalText ? b.finalText : a.finalText,
+		followUpAttempts: a.followUpAttempts + b.followUpAttempts,
+	};
+}
+
+/**
+ * Build a follow-up hook that injects a `<system-reminder>` listing
+ * incomplete /todo items whenever the model emits a "would-stop" turn
+ * with anything left pending or in_progress. Capped at `maxAttempts`
+ * (default 3). Silently no-ops if /todo isn't running or the agent has
+ * no list — same graceful-degrade pattern as memory digest.
+ */
+export function makeTodoFollowUpHook(opts?: { maxAttempts?: number }): FollowUpHook {
+	const max = opts?.maxAttempts ?? 3;
+	return async ({ agentId, ctx, attempt }) => {
+		if (attempt >= max) return null;
+		let summary: { phases: { name: string; tasks: { id: string; content: string; status: string }[] }[]; total: number };
+		try {
+			summary = (await ctx.dispatchProgram("/todo", "incomplete", [{ owner: agentId }])) as typeof summary;
+		} catch {
+			return null;
+		}
+		if (!summary || summary.total === 0) return null;
+
+		const formatted = summary.phases
+			.map((p) => {
+				const tasks = p.tasks.map((t) => `  - ${t.content} [${t.status}]`).join("\n");
+				return `- ${p.name}\n${tasks}`;
+			})
+			.join("\n");
+		const text =
+			`<system-reminder>\n` +
+			`You stopped with ${summary.total} incomplete todo item(s):\n${formatted}\n\n` +
+			`Please continue working on these tasks. When a task is finished, mark it ` +
+			`completed via the \`todo_write\` tool ({op: "update", id: "task-N", status: "completed"}). ` +
+			`If a task is no longer needed, mark it abandoned. Do not stop until every task is in a terminal state.\n` +
+			`(Reminder ${attempt + 1}/${max})\n` +
+			`</system-reminder>`;
+		return { text };
+	};
 }
 
 /** Flag on an agent object enabling auto-injection of /memory digest into the system prompt. */
@@ -1736,23 +1817,31 @@ async function shouldAutoCompact(agentId: string, ctx: ProgramContext): Promise<
  }
  
  /**
- * Public entry point. Owns lock acquisition and the runner-vs-steerer
- * decision. The actual model loop lives in runLoop.
- */
+  * Public entry point. Owns lock acquisition, the runner-vs-steerer
+  * decision, and the follow-up loop. The actual model loop lives in
+  * runLoop.
+  *
+  * Follow-up loop: after runLoop returns "would-stop" for the runner's
+  * prompt, optionally drive additional turns by injecting messages from
+  * `opts.followUpHook`. Each follow-up message is committed as a real
+  * user_text block on the agent's DAG (not a sidecar), so peers replaying
+  * the conversation see the same prompts the model saw. The hook controls
+  * its own cap; runAsk imposes none.
+  */
  async function runAsk(
  	agentId: string,
  	prompt: string,
  	ctx: ProgramContext,
- 	opts: { printStream?: boolean } = {},
+ 	opts: { printStream?: boolean; followUpHook?: FollowUpHook } = {},
  ): Promise<AskResult> {
  	const slot = ensureSlot(agentId);
  	const userBlockId = ctx.randomUUID();
  	const actor = (ctx.client as any).objectActor.getOrCreate([agentId]);
- 
+
 	// Synchronous lock decision. Single-threaded JS guarantees no other
 	// caller can interleave between the read and the write.
 	const isRunner = !slot.running;
- 
+
  	if (!isRunner) {
  		// Steerer path: commit the user block, then park on a promise the
  		// runner will resolve from runLoop's tail.
@@ -1761,20 +1850,59 @@ async function shouldAutoCompact(agentId: string, ctx: ProgramContext): Promise<
  			slot.pending.push({ userBlockId, resolve, reject });
  		});
  	}
- 
+
 	// Runner path. The runner does NOT join slot.pending — their result is
 	// returned directly from runLoop. Only late steerers ride pending.
 	slot.running = true;
 	await actor.addBlock(JSON.stringify(textBlock(userBlockId, prompt, STYLE_USER)));
 
 	try {
+		let aggregate: AskResult | null = null;
+		let currentUserBlockId = userBlockId;
+		let followUpAttempt = 0;
+
+		// Outer follow-up loop. After each runLoop call, if a follow-up hook
+		// provides text, commit it as a fresh user_text block and re-enter
+		// runLoop with it as the new "originalUserBlockId" for attribution.
 		while (true) {
-			const result = await runLoop(agentId, userBlockId, slot, ctx, opts);
-			// Synchronous re-check: any straggler pushed during the gap between
-			// runLoop's last `pending.length === 0` check and its return? Loop
-			// again to address them. Subsequent runLoop calls have nothing to
-			// do for the runner (their result is final after the first call).
-			if (slot.pending.length === 0) return result;
+			let result: AskResult;
+			// Inner straggler loop (existing behavior): drain late steerers
+			// pushed between runLoop's last pending check and its return.
+			while (true) {
+				result = await runLoop(agentId, currentUserBlockId, slot, ctx, opts);
+				if (slot.pending.length === 0) break;
+			}
+
+			aggregate = aggregate ? mergeAskResults(aggregate, result) : result;
+
+			if (!opts.followUpHook) return aggregate;
+
+			let followUp: { text: string } | null | undefined;
+			try {
+				followUp = await opts.followUpHook({
+					agentId,
+					ctx,
+					attempt: followUpAttempt,
+					lastResult: result,
+				});
+			} catch {
+				// A throwing hook MUST NOT take the conversation down. Treat
+				// it as "no follow-up" and finish the ask.
+				return aggregate;
+			}
+
+			if (!followUp || !followUp.text) return aggregate;
+
+			// Commit the follow-up as a regular user_text block. From the
+			// model's POV it's just another user turn. From a peer's POV
+			// the DAG records exactly what was sent. Worth surfacing to
+			// the user via the existing print stream so they see the
+			// continuation isn't a hallucination.
+			const followUpBlockId = ctx.randomUUID();
+			await actor.addBlock(JSON.stringify(textBlock(followUpBlockId, followUp.text, STYLE_USER)));
+			aggregate = { ...aggregate, followUpAttempts: aggregate.followUpAttempts + 1 };
+			currentUserBlockId = followUpBlockId;
+			followUpAttempt++;
 		}
 	} catch (err: any) {
 		// Propagate the error to any steerer waiting on a result and to the
@@ -2096,6 +2224,10 @@ async function runLoop(
 		cacheReadTokens: totalCacheReadTokens,
 		compactedBeforeAsk,
 		compactedOnOverflow,
+		// runLoop never drives follow-ups — that's the outer loop in runAsk.
+		// Each runLoop call contributes 0; runAsk increments as it commits
+		// follow-up blocks.
+		followUpAttempts: 0,
 	};
 
 	const pending = slot.pending.splice(0);
@@ -2170,7 +2302,14 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 				print(magenta(bold("  assistant")) + dim(toolsCount > 0 ? "" : " streaming..."));
 				print("");
 
-				const result = await runAsk(id, prompt, ctx, { printStream: true });
+				const result = await runAsk(id, prompt, ctx, {
+					printStream: true,
+					// Default ON for the CLI: if /todo is loaded and the agent
+					// has incomplete items, the agent will be re-prompted with
+					// a <system-reminder> instead of stopping early. No-op
+					// when /todo isn't running or the agent has no list.
+					followUpHook: makeTodoFollowUpHook(),
+				});
 
 				if (toolsCount > 0 && result.finalText) {
 					for (const line of result.finalText.split("\n")) print(`  ${line}`);
@@ -2182,6 +2321,7 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 				const compactionNotes: string[] = [];
 				if (result.compactedBeforeAsk) compactionNotes.push("auto-compacted before ask");
 				if (result.compactedOnOverflow) compactionNotes.push("compacted on overflow + retried");
+				if (result.followUpAttempts > 0) compactionNotes.push(`${result.followUpAttempts} follow-up turn(s)`);
 				const compactionSuffix = compactionNotes.length ? `, ${compactionNotes.join("; ")}` : "";
 				const cacheNote = result.cacheReadTokens > 0 || result.cacheCreationTokens > 0
 					? `, cache: ${result.cacheReadTokens} read + ${result.cacheCreationTokens} written`
@@ -3372,8 +3512,19 @@ const actorDef: ProgramActorDef = {
 		listTools: async (ctx: ProgramContext, agentId: string) => {
 			return await doListTools(agentId, ctx);
 		},
-		ask: async (ctx: ProgramContext, agentId: string, prompt: string) => {
-			return await runAsk(agentId, prompt, ctx);
+		ask: async (
+			ctx: ProgramContext,
+			agentId: string,
+			prompt: string,
+			opts?: { followUp?: { kind: "todo"; max?: number } | "none" },
+		) => {
+			let followUpHook: FollowUpHook | undefined;
+			if (opts?.followUp && opts.followUp !== "none") {
+				if (opts.followUp.kind === "todo") {
+					followUpHook = makeTodoFollowUpHook({ maxAttempts: opts.followUp.max });
+				}
+			}
+			return await runAsk(agentId, prompt, ctx, { followUpHook });
 		},
 		compact: async (ctx: ProgramContext, agentId: string, instructions?: string) => {
 			return await doCompact(agentId, instructions, ctx);
@@ -3432,6 +3583,8 @@ export const __test = {
 	doRegisterTool,
 	doStatus,
 	runAsk,
+	mergeAskResults,
+	makeTodoFollowUpHook,
 	shouldAutoCompact,
 	isContextOverflowError,
 	buildEffectiveSystem,

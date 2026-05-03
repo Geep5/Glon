@@ -32,6 +32,7 @@
 
 import type { ProgramDef, ProgramContext, ProgramActorDef } from "../runtime.js";
 import { spawnTool } from "./agent.js";
+import { todoWriteToolSpec } from "./todo.js";
 
 // ── ANSI ─────────────────────────────────────────────────────────
 
@@ -100,6 +101,7 @@ These are your real tools. If a request maps to one of them, use it directly.
 - Discord delivery: \`discord_send\` (peer DMs by peer_id)
 - Shell: \`shell_exec\`, \`shell_sessions\`, \`shell_kill\`
 - Subagents: \`spawn\` (parallel children with their own DAGs)
+- Tasks: \`todo_write\` — phased task list. Use it for anything 3+ steps. Mark in_progress before starting and completed immediately after; the harness will re-prompt you if you stop with anything pending.
 
 **Shell** (\`shell_exec\`): the universal escape hatch. Real bash on ${themPossessive} machine.
 Anything you'd do at a terminal — run a binary, hit an API, manipulate files — happens here.
@@ -1026,6 +1028,9 @@ function buildHarnessTools(agentId: string): ToolSpec[] {
 		...BASE_TOOLS,
 		...buildMemoryTools(agentId),
 		...buildShellTools(),
+		// /todo: phased task list per agent. Pairs with the follow-up hook
+		// in /agent — the harness re-prompts when items remain incomplete.
+		todoWriteToolSpec(agentId),
 		spawnTool(agentId),
 	];
 }
@@ -1254,7 +1259,15 @@ async function doIngest(
 	const harness = await ensureBootstrapped(state, ctx);
 	const peer = await resolvePeerForIngest(peerId, ctx);
 	const wrapped = formatIngestPrompt(peer, source, text);
-	const result = await ctx.dispatchProgram("/agent", "ask", [harness.agentId, wrapped]) as {
+	const result = await ctx.dispatchProgram("/agent", "ask", [
+		harness.agentId,
+		wrapped,
+		// Drive the agent past its natural stop when /todo items remain
+		// incomplete. Capped to 3 reminders by default so a stuck loop
+		// can't grind forever. No-op when /todo isn't running or the
+		// agent has no list.
+		{ followUp: { kind: "todo" } },
+	]) as {
 		finalText: string; iterations: number; toolCalls: number;
 		inputTokens: number; outputTokens: number;
 	};
