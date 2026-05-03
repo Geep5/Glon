@@ -63,6 +63,7 @@ const SOURCES = [
 	"src/programs/handlers/wallet.ts",
 	"src/programs/handlers/token.ts",
 	"src/programs/handlers/consensus.ts",
+	"src/programs/handlers/anchor.ts",
 	"package.json",
 	"tsconfig.json",
 ];
@@ -402,6 +403,19 @@ const PROGRAMS: ProgramDef[] = [
 		},
 		entry: "consensus.ts",
 		modules: { "consensus.ts": "src/programs/handlers/consensus.ts" },
+	},
+	{
+		prefix: "/anchor",
+		name: "Anchor",
+		commands: {
+			create: "Create a new anchor from current chain-mode state",
+			list: "Show recent anchors",
+			status: "Latest anchor + pending summary",
+			info: "Full anchor details + Merkle verify",
+			verify: "Verify Merkle root against stored commits",
+		},
+		entry: "anchor.ts",
+		modules: { "anchor.ts": "src/programs/handlers/anchor.ts" },
 	},
 	{
 		prefix: "/google",

@@ -103,6 +103,7 @@ Every script auto-loads `.env` from the project root, so `ANTHROPIC_API_KEY` and
 | `/wallet` | Local-only Ed25519 keychain. Stored at `${GLON_DATA}/wallet.json` mode 0600, never synced |
 | `/token` | Fungible-token program. Deploy, transfer, balance, holders |
 | `/consensus` | Validator gate for chain-mode: nonce + fee + semantic checks |
+ `/anchor` | State commitment: Merkle-root anchor blocks, longest-chain fork choice |
 
 Every program `export default`s a `ProgramDef`:
 
@@ -261,13 +262,13 @@ glon> /token holders 90c86a5aa43e4a5db979e659
 - Validator pipeline: signature gate (kernel) → nonce monotonicity + asymmetric fee (`/consensus`) → semantic check (`/token.validate_op`).
 - Per-pubkey nonces, replay rejection, U128 overflow protection.
 - `token deploy`, `token transfer`, `token balance`, `token holders`, `token info` CLI commands.
-- 123 chain-layer tests including subprocess-isolation determinism check.
+- `/anchor create/list/status/info/verify` — Merkle-root state commitment, auto-tick every 60s, longest-chain fork choice.
+- 133 chain-layer tests including subprocess-isolation determinism check.
 
 ### What's deferred
 
-- **`/anchor`**: global ordering and finality via PoST anchor blocks.
-- **PoST cryptography** ([chiapos](https://github.com/Chia-Network/chiapos), [chiavdf](https://github.com/Chia-Network/chiavdf)): subprocess-only via bundled CLI binaries.
-- **Reorg / fork choice**: requires the anchor chain.
+- **PoST cryptography** ([chiapos](https://github.com/Chia-Network/chiapos), [chiavdf](https://github.com/Chia-Network/chiavdf)): subprocess-only via bundled CLI binaries. Anchor creation will require a PoST proof.
+- **Reorg / fork choice**: requires the anchor chain + cumulative-VDF-iterations comparison.
 - **Adversarial sync hardening**: peer scoring, ban list, bounded buffer.
 - **State rent / storage_credit**: reserved field on every `chain.token` object (always `"0"` today).
 
@@ -433,6 +434,7 @@ test/
     wallet.test.ts            local keychain, mode-0600 storage, signing round-trip
     token.test.ts             chain.token classification, replay, all op kinds, U128 boundary
     consensus.test.ts         nonce monotonicity, asymmetric fees, validator dispatch
+    anchor.test.ts            Merkle tree, root verification, deterministic ordering
 ```
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for internals: DAG replay, actor state model, program context, memory, chain layer, and extensibility.

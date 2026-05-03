@@ -385,12 +385,45 @@ Per-pubkey nonce store lives in `/consensus`'s actor state as `nonces: Record<pu
 
 CLI: `consensus status`, `consensus nonces`, `consensus set-base-fee <n>`.
 
+### `/anchor` — state commitment and ordering
+
+Inspired by Chia's separation of consensus-critical "trunk" from payload "foliage":
+the `merkle_root` field is the trunk (determines fork choice); the `commits_json` field
+is the foliage (inspection only, not consensus-critical).
+
+Each anchor is a `chain.anchor` object with:
+
+| Field | Purpose |
+|---|---|
+| `height` | Sequential index (genesis = 0) |
+| `previous_anchor` | Object ID of previous anchor ("" for genesis) |
+| `merkle_root` | Hex SHA-256 root of binary Merkle tree over all chain-mode heads |
+| `timestamp` | Unix ms |
+| `creator` | Pubkey or "system" (v1) |
+| `commit_count` | Number of committed object heads |
+| `commits_json` | JSON array of `{objectId, headId}` (for inspection/verification) |
+
+**Merkle tree:**
+1. Leaf = `sha256(utf8Bytes(objectId + ":" + headId))`
+2. Sort leaves by hex string (deterministic)
+3. Pair adjacent: `node = sha256(left + right)`
+4. If odd count, duplicate last leaf
+5. Repeat until one hash remains = root
+
+**Fork choice (v1):** longest chain (highest `height`). Ties broken by earlier timestamp.
+In v1 with typically one creator, forks are unlikely.
+
+**Finality:** a Change is "finalized" when its object's head appears in an anchor.
+Changes after the latest anchor are "pending".
+
+CLI: `anchor create`, `anchor list [limit]`, `anchor status`, `anchor info <id>`, `anchor verify <id>`.
+Actor auto-ticks every 60s.
+
 ### What's deferred
 
-- **`/anchor` program**: anchor blocks committing to a Merkle root over every chain-mode object's head. Once anchors land, finalized Changes carry global ordering and can survive reorgs.
-- **PoST cryptography** ([chiapos](https://github.com/Chia-Network/chiapos), [chiavdf](https://github.com/Chia-Network/chiavdf)): subprocess-only via bundled CLI binaries.
-- **Reorg / fork choice**: requires anchor chain + cumulative-VDF-iterations comparison.
-- **Adversarial sync hardening**: peer scoring, ban list, bounded buffer, eclipse defense. `src/programs/handlers/sync.ts` is currently a stub.
+- **PoST cryptography** ([chiapos](https://github.com/Chia-Network/chiapos), [chiavdf](https://github.com/Chia-Network/chiavdf)): subprocess-only via bundled CLI binaries. Anchor creation will require a PoST proof.
+- **Reorg / fork choice**: requires the anchor chain + cumulative-VDF-iterations comparison.
+- **Adversarial sync hardening**: peer scoring, ban list, bounded buffer.
 - **State rent / storage_credit accounting**: every full node stores all chain state forever in v1. The `storage_credit` field is reserved on every `chain.token` object (always `"0"` today).
 
 ## Sync Protocol
@@ -493,6 +526,7 @@ src/programs/
     wallet.ts                local Ed25519 keychain
     token.ts                 fungible-token program
     consensus.ts             chain-mode validator gate
+    anchor.ts                state commitment: Merkle-root anchor blocks
     shell.ts                 persistent bash sessions
 scripts/
   daemon.ts                  headless host: no stdin, HTTP dispatch endpoint
