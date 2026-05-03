@@ -10,7 +10,7 @@ glon is inspired by [Anytype](https://anytype.io)'s philosophy — no hierarchy,
 
 ```
                 ┌──────────────────────────────────────────────────────┐
-   apps         │  Holdfast · Bloom (chain-aware) · automations · …    │   ← configurations of programs
+   apps         │  Holdfast · automations · …                          │   ← configurations of programs
                 ├──────────────────────────────────────────────────────┤
    programs     │  /agent /memory /chat /peer /wallet /token …         │   ← user-space, all hot-loadable
                 ├──────────────────────────────────────────────────────┤
