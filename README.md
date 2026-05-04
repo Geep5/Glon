@@ -1,10 +1,23 @@
 # glon
 
-A distributed operating environment for content-addressed objects, durable actors, and programs that act on them.
+An autonomous-agent operating environment where every agent has a wallet, a DAG-backed long-term memory, and the ability to recall any object from the past.
 
-LLM agents are **applications** that run on this substrate — they reuse the kernel's objects, DAG, actors, and sync rather than reinvent them. Conversation history is just blocks in a DAG. Memory is just typed objects. Tools are just calls to other programs. Subagents are just more agent objects.
+glon is a single stack with three layers designed together:
 
-glon is inspired by [Anytype](https://anytype.io)'s philosophy — no hierarchy, just objects and the links between them — and built on two primitives that hold up at scale: [Rivet](https://rivet.gg) actors and content-addressed protobuf. Every object is a durable actor, every mutation is an immutable change in a DAG, and the graph of relations between objects is the only structure.
+1. **A distributed object kernel.** Every entity is a content-addressed object in a DAG. Changes are immutable, signed, and replayable. Objects are actors: they wake, compute state from their history, and sleep. No external database.
+
+2. **An agent harness (Holdfast).** Identity-aware conversation ingest, durable memory (pinned facts + milestone arcs), scheduled reminders, persistent shell sessions, and subagent batching. An agent's entire conversation lives as blocks in its object's DAG. Compaction keeps context windows bounded without losing history.
+
+3. **Native crypto.** Every agent owns an Ed25519 keypair in a local wallet. Agents deploy UTXO tokens, sign transactions, and hold balances. The same signature gate that protects chain-mode objects also authenticates agent actions.
+
+What makes this an ideal environment for agents:
+
+- **Nothing is ever lost.** Deleted objects and compacted conversation blocks remain in the DAG. Agents can `recall` any past block or `inject` any object — even tombstoned ones — back into their active context.
+- **Agents are stateful by default.** Memory, tools, conversation history, and scheduled tasks are all native object types, not external integrations.
+- **Agents have money.** Wallet keys are agent-owned and local-only. Token operations are signed changes in the same DAG as everything else.
+- **Self-describing.** The system bootstraps its own source code into the store. Query glon for the code that built it.
+
+Inspired by [Anytype](https://anytype.io)'s object-graph philosophy, [Rivet](https://rivet.gg)'s durable actors, [Chia](https://www.chia.net/)'s proof-of-space-and-time consensus, and [oh-my-pi](https://github.com/can1357/oh-my-pi)'s agent harness.
 
 ## Quick start
 
@@ -29,49 +42,29 @@ Every script auto-loads `.env`. The dev server binds `:6420` (set `GLON_PORT` to
 
 ---
 
-## What glon is
+## Programs
 
-Five kernel primitives:
+Zero built-in commands. Every feature below is a program loaded from the store at startup.
 
-| Primitive | What it means |
-|---|---|
-| **Objects, not files** | No folders, no tree. Typed entities in a flat graph linked via `ObjectLink` fields. Structure emerges from connections. |
-| **Changes, not state** | Every mutation is a `Change` protobuf, content-addressed by SHA-256, appended to a DAG. State is computed by replay. |
-| **Actors, not databases** | Each object is a Rivet actor. `objectActor` (one per object), `storeActor` (singleton index), `programActor` (state + RPC). |
-| **Everything is a program** | Zero built-in commands. `/help`, `/crud`, `/agent`, `/coin` — all loaded from the store at startup. |
-| **Self-describing** | Bootstrap seeds the source files as objects into the store. Query glon for the code that built it. |
-
-Programs export a `ProgramDef`:
-
-```typescript
-export default {
-  handler: async (cmd, args, ctx) => { ... },  // CLI
-  actor: { createState: () => ({}), actions: { ... }, tickMs: 5000 },
-  validator: (changes) => { return { valid: true }; },
-  validatedTypes: ["chain.coin.bucket"],
-  chainMode: true,  // require Ed25519 signed Changes
-};
-```
-
-| Program | Purpose |
-|---|---|
-| `/help` | List available programs |
-| `/crud` | Create, list, get, set, delete, search objects |
-| `/inspect` | DAG history, change details, sync state |
-| `/ipc` | Inter-object messaging (inbox/outbox) |
-| `/graph` | Object link traversal, neighbours, BFS |
-| `/agent` | LLM agents with DAG-backed conversation, tool dispatch, auto-compaction, subagent spawning |
-| `/memory` | Durable agent memory: pinned facts and milestone arcs |
-| `/peer` | Identity, trust level, contact handles |
-| `/remind` | Scheduled actions |
-| `/discord` | Discord bridge |
-| `/holdfast` | Agent harness: identity-aware ingest + memory + reminders + shell + subagents |
-| `/wallet` | Local-only Ed25519 keychain |
-| `/coin` | **UTXO-based fungible tokens** |
-| `/consensus` | Validator gate for chain-mode: nonce + fee + semantic checks |
-| `/anchor` | State commitment + PoST gate + inflation rewards |
-| `/plot` | Proof of Space (chiapos) |
-| `/timelord` | Proof of Time (chiavdf) |
+| Program | Layer | Purpose |
+|---|---|---|
+| `/help` | — | List available programs |
+| `/crud` | Kernel | Create, list, get, set, delete, search objects |
+| `/inspect` | Kernel | DAG history, change details, sync state |
+| `/ipc` | Kernel | Inter-object messaging (inbox/outbox) |
+| `/graph` | Kernel | Object link traversal, neighbours, BFS |
+| `/agent` | Harness | LLM agents with DAG-backed conversation, tool dispatch, auto-compaction, subagent spawning |
+| `/memory` | Harness | Durable agent memory: pinned facts and milestone arcs |
+| `/peer` | Harness | Identity, trust level, contact handles |
+| `/remind` | Harness | Scheduled actions |
+| `/discord` | Harness | Discord bridge |
+| `/holdfast` | Harness | Agent harness: identity-aware ingest + memory + reminders + shell + subagents |
+| `/wallet` | Crypto | Local-only Ed25519 keychain |
+| `/coin` | Crypto | UTXO-based fungible tokens |
+| `/consensus` | Crypto | Validator gate for chain-mode: nonce + fee + semantic checks |
+| `/anchor` | Crypto | State commitment + PoST gate + inflation rewards |
+| `/plot` | Crypto | Proof of Space (chiapos) |
+| `/timelord` | Crypto | Proof of Time (chiavdf) |
 
 ---
 
@@ -167,7 +160,6 @@ glon> /coin transfer 90c86a5a... b2c3d4e5... 250 --key=alice
 glon> /coin balance 90c86a5a... a1b2c3d4...
   FIG  750
 ```
-
 
 ### `/anchor` — state commitment
 
