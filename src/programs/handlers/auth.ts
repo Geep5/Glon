@@ -101,12 +101,17 @@ interface AnthropicApiKeyCredential {
 	key: string;
 }
 
+interface KimiApiKeyCredential {
+	type: "api_key";
+	key: string;
+}
 type AnthropicCredential = AnthropicOAuthCredential | AnthropicApiKeyCredential;
 
 interface AuthFile {
 	version: 1;
 	credentials: {
 		anthropic?: AnthropicCredential;
+		kimi?: KimiApiKeyCredential;
 	};
 }
 
@@ -374,6 +379,25 @@ async function forceRefreshAnthropic(state: ResolverState): Promise<ResolvedAnth
 	return { token: refreshed.access, isOAuth: true };
 }
 
+// ── Kimi resolver ────────────────────────────────────────────────
+
+export interface ResolvedKimiCredential {
+	token: string;
+}
+
+async function resolveKimi(): Promise<ResolvedKimiCredential | null> {
+	const file = readAuthFile();
+	const cred = file.credentials.kimi;
+	if (cred) {
+		return { token: cred.key };
+	}
+	const env = process.env.KIMI_API_KEY;
+	if (env) {
+		return { token: env };
+	}
+	return null;
+}
+
 // ── Status formatting ────────────────────────────────────────────
 
 function formatExpiry(expires: number): string {
@@ -412,6 +436,25 @@ function describeAnthropicCredential(cred: AnthropicCredential | undefined): str
 	return lines;
 }
 
+function describeKimiCredential(cred: KimiApiKeyCredential | undefined): string[] {
+	const lines: string[] = [];
+	if (!cred) {
+		const env = process.env.KIMI_API_KEY;
+		if (env) {
+			lines.push(`  ${bold("kimi")}      ${dim("api_key (env: KIMI_API_KEY)")}`);
+			lines.push(dim(`    ${preview(env)}`));
+		} else {
+			lines.push(`  ${bold("kimi")}      ${red("not configured")}`);
+			lines.push(dim(`    Run ${cyan("/auth login kimi <api_key>")},`));
+			lines.push(dim(`    or set ${cyan("KIMI_API_KEY")} in .env`));
+		}
+		return lines;
+	}
+	lines.push(`  ${bold("kimi")}      ${dim("api_key (auth.json)")}`);
+	lines.push(dim(`    ${preview(cred.key)}`));
+	return lines;
+}
+
 function preview(token: string): string {
 	if (token.length <= 16) return token;
 	return `${token.slice(0, 8)}…${token.slice(-4)}`;
@@ -426,11 +469,28 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 	switch (cmd) {
 		case "login": {
 			const provider = args[0] ?? "anthropic";
-			if (provider !== "anthropic") {
+			if (provider !== "anthropic" && provider !== "kimi") {
 				print(red(`Unknown provider: ${provider}`));
-				print(dim(`  Supported: anthropic`));
+				print(dim(`  Supported: anthropic, kimi`));
 				break;
 			}
+
+			if (provider === "kimi") {
+				const apiKey = args[1];
+				if (!apiKey) {
+					print(red("  API key required"));
+					print(dim("  Usage: /auth login kimi <api_key>"));
+					break;
+				}
+				const file = readAuthFile();
+				file.credentials.kimi = { type: "api_key", key: apiKey };
+				writeAuthFile(file);
+				print(green("  Stored Kimi API key."));
+				print(dim("  Stored in ") + authFilePath());
+				break;
+			}
+
+			// Anthropic path
 			const code = args[1];
 
 			if (!code) {
@@ -483,6 +543,9 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 			for (const line of describeAnthropicCredential(file.credentials.anthropic)) {
 				print(line);
 			}
+			for (const line of describeKimiCredential(file.credentials.kimi)) {
+				print(line);
+			}
 			break;
 		}
 
@@ -494,26 +557,45 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 				print(yellow("  removed all credentials"));
 				break;
 			}
-			if (provider !== "anthropic") {
+			if (provider !== "anthropic" && provider !== "kimi") {
 				print(red(`Unknown provider: ${provider}`));
 				break;
 			}
-			if (!file.credentials.anthropic) {
-				print(dim("  no anthropic credential stored"));
+			if (provider === "anthropic") {
+				if (!file.credentials.anthropic) {
+					print(dim("  no anthropic credential stored"));
+					break;
+				}
+				delete file.credentials.anthropic;
+				if (Object.keys(file.credentials).length === 0) {
+					deleteAuthFile();
+				} else {
+					writeAuthFile(file);
+				}
+				print(yellow("  removed anthropic credential"));
 				break;
 			}
-			delete file.credentials.anthropic;
+			// kimi
+			if (!file.credentials.kimi) {
+				print(dim("  no kimi credential stored"));
+				break;
+			}
+			delete file.credentials.kimi;
 			if (Object.keys(file.credentials).length === 0) {
 				deleteAuthFile();
 			} else {
 				writeAuthFile(file);
 			}
-			print(yellow("  removed anthropic credential"));
+			print(yellow("  removed kimi credential"));
 			break;
 		}
 
 		case "refresh": {
 			const provider = args[0] ?? "anthropic";
+			if (provider === "kimi") {
+				print(dim("  Kimi API keys do not expire; nothing to refresh."));
+				break;
+			}
 			if (provider !== "anthropic") {
 				print(red(`Unknown provider: ${provider}`));
 				break;
@@ -544,12 +626,14 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 				bold("  Auth"),
 				`    ${cyan("auth login")} ${dim("[anthropic]")}            Start OAuth — prints a URL to approve in your browser`,
 				`    ${cyan("auth login")} ${dim("[anthropic] <code>")}     Finish OAuth — paste the code from claude.ai's success page`,
-				`    ${cyan("auth status")}                       Show current credential, expiry`,
-				`    ${cyan("auth refresh")} ${dim("[anthropic]")}          Force a token refresh`,
-				`    ${cyan("auth logout")} ${dim("[anthropic|all]")}        Delete stored credentials`,
+				`    ${cyan("auth login")} ${dim("kimi <api_key>")}       Store a Kimi API key`,
+				`    ${cyan("auth status")}                       Show current credentials and expiry`,
+				`    ${cyan("auth refresh")} ${dim("[anthropic|kimi]")}    Force a token refresh`,
+				`    ${cyan("auth logout")} ${dim("[anthropic|kimi|all]")}  Delete stored credentials`,
 				"",
 				dim(`  Credentials live in ${authFilePath()} (mode 0600).`),
 				dim(`  Anthropic env var ${process.env.ANTHROPIC_API_KEY ? "is" : "is NOT"} set; OAuth in auth.json takes precedence.`),
+				dim(`  Kimi env var ${process.env.KIMI_API_KEY ? "is" : "is NOT"} set; auth.json takes precedence.`),
 			].join("\n"));
 		}
 	}
@@ -561,21 +645,16 @@ const actorDef: ProgramActorDef = {
 	createState: (): ResolverState => ({ refreshInflight: null }),
 
 	actions: {
-		/**
-		 * Returns a usable Anthropic credential or null. Refreshes if the
-		 * stored OAuth token is within the expiry buffer. Other programs
-		 * (currently /agent) call this before every request.
-		 */
 		getAnthropic: async (ctx: ProgramContext): Promise<ResolvedAnthropicCredential | null> => {
 			return await resolveAnthropic(ctx.state as ResolverState);
 		},
 
-		/**
-		 * Force-refresh and return the new credential. Called by /agent on
-		 * 401 responses, when local expiry tracking might be wrong.
-		 */
 		refreshAnthropic: async (ctx: ProgramContext): Promise<ResolvedAnthropicCredential | null> => {
 			return await forceRefreshAnthropic(ctx.state as ResolverState);
+		},
+
+		getKimi: async (_ctx: ProgramContext): Promise<ResolvedKimiCredential | null> => {
+			return await resolveKimi();
 		},
 	},
 };
@@ -594,4 +673,5 @@ export const __test = {
 	base64UrlEncode,
 	resolveAnthropic,
 	forceRefreshAnthropic,
+	resolveKimi,
 };

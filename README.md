@@ -122,7 +122,7 @@ glon> /agent tree c07aa4d3
   └─ ✓ explore-b [explore] task=b
 ```
 
-**Auth:** Two credential kinds for Anthropic: API key (`ANTHROPIC_API_KEY` in `.env`) or Claude Pro/Max subscription (`/auth login anthropic`). OAuth wins if both configured.
+**Auth:** Anthropic: API key (`ANTHROPIC_API_KEY` in `.env`) or Claude Pro/Max subscription (`/auth login anthropic`). Kimi (Moonshot AI): API key (`KIMI_API_KEY` in `.env`) or `/auth login kimi <key>`. Set the agent's `model` field to a kimi model (e.g. `moonshot-v1-8k`) to route requests there.
 
 ---
 

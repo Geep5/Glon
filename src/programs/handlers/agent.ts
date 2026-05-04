@@ -784,6 +784,10 @@ interface ResolvedAnthropicCredential {
 	isOAuth: boolean;
 }
 
+interface ResolvedKimiCredential {
+	token: string;
+}
+
 /** Transient network failure heuristic — these are all worth one retry. */
 function isTransientFetchError(err: unknown): boolean {
 	const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
@@ -829,6 +833,24 @@ async function resolveAnthropicCredential(ctx: ProgramContext | undefined): Prom
 	}
 	const envKey = process.env.ANTHROPIC_API_KEY;
 	if (envKey) return { token: envKey, isOAuth: false };
+	return null;
+}
+
+/**
+ * Resolve a Kimi (Moonshot AI) credential. Tries the /auth program first,
+ * falls back to KIMI_API_KEY env var.
+ */
+async function resolveKimiCredential(ctx: ProgramContext | undefined): Promise<ResolvedKimiCredential | null> {
+	if (ctx) {
+		try {
+			const result = await ctx.dispatchProgram("/auth", "getKimi", []) as ResolvedKimiCredential | null;
+			if (result?.token) return result;
+		} catch {
+			// /auth not loaded — fall through to env-var.
+		}
+	}
+	const envKey = process.env.KIMI_API_KEY;
+	if (envKey) return { token: envKey };
 	return null;
 }
 
@@ -1053,10 +1075,190 @@ async function callAnthropic(
 	};
 }
 
-/** True when an error looks like an Anthropic context-overflow error. */
+/** Convert Anthropic-format messages to OpenAI-format for Kimi. */
+function anthropicMessagesToOpenAI(
+	messages: { role: string; content: string | AnthropicContent[] }[],
+): { role: string; content?: string; tool_calls?: any[]; tool_call_id?: string }[] {
+	const out: { role: string; content?: string; tool_calls?: any[]; tool_call_id?: string }[] = [];
+	for (const msg of messages) {
+		if (typeof msg.content === "string") {
+			out.push({ role: msg.role, content: msg.content });
+			continue;
+		}
+		const textParts: string[] = [];
+		const toolCalls: any[] = [];
+		const toolResults: { role: "tool"; tool_call_id: string; content: string }[] = [];
+		for (const c of msg.content) {
+			if (c.type === "text") {
+				textParts.push(c.text);
+			} else if (c.type === "tool_use") {
+				toolCalls.push({
+					id: c.id,
+					type: "function",
+					function: { name: c.name, arguments: JSON.stringify(c.input) },
+				});
+			} else if (c.type === "tool_result") {
+				toolResults.push({ role: "tool", tool_call_id: c.tool_use_id, content: c.content });
+			}
+		}
+		if (msg.role === "assistant") {
+			const openAiMsg: any = { role: "assistant" };
+			if (textParts.length > 0) openAiMsg.content = textParts.join("");
+			if (toolCalls.length > 0) openAiMsg.tool_calls = toolCalls;
+			out.push(openAiMsg);
+		} else {
+			// user role: text becomes a user message, tool_results become tool messages
+			if (textParts.length > 0) {
+				out.push({ role: "user", content: textParts.join("") });
+			}
+			out.push(...toolResults);
+		}
+	}
+	return out;
+}
+
+async function callKimi(
+	messages: { role: string; content: string | AnthropicContent[] }[],
+	system: string | undefined,
+	model: string,
+	temperature: number | undefined,
+	tools: ToolSpec[] | undefined,
+	onChunk: ((text: string) => void) | undefined,
+	maxTokens: number | undefined,
+	ctx: ProgramContext,
+): Promise<InferenceResult> {
+	const auth = await resolveKimiCredential(ctx);
+	if (!auth) {
+		throw new Error(
+			`No credentials for model "${model}". Run \`/auth login kimi <key\u003e\` or set KIMI_API_KEY.`,
+		);
+	}
+
+	const stream = !!onChunk && !tools;
+	const openAiMessages = anthropicMessagesToOpenAI(messages);
+	if (system) {
+		openAiMessages.unshift({ role: "system", content: system });
+	}
+
+	const body: Record<string, any> = {
+		model,
+		messages: openAiMessages,
+		stream,
+	};
+	if (maxTokens !== undefined) body.max_tokens = maxTokens;
+	if (temperature !== undefined) body.temperature = temperature;
+	if (tools && tools.length > 0) {
+		body.tools = tools.map((t) => ({
+			type: "function",
+			function: {
+				name: t.name,
+				description: t.description,
+				parameters: t.input_schema,
+			},
+		}));
+	}
+
+	const res = await fetchWithTransientRetry("https://api.moonshot.cn/v1/chat/completions", {
+		method: "POST",
+		headers: {
+			"Content-Type": "application/json",
+			"Authorization": `Bearer ${auth.token}`,
+		},
+		body: JSON.stringify(body),
+	});
+
+	if (!res.ok) {
+		const text = await res.text();
+		throw new Error(`Kimi API ${res.status}: ${text}`);
+	}
+
+	if (stream) {
+		let textAccum = "";
+		let inputTokens = 0;
+		let outputTokens = 0;
+		const decoder = new TextDecoder();
+		const reader = res.body!.getReader();
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			const chunk = decoder.decode(value, { stream: true });
+			for (const line of chunk.split("\n")) {
+				if (!line.startsWith("data: ")) continue;
+				const data = line.slice(6);
+				if (data === "[DONE]") continue;
+				try {
+					const parsed = JSON.parse(data);
+					const delta = parsed.choices?.[0]?.delta;
+					if (delta?.content) {
+						textAccum += delta.content;
+						onChunk!(delta.content);
+					}
+					if (parsed.usage?.prompt_tokens) {
+						inputTokens = parsed.usage.prompt_tokens;
+					}
+					if (parsed.usage?.completion_tokens) {
+						outputTokens = parsed.usage.completion_tokens;
+					}
+				} catch { /* ignore */ }
+			}
+		}
+		return {
+			content: textAccum ? [{ type: "text", text: textAccum }] : [],
+			stopReason: "end_turn",
+			model,
+			inputTokens,
+			outputTokens,
+		};
+	}
+
+	const data = await res.json() as any;
+	const choice = data.choices?.[0];
+	const message = choice?.message ?? {};
+	const content: AnthropicContent[] = [];
+	if (message.content) {
+		content.push({ type: "text", text: message.content });
+	}
+	for (const tc of message.tool_calls ?? []) {
+		if (tc.type === "function") {
+			content.push({
+				type: "tool_use",
+				id: tc.id,
+				name: tc.function?.name ?? "",
+				input: (safeJsonParse(tc.function?.arguments ?? "{}") as Record<string, unknown>) ?? {},
+			});
+		}
+	}
+	const finishReason = choice?.finish_reason;
+	const stopReason = finishReason === "tool_calls" ? "tool_use" : finishReason === "length" ? "max_tokens" : "end_turn";
+	return {
+		content,
+		stopReason,
+		model: data.model ?? model,
+		inputTokens: data.usage?.prompt_tokens ?? 0,
+		outputTokens: data.usage?.completion_tokens ?? 0,
+	};
+}
+
+async function callLLM(
+	messages: { role: string; content: string | AnthropicContent[] }[],
+	system: string | undefined,
+	model: string,
+	temperature: number | undefined,
+	tools: ToolSpec[] | undefined,
+	onChunk: ((text: string) => void) | undefined,
+	maxTokens: number | undefined,
+	ctx: ProgramContext,
+): Promise<InferenceResult> {
+	if (model.startsWith("moonshot")) {
+		return callKimi(messages, system, model, temperature, tools, onChunk, maxTokens, ctx);
+	}
+	return callAnthropic(messages, system, model, temperature, tools, onChunk, maxTokens, ctx);
+}
+
+/** True when an error looks like a context-overflow error from Anthropic or Kimi. */
 function isContextOverflowError(err: any): boolean {
 	const msg = err?.message ?? String(err ?? "");
-	return /too long|context length|prompt is too long|context_length_exceeded/i.test(msg);
+	return /too long|context length|prompt is too long|context_length_exceeded|context window|max context/i.test(msg);
 }
 
 // ── Block constructors ───────────────────────────────────────────
@@ -1302,7 +1504,7 @@ async function runExtractionLoop(
 
 	while (iterations < EXTRACTION_MAX_ITERATIONS) {
 		iterations++;
-		const result = await callAnthropic(
+		const result = await callLLM(
 			messages, EXTRACTION_SYSTEM, model, SUMMARY_TEMPERATURE, tools, undefined, SUMMARY_MAX_TOKENS, ctx,
 		);
 		inputTokens += result.inputTokens;
@@ -1429,7 +1631,7 @@ async function doCompact(
 
 	const prompt = buildSummaryPrompt(toSummarise, latestCompaction?.summary, customInstructions, !!extractionResult);
 
-	const result = await callAnthropic(
+	const result = await callLLM(
 		[{ role: "user", content: prompt }],
 		undefined,
 		model,
@@ -2084,7 +2286,7 @@ async function runLoop(
 
 		let result: InferenceResult;
 		try {
-			result = await callAnthropic(messages, effectiveSystem, model, temperature, tools.length > 0 ? tools : undefined, onChunk, undefined, ctx);
+			result = await callLLM(messages, effectiveSystem, model, temperature, tools.length > 0 ? tools : undefined, onChunk, undefined, ctx);
 		} catch (err: any) {
 			if (iterations === 1 && !compactedOnOverflow && isContextOverflowError(err)) {
 				// Overflow recovery: compact, then rebuild messages from the
@@ -2784,8 +2986,8 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 				`    ${cyan("agent unregister-tool")} ${dim("<id> <name>")}                remove a tool`,
 				`    ${cyan("agent tools")} ${dim("<id>")}                                 list registered tools`,
 				"",
-				dim("  Models: claude-sonnet-4-20250514, claude-haiku-4-20250414, etc."),
-				dim("  Requires ANTHROPIC_API_KEY env var."),
+				dim("  Models: claude-sonnet-4-20250514, claude-haiku-4-20250414, moonshot-v1-8k, moonshot-v1-32k, moonshot-v1-128k, etc."),
+				dim("  Requires ANTHROPIC_API_KEY or KIMI_API_KEY env var, or `/auth login`."),
 			].join("\n"));
 		}
 	}
