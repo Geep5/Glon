@@ -24,19 +24,36 @@ Inspired by [Anytype](https://anytype.io)'s object-graph philosophy, [Rivet](htt
 ```bash
 git clone https://github.com/Geep5/glon.git
 cd glon && npm install
-cp .env.example .env        # fill in secrets
+cp .env.example .env        # add at least one LLM API key
 
-# Terminal 1 — actor host
+# Terminal 1 — actor host (keep running)
 npm run dev
 
-# Terminal 2 — first run only
+# Terminal 2 — seed programs into the store (first run only)
 npm run bootstrap
 
 # Terminal 3 — interactive shell
 npm run client
 ```
 
+In the client, create your agent:
+
+```
+glon> /holdfast setup --name Graice --principal-name Grant
+```
+
+Then talk to it:
+
+```
+glon> /holdfast say Hello!
+```
+
 Every script auto-loads `.env`. The dev server binds `:6420` (set `GLON_PORT` to override). Clients auto-discover via `~/.glon/.endpoint`.
+
+**Models:** Set the agent's `model` field to switch providers.
+- Anthropic (default): `claude-sonnet-4-20250514`
+- Kimi (Moonshot): `moonshot-v1-8k`, `moonshot-v1-32k`, etc.
+- Kimi Coding (`sk-kimi-*` keys): `kimi-for-coding`
 
 **Headless:** `npx tsx scripts/daemon.ts` loads programs and exposes `POST /dispatch` on `:6430`.
 

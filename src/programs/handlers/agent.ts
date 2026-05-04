@@ -1158,12 +1158,25 @@ async function callKimi(
 		}));
 	}
 
-	const res = await fetchWithTransientRetry("https://api.moonshot.cn/v1/chat/completions", {
+	const isKimiCodingKey = auth.token.startsWith("sk-kimi-");
+	const kimiBaseUrl = isKimiCodingKey ? "https://api.kimi.com/coding" : "https://api.moonshot.cn";
+	const headers: Record<string, string> = {
+		"Content-Type": "application/json",
+		"Authorization": `Bearer ${auth.token}`,
+	};
+	if (isKimiCodingKey) {
+		// Kimi Coding API requires coding-agent identification headers.
+		headers["User-Agent"] = "KimiCLI/1.0.0";
+		headers["X-Msh-Platform"] = "kimi_cli";
+		headers["X-Msh-Version"] = "1.0.0";
+		headers["X-Msh-Device-Name"] = "glon";
+		headers["X-Msh-Device-Model"] = "Linux";
+		headers["X-Msh-Os-Version"] = "linux";
+		headers["X-Msh-Device-Id"] = "glon-agent-001";
+	}
+	const res = await fetchWithTransientRetry(`${kimiBaseUrl}/v1/chat/completions`, {
 		method: "POST",
-		headers: {
-			"Content-Type": "application/json",
-			"Authorization": `Bearer ${auth.token}`,
-		},
+		headers,
 		body: JSON.stringify(body),
 	});
 
@@ -1249,7 +1262,7 @@ async function callLLM(
 	maxTokens: number | undefined,
 	ctx: ProgramContext,
 ): Promise<InferenceResult> {
-	if (model.startsWith("moonshot")) {
+	if (model.startsWith("moonshot") || model.startsWith("kimi-")) {
 		return callKimi(messages, system, model, temperature, tools, onChunk, maxTokens, ctx);
 	}
 	return callAnthropic(messages, system, model, temperature, tools, onChunk, maxTokens, ctx);

@@ -1430,16 +1430,30 @@ const actorDef: ProgramActorDef = {
 		 * `/holdfast setup`, and headless callers (HTTP dispatch) should be
 		 * able to use the same verb.
 		 */
-		bootstrap: async (ctx: ProgramContext, opts?: string | SetupOpts) => {
-			const parsed: SetupOpts = typeof opts === "string" ? (opts ? JSON.parse(opts) : {}) : (opts ?? {});
+		bootstrap: async (ctx: ProgramContext, ...args: any[]) => {
+			const first = args[0];
+			let parsed: SetupOpts;
+			if (typeof first === "string" && args.length > 1) {
+				parsed = parseSetupArgs(args as string[]);
+			} else {
+				const opts = first as string | SetupOpts | undefined;
+				parsed = typeof opts === "string" ? (opts ? JSON.parse(opts) : {}) : (opts ?? {});
+			}
 			const result = await doSetup(parsed, ctx);
 			ctx.state.agentId = result.agentId;
 			ctx.state.agentName = result.agentName;
 			ctx.state.principalPeerId = result.principalPeerId;
 			return result;
 		},
-		setup: async (ctx: ProgramContext, opts?: string | SetupOpts) => {
-			const parsed: SetupOpts = typeof opts === "string" ? (opts ? JSON.parse(opts) : {}) : (opts ?? {});
+		setup: async (ctx: ProgramContext, ...args: any[]) => {
+			const first = args[0];
+			let parsed: SetupOpts;
+			if (typeof first === "string" && args.length > 1) {
+				parsed = parseSetupArgs(args as string[]);
+			} else {
+				const opts = first as string | SetupOpts | undefined;
+				parsed = typeof opts === "string" ? (opts ? JSON.parse(opts) : {}) : (opts ?? {});
+			}
 			const result = await doSetup(parsed, ctx);
 			ctx.state.agentId = result.agentId;
 			ctx.state.agentName = result.agentName;
@@ -1448,12 +1462,14 @@ const actorDef: ProgramActorDef = {
 		},
 
 		/** Process an inbound message from a named peer on a named source. */
-		ingest: async (ctx: ProgramContext, source: string, peerId: string, text: string) => {
+		ingest: async (ctx: ProgramContext, source: string, peerId: string, ...textParts: any[]) => {
+			const text = textParts.join(" ");
 			return await doIngest(source, peerId, text, ctx.state, ctx);
 		},
 
 		/** Shell-side convenience: the principal speaks to the agent directly. */
-		say: async (ctx: ProgramContext, text: string) => {
+		say: async (ctx: ProgramContext, ...textParts: any[]) => {
+			const text = textParts.join(" ");
 			return await doSay(text, ctx.state, ctx);
 		},
 
