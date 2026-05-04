@@ -145,7 +145,7 @@ A signed-token chain layered on the same per-actor DAG primitives. Four programs
 | Wallet | Local-only `${GLON_DATA}/wallet.json` (mode 0600) |
 | Determinism | `src/det/` — canonical proto encoder (sorted map<> entries), BigInt-only math, raw Ed25519 via `node:crypto` |
 
-### `/coin` — UTXO model (recommended)
+### `/coin` — UTXO model
 
 - `chain.token` objects hold metadata only (name, symbol, decimals, owner, supply).
 - `chain.coin.bucket` objects hold up to 1000 coins as `BlockAdd` ops with `contentType="chain.coin.op"`.
