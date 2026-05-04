@@ -7,15 +7,14 @@
 //   - Fork choice: longest chain (highest height), ties broken by timestamp.
 //   - State commitment: binary Merkle tree over (objectId + headId) pairs.
 //
-// v1 (pre-PoST):
-//   - Anchor creation is permissionless (any node can create).
-//   - No VDF proofs required; timestamps provide rough ordering.
-//   - Finality is "soft" — social consensus around which anchor chain to follow.
+// v1 (testnet PoST):
+//   - Simplified PoST: /plot (hash-based proof of space) + /timelord (sequential SHA-256 VDF).
+//   - Anchor creation optionally accepts a VDF output and plot proof.
+//   - Auto-tick runs without PoST (testnet mode) unless configured otherwise.
 //
-// Future (with PoST):
-//   - Anchor creation will require a PoST proof (chiapos + chiavdf).
-//   - Fastest valid proof wins the right to create the next anchor.
-//   - Timestamps become redundant; VDF output provides canonical ordering.
+// Future (mainnet PoST):
+//   - Replace simplified PoST with chiapos + chiavdf (real class-group VDFs).
+//   - Anchor creation requires a valid PoST proof; fastest proof wins.
 
 import type { ProgramDef, ProgramContext, ProgramActorDef } from "../runtime.js";
 import { sha256, hexEncode } from "../../crypto.js";
@@ -117,6 +116,7 @@ async function buildAnchor(
 	ctx: ProgramContext,
 	previousAnchorId: string,
 	height: number,
+	opts: { vdfOutput?: string; plotProof?: string; plotQuality?: number; creator?: string } = {},
 ): Promise<{ id: string; root: string; commits: AnchorCommit[] }> {
 	const store = ctx.store as any;
 
@@ -142,9 +142,12 @@ async function buildAnchor(
 		previous_anchor: previousAnchorId,
 		merkle_root: root,
 		timestamp: Date.now(),
-		creator: "system", // v1: no PoST proof, creator is generic
+		creator: opts.creator ?? "system",
 		commit_count: commits.length,
 		commits_json: JSON.stringify(commits),
+		vdf_output: opts.vdfOutput ?? "",
+		plot_proof: opts.plotProof ?? "",
+		plot_quality: opts.plotQuality ?? 0,
 	};
 
 	const id = (await store.create(ANCHOR_TYPE_KEY, JSON.stringify(fields))) as string;
@@ -229,7 +232,24 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 			const latest = await findLatestAnchor(store);
 			const height = latest ? latest.height + 1 : 0;
 			const previousId = latest ? latest.id : "";
-			const { id, root, commits } = await buildAnchor(ctx, previousId, height);
+
+			// Optional PoST arguments
+			const vdfArg = args.find((a) => a.startsWith("--vdf="));
+			const plotArg = args.find((a) => a.startsWith("--plot-proof="));
+			const qualityArg = args.find((a) => a.startsWith("--plot-quality="));
+			const creatorArg = args.find((a) => a.startsWith("--creator="));
+
+			const vdfOutput = vdfArg ? vdfArg.split("=")[1] : undefined;
+			const plotProof = plotArg ? plotArg.split("=")[1] : undefined;
+			const plotQuality = qualityArg ? Number(qualityArg.split("=")[1]) : undefined;
+			const creator = creatorArg ? creatorArg.split("=")[1] : undefined;
+
+			const { id, root, commits } = await buildAnchor(ctx, previousId, height, {
+				vdfOutput,
+				plotProof,
+				plotQuality,
+				creator,
+			});
 
 			// Update actor state.
 			state.lastAnchorId = id;
@@ -242,6 +262,8 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 			print(dim("  height: ") + String(height));
 			print(dim("  root:   ") + root.slice(0, 24) + "…");
 			print(dim("  commits:") + " " + commits.length + " object head(s)");
+			if (vdfOutput) print(dim("  vdf:    ") + "included");
+			if (plotProof) print(dim("  plot:   ") + `quality=${plotQuality ?? 0}`);
 			if (previousId) print(dim("  prev:   ") + previousId);
 			break;
 		}
@@ -273,7 +295,6 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 			print(dim("  merkle root:   ") + latest.root.slice(0, 24) + "…");
 			print(dim("  timestamp:     ") + new Date(latest.timestamp).toLocaleString());
 
-			// Count pending objects (chain-mode objects not in latest anchor)
 			const obj = await store.get(latest.id);
 			const fields = obj?.fields ?? {};
 			const commitsJson = String(fields.commits_json?.stringValue ?? fields.commits_json ?? "[]");
@@ -283,7 +304,11 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 			} catch { /* ignore */ }
 			print(dim("  commits:       ") + commitCount + " object head(s) in latest anchor");
 
-			// Count total chain-mode objects
+			const vdfOutput = String(fields.vdf_output?.stringValue ?? fields.vdf_output ?? "");
+			const plotQuality = Number(fields.plot_quality?.intValue ?? fields.plot_quality ?? 0);
+			if (vdfOutput) print(dim("  VDF proof:     ") + "included");
+			if (plotQuality > 0) print(dim("  plot quality:  ") + plotQuality + " bits");
+
 			let totalObjects = 0;
 			for (const typeKey of TRACKED_TYPES) {
 				const refs = (await store.list(typeKey)) as Array<{ id: string }>;
@@ -309,6 +334,8 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 			const creator = String(f.creator?.stringValue ?? f.creator ?? "system");
 			const commitCount = Number(f.commit_count?.intValue ?? f.commit_count ?? 0);
 			const commitsJson = String(f.commits_json?.stringValue ?? f.commits_json ?? "[]");
+			const vdfOutput = String(f.vdf_output?.stringValue ?? f.vdf_output ?? "");
+			const plotQuality = Number(f.plot_quality?.intValue ?? f.plot_quality ?? 0);
 
 			print(bold(`Anchor ${height}`));
 			print(dim("  id:       ") + id);
@@ -317,6 +344,8 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 			print(dim("  previous: ") + (previous || "(genesis)"));
 			print(dim("  time:     ") + new Date(timestamp).toLocaleString());
 			print(dim("  commits:  ") + commitCount);
+			if (vdfOutput) print(dim("  VDF:      ") + "included");
+			if (plotQuality > 0) print(dim("  quality:  ") + plotQuality + " bits");
 
 			// Verify Merkle root
 			try {
@@ -353,12 +382,13 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 		default: {
 			print([
 				bold("  Anchor") + dim(" — global ordering + state commitment for chain-mode objects"),
-				`    ${cyan("anchor create")}                 create a new anchor from current chain-mode state`,
+				`    ${cyan("anchor create")} ${dim("[--vdf=json] [--plot-proof=json] [--plot-quality=N] [--creator=name]")}`,
 				`    ${cyan("anchor list")} ${dim("[limit]")}        show recent anchors (newest first)`,
 				`    ${cyan("anchor status")}               latest height, commit count, pending objects`,
 				`    ${cyan("anchor info")} ${dim("<id>")}         full anchor details + Merkle verify`,
 				`    ${cyan("anchor verify")} ${dim("<id>")}        verify Merkle root against stored commits`,
 				dim(`  Auto-anchors every ${AUTO_ANCHOR_MS / 1000}s when the actor is running.`),
+				dim("  PoST proofs (VDF + plot) are optional in testnet mode."),
 			].join("\n"));
 		}
 	}
@@ -374,12 +404,12 @@ const actorDef: ProgramActorDef = {
 
 	actions: {
 		/** Create a new anchor from current chain-mode state. */
-		createAnchor: async (ctx: ProgramContext) => {
+		createAnchor: async (ctx: ProgramContext, opts?: { vdfOutput?: string; plotProof?: string; plotQuality?: number; creator?: string }) => {
 			const store = ctx.store as any;
 			const latest = await findLatestAnchor(store);
 			const height = latest ? latest.height + 1 : 0;
 			const previousId = latest ? latest.id : "";
-			const { id, root, commits } = await buildAnchor(ctx, previousId, height);
+			const { id, root, commits } = await buildAnchor(ctx, previousId, height, opts ?? {});
 
 			// Update state.
 			const s = loadState(ctx.state ?? {});
@@ -432,7 +462,7 @@ const actorDef: ProgramActorDef = {
 	},
 
 	onTick: async (ctx: ProgramContext) => {
-		// Auto-create anchor on tick.
+		// Auto-create anchor on tick (testnet mode: no PoST proof required).
 		const store = ctx.store as any;
 		const latest = await findLatestAnchor(store);
 		const height = latest ? latest.height + 1 : 0;

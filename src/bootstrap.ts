@@ -64,6 +64,8 @@ const SOURCES = [
 	"src/programs/handlers/token.ts",
 	"src/programs/handlers/consensus.ts",
 	"src/programs/handlers/anchor.ts",
+	"src/programs/handlers/plot.ts",
+	"src/programs/handlers/timelord.ts",
 	"package.json",
 	"tsconfig.json",
 ];
@@ -416,6 +418,30 @@ const PROGRAMS: ProgramDef[] = [
 		},
 		entry: "anchor.ts",
 		modules: { "anchor.ts": "src/programs/handlers/anchor.ts" },
+	},
+	{
+		prefix: "/plot",
+		name: "Plot",
+		commands: {
+			create: "Create a simplified plot file",
+			list: "List all plot files",
+			prove: "Find best proof for a challenge",
+			verify: "Verify a proof",
+		},
+		entry: "plot.ts",
+		modules: { "plot.ts": "src/programs/handlers/plot.ts" },
+	},
+	{
+		prefix: "/timelord",
+		name: "Timelord",
+		commands: {
+			compute: "Run VDF computation",
+			verify: "Verify a VDF output",
+			benchmark: "Measure VDF speed",
+			challenge: "Derive challenge from anchor merkle_root",
+		},
+		entry: "timelord.ts",
+		modules: { "timelord.ts": "src/programs/handlers/timelord.ts" },
 	},
 	{
 		prefix: "/google",

@@ -402,6 +402,10 @@ Each anchor is a `chain.anchor` object with:
 | `creator` | Pubkey or "system" (v1) |
 | `commit_count` | Number of committed object heads |
 | `commits_json` | JSON array of `{objectId, headId}` (for inspection/verification) |
+| `vdf_output` | VDF proof JSON (optional in testnet, required for mainnet) |
+| `plot_proof` | Plot proof JSON (optional in testnet, required for mainnet) |
+| `plot_quality` | Quality score of plot proof (higher = better) |
+
 
 **Merkle tree:**
 1. Leaf = `sha256(utf8Bytes(objectId + ":" + headId))`
@@ -419,12 +423,33 @@ Changes after the latest anchor are "pending".
 CLI: `anchor create`, `anchor list [limit]`, `anchor status`, `anchor info <id>`, `anchor verify <id>`.
 Actor auto-ticks every 60s.
 
+### Simplified PoST (testnet mode)
+
+v1 includes simplified PoST implementations for testing the anchor integration
+before chiapos/chiavdf are available. These are **not cryptographically secure**
+and should be replaced for mainnet.
+
+**`/plot`** — simplified Proof of Space:
+  - A plot is a file of N random 32-byte hashes (~32MB at 1M entries)
+  - Challenge = 32-byte hash
+  - Proof = the hash in the plot with smallest XOR distance to challenge
+  - Quality = count of leading zero bits in distance (higher = better)
+  - Winning = quality > threshold
+  - Replace with chiapos for mainnet
+
+**`/timelord`** — simplified VDF:
+  - VDF = `sha256^iterations(challenge)` (sequential hashing)
+  - Proof = final hash + iteration count
+  - Verification = re-run and compare
+  - NOT secure against ASICs; replace with chiavdf for mainnet
+
 ### What's deferred
 
-- **PoST cryptography** ([chiapos](https://github.com/Chia-Network/chiapos), [chiavdf](https://github.com/Chia-Network/chiavdf)): subprocess-only via bundled CLI binaries. Anchor creation will require a PoST proof.
+- **Real PoST cryptography** ([chiapos](https://github.com/Chia-Network/chiapos), [chiavdf](https://github.com/Chia-Network/chiavdf)): subprocess-only via bundled CLI binaries. The simplified PoST is functional for testnet but must be replaced.
 - **Reorg / fork choice**: requires the anchor chain + cumulative-VDF-iterations comparison.
 - **Adversarial sync hardening**: peer scoring, ban list, bounded buffer.
 - **State rent / storage_credit accounting**: every full node stores all chain state forever in v1. The `storage_credit` field is reserved on every `chain.token` object (always `"0"` today).
+
 
 ## Sync Protocol
 

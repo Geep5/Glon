@@ -104,6 +104,8 @@ Every script auto-loads `.env` from the project root, so `ANTHROPIC_API_KEY` and
 | `/token` | Fungible-token program. Deploy, transfer, balance, holders |
 | `/consensus` | Validator gate for chain-mode: nonce + fee + semantic checks |
  `/anchor` | State commitment: Merkle-root anchor blocks, longest-chain fork choice |
+ `/plot` | Simplified Proof of Space (testnet). Create plots, find/verify proofs |
+ `/timelord` | Simplified VDF (testnet). Compute/verify sequential SHA-256 proofs |
 
 Every program `export default`s a `ProgramDef`:
 
@@ -435,6 +437,8 @@ test/
     token.test.ts             chain.token classification, replay, all op kinds, U128 boundary
     consensus.test.ts         nonce monotonicity, asymmetric fees, validator dispatch
     anchor.test.ts            Merkle tree, root verification, deterministic ordering
+    plot.test.ts              simplified proof-of-space: create, prove, verify, tamper
+    timelord.test.ts          simplified VDF: compute, verify, deriveChallenge, benchmark
 ```
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for internals: DAG replay, actor state model, program context, memory, chain layer, and extensibility.
