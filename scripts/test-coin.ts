@@ -3,9 +3,8 @@
  * Coin UTXO integration test.
  * Requires dev server on :6420.
  *
- * Uses direct imports from src/programs/handlers/coin.js (same pattern
- * as demo-crypto-simple.ts) to bypass the esbuild bundling issue that
- * breaks dynamic imports inside loaded programs.
+	 * Uses direct imports from src/programs/handlers/coin.js to bypass the
+	 * esbuild bundling issue that breaks dynamic imports inside loaded programs.
  */
 
 import { createClient } from "rivetkit/client";
