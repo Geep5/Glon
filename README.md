@@ -38,7 +38,7 @@ Five kernel primitives:
 | **Objects, not files** | No folders, no tree. Typed entities in a flat graph linked via `ObjectLink` fields. Structure emerges from connections. |
 | **Changes, not state** | Every mutation is a `Change` protobuf, content-addressed by SHA-256, appended to a DAG. State is computed by replay. |
 | **Actors, not databases** | Each object is a Rivet actor. `objectActor` (one per object), `storeActor` (singleton index), `programActor` (state + RPC). |
-	| **Everything is a program** | Zero built-in commands. `/help`, `/crud`, `/agent`, `/coin` — all loaded from the store at startup. |
+| **Everything is a program** | Zero built-in commands. `/help`, `/crud`, `/agent`, `/coin` — all loaded from the store at startup. |
 | **Self-describing** | Bootstrap seeds the source files as objects into the store. Query glon for the code that built it. |
 
 Programs export a `ProgramDef`:
@@ -48,7 +48,7 @@ export default {
   handler: async (cmd, args, ctx) => { ... },  // CLI
   actor: { createState: () => ({}), actions: { ... }, tickMs: 5000 },
   validator: (changes) => { return { valid: true }; },
-	  validatedTypes: ["chain.coin.bucket"],
+  validatedTypes: ["chain.coin.bucket"],
   chainMode: true,  // require Ed25519 signed Changes
 };
 ```
@@ -67,7 +67,7 @@ export default {
 | `/discord` | Discord bridge |
 | `/holdfast` | Agent harness: identity-aware ingest + memory + reminders + shell + subagents |
 | `/wallet` | Local-only Ed25519 keychain |
-| `/coin` | **UTXO-based fungible tokens** (recommended for new tokens) |
+| `/coin` | **UTXO-based fungible tokens** |
 | `/consensus` | Validator gate for chain-mode: nonce + fee + semantic checks |
 | `/anchor` | State commitment + PoST gate + inflation rewards |
 | `/plot` | Proof of Space (chiapos) |
@@ -135,7 +135,7 @@ glon> /agent tree c07aa4d3
 
 ## Crypto
 
-A signed-token chain layered on the same per-actor DAG primitives. Three programs (`/wallet`, `/coin`, `/consensus`) plus a kernel-level Ed25519 signature gate.
+A signed-token chain layered on the same per-actor DAG primitives. Four programs (`/wallet`, `/coin`, `/consensus`, `/anchor`) plus a kernel-level Ed25519 signature gate.
 
 | Feature | Primitive |
 |---|---|
@@ -191,7 +191,7 @@ glon> /coin balance 90c86a5a... a1b2c3d4...
 
 **Discord bridge.** Create app at [Discord Developer Portal](https://discord.com/developers/applications) → Bot tab → copy token into `.env` as `DISCORD_BOT_TOKEN`. OAuth2 URL Generator: scope `bot`, permissions `Send Messages` + `Read Message History`. Find your user id (Settings → Advanced → Developer Mode → right-click name → Copy User ID) for `/holdfast setup --principal-discord <id>`.
 
-**State rent.** Reserved `storage_credit` field on every `chain.token` object (always `"0"` in v1). Deferred.
+**State rent.** Reserved `storage_credit` field on coin metadata objects (`chain.token` typed, always `"0"` in v1). Deferred.
 
 **Sync.** Pull-based over HTTP with protobuf `Envelope`. Chain-mode signature gate means forged Changes are rejected before disk. Full P2P hardening (mDNS discovery, Bloom filters, reputation) is deferred.
 
