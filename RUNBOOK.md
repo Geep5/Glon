@@ -141,6 +141,7 @@ Set `GLON_PORT` in `.env` to override the dev server port. The daemon port is co
 | `src/programs/handlers/agent.ts` | Agent logic, model defaults, compaction |
 | `src/programs/handlers/discord.ts` | Discord bridge, gateway, polling |
 | `src/programs/handlers/holdfast.ts` | Harness wiring (tools, ingest, say) |
+| `src/programs/handlers/coin.ts`  | Coin, token, bucket, and offer handlers |
 | `scripts/daemon.ts` | Headless daemon entry point |
 | `.env` | API keys, tokens, ports |
 
@@ -159,7 +160,72 @@ npx tsx src/client.ts <<'EOF'
 /holdfast say ping
 EOF
 ```
+
+
 Expected: gateway connected, agent ID + principal ID printed, and a "pong" response.
+
+---
+
+## Coin Offers (atomic swaps)
+
+Glon supports peer-to-peer atomic token swaps via `chain.coin.offer`. Offers are never-expiring and support N-for-M multi-asset trades from day one. Settlement uses cross-object batch validation (`pushChangesBatch`) for atomicity.
+
+### Deploy a token first
+
+```bash
+npx tsx src/client.ts <<'EOF'
+/coin deploy MyToken MT 1000000 --decimals=2 --key=default
+EOF
+```
+
+### Create an offer (maker)
+
+```bash
+npx tsx src/client.ts <<'EOF'
+/coin offer create <token_id> <amount> <request_token_id> <request_amount> --key=default
+EOF
+```
+
+Example: offer 1000 MT for 500 of another token.
+
+### Accept an offer (taker)
+
+```bash
+npx tsx src/client.ts <<'EOF'
+/coin offer accept <offer_id> --key=default
+EOF
+```
+
+The taker must have sufficient balance of the requested tokens. The command auto-selects payment coins, spends them, pays into the offer, and settles atomically in a single batch.
+
+### Claim settled outputs
+
+After settlement, each party claims their outputs:
+
+```bash
+npx tsx src/client.ts <<'EOF'
+/coin offer claim <offer_id> --key=default
+EOF
+```
+
+### Other offer commands
+
+```bash
+# List all offers
+/coin offer list
+
+# Show offer details + replay state
+/coin offer info <offer_id>
+
+# Cancel (maker only)
+/coin offer cancel <offer_id> --key=default
+
+# Export offer JSON for sharing
+/coin offer export <offer_id> --file=offer.json
+
+# Inspect exported offer
+/coin offer import offer.json
+```
 
 ---
 
