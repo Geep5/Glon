@@ -34,3 +34,7 @@ tell-agent-truth.sh
 
 # Alpaca trading scripts (contain API credentials inline)
 scripts/alpaca-filter.ts
+
+# Trading system (Alpaca credentials + proprietary strategy)
+src/programs/handlers/trading.ts
+scripts/trading-rounds.ts
