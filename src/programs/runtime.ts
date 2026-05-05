@@ -73,14 +73,21 @@ export interface ProgramContext {
 	dispatchProgram: (prefix: string, action: string, args: unknown[]) => Promise<unknown>;
 }
 
+
 /** Validation result returned by program validators. */
 export interface ValidationResult {
 	valid: boolean;
 	error?: string;
 }
 
-/** A program validator function. */
-export type ValidatorFn = (changes: Change[]) => ValidationResult;
+/** Context passed to validators during cross-object batch validation. */
+export interface BatchValidationContext {
+	/** All changes in the batch, across all objects. */
+	allChanges: Change[];
+}
+
+/** A program validator function. Receives changes for its object plus optional batch context. */
+export type ValidatorFn = (changes: Change[], context?: BatchValidationContext) => ValidationResult;
 
 /** Shape of a program's actor definition (exported from module programs). */
 export interface ProgramActorDef {

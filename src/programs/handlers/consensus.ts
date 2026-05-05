@@ -72,8 +72,10 @@ export const MINT_FEE_MULTIPLIER = 10n;
  * for. Each entry binds a typeKey to (programPrefix, validateAction).
  * Adding a new chain-mode type is one entry here plus the program.
  */
+
 const TYPE_DISPATCH: Record<string, { prefix: string; action: string; idKey: string }> = {
-	"chain.coin.bucket": { prefix: "/coin", action: "validate_op", idKey: "bucketId" },
+	"chain.coin.bucket": { prefix: "/coin", action: "validate_op", idKey: "objectId" },
+	"chain.coin.offer": { prefix: "/coin", action: "validate_op", idKey: "objectId" },
 };
 
 // ── Op-kind classification (informational, fee-only) ─────────────

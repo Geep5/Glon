@@ -30,7 +30,10 @@ import {
 } from "./dag/change.js";
 import { computeState, findHeads, toSnapshot, type ObjectState, type BlockProvenance } from "./dag/dag.js";
 import { initDisk, writeChange, readChangeByHex, listChangeFilesForObject, deleteChangesForObject, diskStats } from "./disk.js";
+
 import { getValidator, isChainModeType } from "./programs/runtime.js";
+import type { BatchValidationContext } from "./programs/runtime.js";
+
 import { canonicalEncodeChange, canonicalEncodeChangeForSigning } from "./det/canonical.js";
 import { verify as ed25519Verify } from "./det/ed25519.js";
 import { replayBucket, decodeCoinOp, BUCKET_TYPE_KEY } from "./programs/handlers/coin.js";
@@ -371,9 +374,11 @@ const objectActor = actor({
 				}
 			}
 
+
 			const validator = getValidator(effectiveTypeKey);
 			if (validator) {
-				const result = validator(decoded);
+				const context: BatchValidationContext = { allChanges: decoded };
+				const result = validator(decoded, context);
 				if (!result.valid) {
 					throw new Error(`Validation rejected: ${result.error}`);
 				}
@@ -576,9 +581,26 @@ const storeActor = actor({
 			)) as unknown as { id: string }[];
 			if (rows.length === 0) return null;
 
-			const client = c.client<typeof app>();
-			const objActor = client.objectActor.getOrCreate([id]);
-			return await objActor.read();
+
+			// Always load fresh from disk so pushChangesBatch mutations
+			// are visible immediately without waiting for actor vars sync.
+			initDisk();
+			const result = loadFromDisk(id);
+			if (!result) return null;
+			const vars = computedToVars(result.state, result.changeCount);
+			return {
+				id,
+				typeKey: vars.typeKey,
+				fields: vars.fields,
+				content: vars.content,
+				blocks: vars.blocks,
+				blockProvenance: vars.blockProvenance,
+				deleted: vars.deleted,
+				createdAt: vars.createdAt,
+				updatedAt: vars.updatedAt,
+				headIds: vars.headIds,
+				changeCount: vars.changeCount,
+			};
 		},
 
 		getRef: async (c, id: string): Promise<ObjectRef | null> => {
@@ -835,6 +857,131 @@ const storeActor = actor({
 				}
 			}
 			return result;
+
+		},
+
+		/** Cross-object batch push: validates and writes changes for multiple objects
+		 *  atomically — either all pass validation or none are written.
+		 *
+		 *  Input: JSON array of { objectId: string, changesBase64: string }
+		 *  Each changesBase64 is comma-separated base64-encoded Change protobufs.
+		 */
+		pushChangesBatch: async (c, entriesJson: string) => {
+			const entries = JSON.parse(entriesJson) as Array<{ objectId: string; changesBase64: string }>;
+			if (!Array.isArray(entries) || entries.length === 0) {
+				throw new Error("pushChangesBatch: expected non-empty array of { objectId, changesBase64 }");
+			}
+
+			initDisk();
+
+			// Decode all changes, group by objectId.
+			const groupMap = new Map<string, Change[]>();
+			const allChanges: Change[] = [];
+
+			for (const entry of entries) {
+				const parts = entry.changesBase64.split(",").filter(Boolean);
+				const decoded: Change[] = [];
+				for (const b64 of parts) {
+					const bytes = Buffer.from(b64, "base64");
+					decoded.push(decodeChange(new Uint8Array(bytes)));
+				}
+				const existing = groupMap.get(entry.objectId) ?? [];
+				groupMap.set(entry.objectId, existing.concat(decoded));
+				allChanges.push(...decoded);
+			}
+
+			// For each group: resolve typeKey, run signature gate.
+			const typeKeyMap = new Map<string, string>();
+			for (const [objectId, changes] of groupMap) {
+				let effectiveTypeKey = "";
+				const objRows = (await c.db.execute(
+					"SELECT type_key FROM objects WHERE id = ? AND deleted = 0",
+					objectId,
+				)) as unknown as { type_key: string }[];
+				if (objRows.length > 0) {
+					effectiveTypeKey = objRows[0].type_key;
+				}
+				if (!effectiveTypeKey) {
+					for (const ch of changes) {
+						for (const op of ch.ops ?? []) {
+							if (op.objectCreate?.typeKey) {
+								effectiveTypeKey = op.objectCreate.typeKey;
+								break;
+							}
+						}
+						if (effectiveTypeKey) break;
+					}
+				}
+				if (!effectiveTypeKey) {
+					throw new Error(`pushChangesBatch: cannot resolve typeKey for object ${objectId}`);
+				}
+				typeKeyMap.set(objectId, effectiveTypeKey);
+
+				// Signature gate
+				if (isChainModeType(effectiveTypeKey)) {
+					for (const change of changes) {
+						const sig = change.authorSig;
+						if (!sig || !sig.pubkey || sig.pubkey.length === 0) {
+							throw new Error(`signature gate: chain-mode change for object ${change.objectId} is missing author_sig`);
+						}
+						if (sig.pubkey.length !== 32) {
+							throw new Error(`signature gate: pubkey must be 32 bytes (got ${sig.pubkey.length})`);
+						}
+						if (!sig.signature || sig.signature.length !== 64) {
+							throw new Error(`signature gate: signature must be 64 bytes (got ${sig.signature?.length ?? 0})`);
+						}
+						const signingBytes = canonicalEncodeChangeForSigning(change);
+						const ok = ed25519Verify(sig.pubkey, signingBytes, sig.signature);
+						if (!ok) {
+							throw new Error(`signature gate: invalid signature for change in ${change.objectId}`);
+						}
+						const expectedId = sha256(canonicalEncodeChange(change));
+						if (hexEncode(expectedId) !== hexEncode(change.id)) {
+							throw new Error(`signature gate: change id does not match canonical hash`);
+						}
+					}
+				}
+			}
+
+			// Run validators with full batch context.
+			const batchContext: BatchValidationContext = { allChanges };
+			for (const [objectId, changes] of groupMap) {
+				const effectiveTypeKey = typeKeyMap.get(objectId)!;
+				const validator = getValidator(effectiveTypeKey);
+				if (validator) {
+					const result = validator(changes, batchContext);
+					if (!result.valid) {
+						throw new Error(`Validation rejected for ${objectId}: ${result.error}`);
+					}
+				}
+			}
+
+			// All validation passed — write to disk, recompute, index.
+			for (const change of allChanges) {
+				writeChange(change);
+			}
+
+
+			// Recompute + index each object.
+			for (const objectId of groupMap.keys()) {
+				const result = loadFromDisk(objectId);
+				if (result) {
+					await indexObject(c, result.state);
+					if (result.state.typeKey === BUCKET_TYPE_KEY) {
+						await indexCoins(c, result.state);
+					}
+				}
+
+				for (const change of groupMap.get(objectId)!) {
+					await indexChange(c, change);
+				}
+
+
+
+			}
+
+
+			return { ok: true, objects: Array.from(groupMap.keys()) };
 		},
 	},
 });

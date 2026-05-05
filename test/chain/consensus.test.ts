@@ -325,9 +325,10 @@ describe("validateFully", () => {
 		const r = await validateFully(deployChange(), "bucket-1", emptyState(), ctx);
 		assert.equal(r.ok, true);
 		assert.equal(dispatchCalls.length, 1);
+
 		assert.equal(dispatchCalls[0].prefix, "/coin");
 		assert.equal(dispatchCalls[0].action, "validate_op");
-		assert.equal(dispatchCalls[0].args[0].bucketId, "bucket-1");
+		assert.equal(dispatchCalls[0].args[0].objectId, "bucket-1");
 	});
 
 	it("returns the consensus failure WITHOUT dispatching when gate fails", async () => {
