@@ -45,7 +45,7 @@ function blue(s: string) { return `${BLUE}${s}${RESET}`; }
 
 // ── Constants ────────────────────────────────────────────────────
 
-const DEFAULT_MODEL = "claude-sonnet-4-20250514";
+const DEFAULT_MODEL = "moonshot-v1-8k";
 // Per-agent override: agent.fields.max_tool_iterations (int)
 const DEFAULT_MAX_TOOL_ITERATIONS = 100;
 const TOOL_RESULT_TRUNCATE = 8192;
@@ -141,6 +141,8 @@ interface InferenceResult {
 	cacheCreationTokens?: number;
 	/** Tokens read from the prompt cache this turn (~10% of normal input price). */
 	cacheReadTokens?: number;
+	/** Kimi reasoning_content (chain-of-thought) that must be preserved across turns. */
+	reasoningContent?: string;
 }
 
 interface CompactionConfig {
@@ -1105,13 +1107,16 @@ function anthropicMessagesToOpenAI(
 			const openAiMsg: any = { role: "assistant" };
 			if (textParts.length > 0) openAiMsg.content = textParts.join("");
 			if (toolCalls.length > 0) openAiMsg.tool_calls = toolCalls;
+			if ((msg as any).reasoningContent) openAiMsg.reasoning_content = (msg as any).reasoningContent;
 			out.push(openAiMsg);
 		} else {
-			// user role: text becomes a user message, tool_results become tool messages
+			// user role: text becomes a user message, tool_results become tool messages.
+			// OpenAI requires tool messages to follow immediately after assistant tool_calls,
+			// so emit tool messages before any user text in this turn.
+			out.push(...toolResults);
 			if (textParts.length > 0) {
 				out.push({ role: "user", content: textParts.join("") });
 			}
-			out.push(...toolResults);
 		}
 	}
 	return out;
@@ -1174,10 +1179,12 @@ async function callKimi(
 		headers["X-Msh-Os-Version"] = "linux";
 		headers["X-Msh-Device-Id"] = "glon-agent-001";
 	}
+
+	const bodyJson = JSON.stringify(body);
 	const res = await fetchWithTransientRetry(`${kimiBaseUrl}/v1/chat/completions`, {
 		method: "POST",
 		headers,
-		body: JSON.stringify(body),
+		body: bodyJson,
 	});
 
 	if (!res.ok) {
@@ -1187,6 +1194,7 @@ async function callKimi(
 
 	if (stream) {
 		let textAccum = "";
+		let reasoningAccum = "";
 		let inputTokens = 0;
 		let outputTokens = 0;
 		const decoder = new TextDecoder();
@@ -1206,6 +1214,9 @@ async function callKimi(
 						textAccum += delta.content;
 						onChunk!(delta.content);
 					}
+					if (delta?.reasoning_content) {
+						reasoningAccum += delta.reasoning_content;
+					}
 					if (parsed.usage?.prompt_tokens) {
 						inputTokens = parsed.usage.prompt_tokens;
 					}
@@ -1221,6 +1232,7 @@ async function callKimi(
 			model,
 			inputTokens,
 			outputTokens,
+			reasoningContent: reasoningAccum || undefined,
 		};
 	}
 
@@ -1249,6 +1261,7 @@ async function callKimi(
 		model: data.model ?? model,
 		inputTokens: data.usage?.prompt_tokens ?? 0,
 		outputTokens: data.usage?.completion_tokens ?? 0,
+		reasoningContent: message.reasoning_content,
 	};
 }
 
@@ -1565,7 +1578,7 @@ async function runExtractionLoop(
 				type: "tool_result", tool_use_id: tu.id, content, is_error: isError,
 			});
 		}
-		messages.push({ role: "assistant", content: result.content });
+		messages.push({ role: "assistant", content: result.content, reasoningContent: result.reasoningContent });
 		messages.push({ role: "user", content: toolResults });
 	}
 
@@ -2338,7 +2351,7 @@ async function runLoop(
 
 		// Append the assistant message (text + tool_uses) to local messages.
 		if (result.content.length > 0) {
-			messages.push({ role: "assistant", content: result.content });
+			messages.push({ role: "assistant", content: result.content, reasoningContent: result.reasoningContent });
 		}
 
 		// Persist to DAG and record text-emitting iterations for attribution.

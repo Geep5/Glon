@@ -244,6 +244,8 @@ pattern that fills your context with no signal and can drive you past the
 context-window ceiling. Prefer event-driven hooks (Discord ingest, a single
 /remind at a real human-meaningful time) over recurring self-prompts.
 
+
+
 ## Discord
 discord_send delivers a single message to a peer's Discord DM. Payload:
 \`{peer_id, text}\`. The peer must have \`discord_id\` set on their object
@@ -253,6 +255,11 @@ just respond when prompted. The bridge tags every inbound message with
 the sender's display_name + trust level so the identity-awareness rules
 above apply directly.
 
+discord_bridge_send posts to a shared Discord channel (e.g., for inter-agent
+communication with another bot). Payload: \`{channel_id, text}\`. Use this when
+you need to proactively message another agent in a bridge channel. Inbound
+bridge messages are also delivered as user turns, tagged with the sender's
+peer info and trust level.
 ## Subagents
 \`spawn\` runs one or more child agents in parallel and waits for all of
 them before returning a compressed batch result. Use it when work splits
@@ -582,6 +589,20 @@ const BASE_TOOLS: ToolSpec[] = [
 		},
 		target_prefix: "/discord",
 		target_action: "send",
+	},
+	{
+		name: "discord_bridge_send",
+		description: "Send a message to a Discord bridge channel (inter-agent communication). Use when you need to proactively reach another agent in a shared channel.",
+		input_schema: {
+			type: "object",
+			properties: {
+				channel_id: { type: "string" },
+				text: { type: "string" },
+			},
+			required: ["channel_id", "text"],
+		},
+		target_prefix: "/discord",
+		target_action: "sendChannel",
 	},
 	{
 		name: "remind_schedule",

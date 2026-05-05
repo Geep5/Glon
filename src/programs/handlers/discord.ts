@@ -42,6 +42,30 @@ const DISCORD_API = "https://discord.com/api/v10";
 const DEFAULT_POLL_MS = 3000;
 const MESSAGE_MAX_LEN = 2000;
 
+
+// ── Bridge channels ──────────────────────────────────────────────
+// Inter-agent communication happens over shared Discord channels
+// (bot-to-bot DMs are forbidden by Discord TOS). Channels listed in
+// GLON_BRIDGE_CHANNELS are polled alongside DMs. Messages from known
+// peers are routed through /holdfast.ingest exactly like DMs.
+//
+// Format: GLON_BRIDGE_CHANNELS=channelId1,channelId2,...
+//
+// Loop safety: only ONE bot in a bridge channel should auto-ingest.
+// The other bot(s) should leave GLON_BRIDGE_CHANNELS empty and post
+// manually via discord_bridge_send or sendChannel.
+
+/** Parse GLON_BRIDGE_CHANNELS env var into a list of channel IDs. */
+function getBridgeChannels(): string[] {
+	const raw = process.env.GLON_BRIDGE_CHANNELS ?? "";
+	if (!raw) return [];
+	return raw.split(",").map((s) => s.trim()).filter(Boolean);
+}
+
+/** Whether to ingest messages from agent-kind peers in bridge channels.
+ *  Default true. Set to false on the "listening" side if both bots
+ *  auto-ingest and you want to break reply loops. */
+const BRIDGE_INGEST_AGENTS = (process.env.GLON_BRIDGE_INGEST_FROM_AGENTS ?? "true") !== "false";
 // ── Types ────────────────────────────────────────────────────────
 
 interface PeerSnapshot {
@@ -324,18 +348,96 @@ async function pollPeer(peer: PeerSnapshot, state: Record<string, any>, ctx: Pro
 	return processed;
 }
 
-async function runPoll(state: Record<string, any>, ctx: ProgramContext): Promise<{ peers: number; processed: number }> {
+/** Poll a bridge channel (shared server channel, not a DM) for messages from
+ *  known peers. Works like pollPeer but resolves the sender by discord_id
+ *  rather than opening a DM channel. Replies are posted back to the same
+ *  channel. */
+async function pollBridgeChannel(channelId: string, state: Record<string, any>, ctx: ProgramContext): Promise<number> {
+	state.watermarks = state.watermarks ?? {};
+	const watermark = state.watermarks[channelId] as string | undefined;
+	const isFirstPoll = !watermark;
+
+	const qs = isFirstPoll ? `?limit=5` : `?limit=10&after=${watermark}`;
+	const msgs = await discord("GET", `/channels/${channelId}/messages${qs}`) as DiscordMessage[] | null;
+	if (!msgs || msgs.length === 0) {
+		if (isFirstPoll) state.watermarks[channelId] = "0";
+		return 0;
+	}
+
+	const botUserId = await getBotUserId(state);
+	const sorted = [...msgs].sort((a, b) => a.id.localeCompare(b.id));
+
+	const now = Date.now();
+	const eligible = isFirstPoll
+		? sorted.filter((m) => now - snowflakeTimestampMs(m.id) <= FIRST_POLL_RECENCY_MS)
+		: sorted;
+
+	const newest = sorted[sorted.length - 1].id;
+	if (!watermark || newest > watermark) state.watermarks[channelId] = newest;
+
+	// Build a lookup of peer by discord_id so we can identify the sender.
+	const peers = await fetchPeersWithDiscord(ctx);
+	const peerByDiscordId = new Map<string, PeerSnapshot>();
+	for (const p of peers) {
+		if (p.discord_id) peerByDiscordId.set(p.discord_id, p);
+	}
+
+	let processed = 0;
+	for (const m of eligible) {
+		const authorId = m.author?.id;
+		if (!authorId || authorId === botUserId) continue;
+		const content = (m.content ?? "").trim();
+		if (!content) continue;
+
+		const peer = peerByDiscordId.get(authorId);
+		if (!peer) continue; // unknown sender — skip
+		if (!BRIDGE_INGEST_AGENTS && peer.kind === "agent") continue;
+
+		processed++;
+		try {
+			discord("POST", `/channels/${channelId}/typing`).catch(() => {});
+
+			const result = await ctx.dispatchProgram("/holdfast", "ingest", ["discord", peer.id, content]) as {
+				finalText: string;
+			};
+			if (result?.finalText) {
+				await postMessage(channelId, result.finalText);
+			}
+		} catch (err: any) {
+			const raw = err?.message ?? String(err);
+			ctx.print(red(`  [discord] bridge ingest failed for ${peer.display_name}: ${raw}`));
+			const userFacing = /fetch failed|econnreset|etimedout|socket hang up/i.test(raw)
+				? "[network hiccup talking to my model — try again in a sec]"
+				: `[error: ${raw}]`;
+			try { await postMessage(channelId, userFacing); }
+			catch { /* best-effort */ }
+		}
+	}
+	return processed;
+}
+
+
+async function runPoll(state: Record<string, any>, ctx: ProgramContext): Promise<{ peers: number; processed: number; bridges: number }> {
 	const peers = await fetchPeersWithDiscord(ctx);
 	let processed = 0;
 	for (const peer of peers) {
 		try {
 			processed += await pollPeer(peer, state, ctx);
 		} catch (err: any) {
-			// Log but continue with other peers.
 			ctx.print(dim(`  [discord] poll error for ${peer.display_name}: ${err?.message ?? String(err)}`));
 		}
 	}
-	return { peers: peers.length, processed };
+
+	const bridgeChannels = getBridgeChannels();
+	let bridges = 0;
+	for (const channelId of bridgeChannels) {
+		try {
+			bridges += await pollBridgeChannel(channelId, state, ctx);
+		} catch (err: any) {
+			ctx.print(dim(`  [discord] bridge poll error for ${channelId}: ${err?.message ?? String(err)}`));
+		}
+	}
+	return { peers: peers.length, processed, bridges };
 }
 
 // ── Core: Gateway (presence / "online" status) ─────────────────
@@ -672,11 +774,16 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 			state.dmChannelByPeer = state.dmChannelByPeer ?? {};
 			const watchedCount = Object.keys(state.watermarks).length;
 			const cachedCount = Object.keys(state.dmChannelByPeer).length;
+			const bridgeChannels = getBridgeChannels();
 			print(bold("  Discord"));
 			print(dim(`  bot user id: ${state.botUserId || "(not resolved yet)"}`));
-			print(dim(`  poll interval: ${state.pollMs ?? DEFAULT_POLL_MS}ms`));
+			print(dim(`  gateway: ${state.gatewayConnected ? green("connected") : red("disconnected")}`));
 			print(dim(`  DM channels cached: ${cachedCount}`));
 			print(dim(`  watermarks tracked: ${watchedCount}`));
+			if (bridgeChannels.length > 0) {
+				print(dim(`  bridge channels: ${bridgeChannels.join(", ")}`));
+				print(dim(`  bridge ingest agents: ${BRIDGE_INGEST_AGENTS ? "yes" : "no"}`));
+			}
 			break;
 		}
 
