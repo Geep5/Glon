@@ -31,3 +31,6 @@ tell-agent-truth.sh
 	# Screenshots / docs drafts
 	*.png
 	UTXO_REVAMP.md
+
+# Alpaca trading scripts (contain API credentials inline)
+scripts/alpaca-filter.ts
