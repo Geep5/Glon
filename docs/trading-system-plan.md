@@ -128,39 +128,67 @@ ORCHESTRATOR triggers round
 Round ends. Agents sleep. Orchestrator waits for next tick.
 ```
 
+
 ### 1. Pairing
 
-**Goal:** Pair agents who are hex neighbors but haven't debated recently.
+**Goal:** Pair agents with their hex neighbors. The hex grid IS the social graph.
 
 **Algorithm:**
 ```
-unpaired = all agents shuffled
+unpaired = all agents
 pairs = []
 
+# Sort by hex ring (distance from center), outer first
+# Outer agents (winners) pair with each other
+# Inner agents (losers/new) pair with each other
+unpaired.sort(key=lambda a: -hex_distance(a, {q:0, r:0}))
+
 while len(unpaired) >= 2:
-    a = unpaired.pop()
+    a = unpaired.pop(0)
     
-    # Find best match among unpaired:
-    # 1. Prefer agents who haven't faced each other
-    # 2. Prefer agents close on hex grid (neighbors)
-    # 3. Prefer agents who haven't debated in longest time
+    # Find candidates:
+    # 1. Hex neighbors first (adjacent cells)
+    # 2. Same ring second (same distance from center)
+    # 3. Fallback: closest unpaired agent
     
-    candidates = [b for b in unpaired if b.id != a.last_peer_id]
-    if not candidates:
-        candidates = unpaired  # fallback: anyone available
+    neighbors = [b for b in unpaired if hex_distance(a, b) == 1]
+    same_ring = [b for b in unpaired 
+                 if hex_distance(a, b) > 1 
+                 and hex_distance(a, {q:0,r:0}) == hex_distance(b, {q:0,r:0})]
     
-    # Score each candidate
-    best = min(candidates, key=lambda b: (
-        hex_distance(a, b),           # closer = better
-        0 if b.id not in a.peers_faced else 1,  # new = better
-        rounds_since_last_debate(a, b)  # longer = better
-    ))
+    if neighbors:
+        # Prefer neighbor we haven't faced recently
+        candidates = [b for b in neighbors if b.id != a.last_peer_id]
+        if not candidates:
+            candidates = neighbors
+        best = max(candidates, key=lambda b: rounds_since_last_debate(a, b))
+    elif same_ring:
+        candidates = [b for b in same_ring if b.id != a.last_peer_id]
+        if not candidates:
+            candidates = same_ring
+        best = min(candidates, key=lambda b: hex_distance(a, b))
+    else:
+        # Fallback: any closest unpaired agent
+        candidates = [b for b in unpaired if b.id != a.last_peer_id]
+        if not candidates:
+            candidates = unpaired
+        best = min(candidates, key=lambda b: hex_distance(a, b))
     
     unpaired.remove(best)
     pairs.append((a, best))
+    a.last_peer_id = best.id
+    best.last_peer_id = a.id
 ```
 
+**Why this works:**
+- Winners naturally cluster at outer rings → they face each other (harder competition)
+- Losers/new agents stay inner → they face each other (easier to recover)
+- Hex adjacency ensures physical proximity on the grid = social proximity
+- Same-ring fallback prevents agents from being stranded
+
 **Edge case:** Odd number of agents. One agent gets a "bye" — no debate, no movement this round.
+
+**Edge case:** Agent with no unpaired neighbors in any ring. They get paired with the closest available agent regardless of ring.
 
 ### 2. Debate
 
@@ -240,7 +268,23 @@ const HEX_DIRS = [
 - Agents cluster by performance over time
 - Winners face winners (harder to agree = more disputes)
 - Losers face losers (easier to identify the better of two bad options)
+
 - Natural stratification
+
+**Pyramid structure:**
+- Hex distance from center = performance tier
+- Ring 0 (center): New agents, struggling agents
+- Ring 1: Mid-tier agents
+- Ring 2: Strong performers
+- Ring 3+: Elite tier, top of pyramid
+- The "pyramid" emerges naturally — outer rings have more cells (hex rings grow), accommodating more agents at higher tiers
+
+**Scaling with agent count:**
+- 5 agents: fits in rings 0-1, small pyramid
+- 10 agents: fills rings 0-2, medium pyramid
+- 20+ agents: fills rings 0-3+, full pyramid
+- Grid radius auto-expands: `radius = ceil(sqrt(agent_count))`
+- More agents = taller pyramid = more tiers = fiercer competition at the top
 
 ---
 
@@ -248,11 +292,15 @@ const HEX_DIRS = [
 
 **Trigger:** End-of-day or after N rounds (e.g., 20 rounds).
 
-**Selection:**
+
+**Selection (scales with agent count):**
 - Rank agents by hex distance from center (farthest = best)
 - Tie-break by win count, then win/loss ratio
-- Top K agents (e.g., top 2) have their contracts traded
-
+- Number of trades = `floor(sqrt(agent_count))` or `ceil(agent_count / 5)`
+- 5 agents → top 2 trade
+- 10 agents → top 3 trade
+- 20 agents → top 4-5 trade
+- Only agents at ring >= `floor(max_ring / 2)` are eligible (must be in upper pyramid)
 **Trade execution:**
 - Alpaca API: buy the option contract (paper trading for v1)
 - Track entry price
@@ -264,16 +312,19 @@ const HEX_DIRS = [
 - New contracts assigned for next day
 - Win/loss stats persist for lifetime leaderboard
 
+
 ---
 
+## Phase 5: Dynamic Scaling (Future)
 ## Phase 5: Dynamic Scaling (Future)
 
 **Adding agents mid-day:**
 - New filter run → new contracts
 - Spawn new agent objects with new contracts
-- New agents start at hex center
-- They receive full debate history of all existing agents (so they can catch up)
+- New agents start at hex center (ring 0)
+- They receive full debate history of all existing agents (catch-up context)
 - Eligible for pairing immediately in next round
+- More agents = pyramid grows taller = more competition tiers
 
 **Removing agents:**
 - Agent at hex center for 3 consecutive rounds with no wins → auto-removed
@@ -284,10 +335,10 @@ const HEX_DIRS = [
 - Or: orchestrator forces swap if a contract has zero volume for 5 rounds
 
 **Scaling:**
-- Works with any number of agents: 5, 10, 20, 50
+- Works with any number of agents: 5, 10, 20, 50+
 - Pairing algorithm handles odd counts (bye)
-- Hex grid naturally accommodates more agents (more cells occupied)
-
+- Hex grid auto-expands: `radius = ceil(sqrt(N))`
+- More agents = taller pyramid = fiercer competition at top tiers
 ---
 
 ## Phase 6: State & Persistence
