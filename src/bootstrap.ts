@@ -222,188 +222,206 @@ function canonicalFields(value: unknown): string {
 	});
 }
 
-async function main() {
-	const FORCE = process.argv.includes("--force");
-
-	initDisk();
-
-	const client = createClient<typeof app>(ENDPOINT);
-	const store = client.storeActor.getOrCreate(["root"]);
-
-	console.log(FORCE ? "Bootstrapping Glon (force mode: existing objects will be updated)...\n" : "Bootstrapping Glon...\n");
-	// Build lookup of existing objects by type+name for idempotency.
-	const existingByKey = new Map<string, string>();
-	try {
-		const allRefs = await store.list() as { id: string; typeKey: string }[];
-		for (const ref of allRefs) {
-			const obj = await store.get(ref.id) as { fields?: Record<string, any> } | null;
-			if (!obj?.fields?.name?.stringValue) continue;
-			// Key: "type::name" for source files, "type::prefix" for programs
-			existingByKey.set(`${ref.typeKey}::${obj.fields.name.stringValue}`, ref.id);
-			if (obj.fields.prefix?.stringValue) {
-				existingByKey.set(`program::${obj.fields.prefix.stringValue}`, ref.id);
-			}
-		}
-	} catch {
-		// Store may be empty or not ready; proceed with creates.
+	export interface BootstrapResult {
+		created: number;
+		updated: number;
+		skipped: number;
 	}
 
-	let created = 0;
-	let updated = 0;
-	let skipped = 0;
+	/**
+	 * Synchronize disk sources and programs into the store.
+	 *
+	 * @param store  Store actor handle
+	 * @param client Rivet client (for objectActor access)
+	 * @param opts   force: rewrite even when unchanged; quiet: suppress logs
+	 */
+	export async function bootstrapStore(
+		store: any,
+		client: any,
+		opts: { force?: boolean; quiet?: boolean } = {},
+	): Promise<BootstrapResult> {
+		const FORCE = opts.force ?? false;
+		const log = opts.quiet
+			? () => {}
+			: (msg: string) => console.log(msg);
 
-	for (const relPath of SOURCES) {
-		const absPath = resolve(projectRoot, relPath);
-		const name = basename(relPath);
-		const kind = kindOf(relPath);
-
-		const existingSourceId = existingByKey.get(`${kind}::${name}`);
-
-		let raw: Buffer;
+		// Build lookup of existing objects by type+name for idempotency.
+		const existingByKey = new Map<string, string>();
 		try {
-			raw = readFileSync(absPath);
+			const allRefs = (await store.list()) as { id: string; typeKey: string }[];
+			for (const ref of allRefs) {
+				const obj = (await store.get(ref.id)) as { fields?: Record<string, any> } | null;
+				if (!obj?.fields?.name?.stringValue) continue;
+				existingByKey.set(`${ref.typeKey}::${obj.fields.name.stringValue}`, ref.id);
+				if (obj.fields.prefix?.stringValue) {
+					existingByKey.set(`program::${obj.fields.prefix.stringValue}`, ref.id);
+				}
+			}
 		} catch {
-			console.log(`  SKIP  ${relPath} (not found)`);
-			skipped++;
-			continue;
+			// Store may be empty or not ready; proceed with creates.
 		}
 
-		const lineCount = raw.toString("utf-8").split("\n").length;
-		const contentBase64 = raw.toString("base64");
+		let created = 0;
+		let updated = 0;
+		let skipped = 0;
 
-		const fieldsJson = JSON.stringify({
-			name: stringVal(name),
-			path: stringVal(relPath),
-			lines: intVal(lineCount),
-			size: intVal(raw.byteLength),
-		});
-
-		// Content-aware idempotency: skip only when the on-disk content matches
-		// what's already stored. --force rewrites unconditionally (useful when
-		// you've manually corrupted an object and want a clean reseed).
-		if (existingSourceId && !FORCE) {
-			const existing = await store.get(existingSourceId);
-			const existingContent = String(existing?.content ?? "");
-			if (existingContent === contentBase64) {
-				console.log(`  UNCHANGED ${relPath.padEnd(24)} ${kind.padEnd(12)} ${existingSourceId.slice(0, 12)}...`);
-				skipped++;
-				continue;
-			}
-		}
-
-		try {
-			if (existingSourceId) {
-				const actor = client.objectActor.getOrCreate([existingSourceId]);
-				await actor.setContent(contentBase64);
-				await actor.setFields(JSON.stringify({
-					lines: intVal(lineCount),
-					size: intVal(raw.byteLength),
-				}));
-				const tag = FORCE ? "FORCED" : "UPDATE";
-				console.log(`  ${tag.padEnd(9)} ${relPath.padEnd(24)} ${kind.padEnd(12)} ${existingSourceId.slice(0, 12)}...`);
-				updated++;
-			} else {
-				const id = await store.create(kind, fieldsJson, contentBase64);
-				console.log(`  CREATE    ${relPath.padEnd(24)} ${kind.padEnd(12)} ${id.slice(0, 12)}...`);
-				created++;
-			}
-		} catch (err) {
-			const msg = err instanceof Error ? err.message : String(err);
-			console.log(`  ERR       ${relPath} \u2014 ${msg}`);
-			skipped++;
-		}
-	}
-
-	// ── Programs ────────────────────────────────────────────────
-	console.log("\nSeeding programs...\n");
-
-	for (const prog of PROGRAMS) {
-		const existingProgId = existingByKey.get(`program::${prog.prefix}`);
-
-		// Load all module files and build the manifest.
-		const moduleEntries: Record<string, ReturnType<typeof stringVal>> = {};
-		let allOk = true;
-		for (const [filename, relPath] of Object.entries(prog.modules)) {
+		for (const relPath of SOURCES) {
 			const absPath = resolve(projectRoot, relPath);
+			const name = basename(relPath);
+			const kind = kindOf(relPath);
+
+			const existingSourceId = existingByKey.get(`${kind}::${name}`);
+
+			let raw: Buffer;
 			try {
-				const raw = readFileSync(absPath);
-				moduleEntries[filename] = stringVal(raw.toString("base64"));
+				raw = readFileSync(absPath);
 			} catch {
-				console.log(`  SKIP      ${prog.prefix} (missing ${relPath})`);
-				allOk = false;
-				break;
-			}
-		}
-		if (!allOk) { skipped++; continue; }
-
-		const commandEntries: Record<string, ReturnType<typeof stringVal>> = {};
-		for (const [k, v] of Object.entries(prog.commands)) {
-			commandEntries[k] = stringVal(v);
-		}
-
-		const fieldsJson = JSON.stringify({
-			name: stringVal(prog.name),
-			prefix: stringVal(prog.prefix),
-			commands: mapVal(commandEntries),
-			manifest: mapVal({
-				entry: stringVal(prog.entry),
-				modules: mapVal(moduleEntries),
-			}),
-		});
-
-		// Content-aware idempotency: compare the full fields shape (commands +
-		// manifest + name) against what's already stored. Only skip when nothing
-		// changed; --force rewrites unconditionally.
-		if (existingProgId && !FORCE) {
-			const existing = await store.get(existingProgId);
-			const existingFields = canonicalFields(existing?.fields);
-			const desiredFields = canonicalFields(JSON.parse(fieldsJson));
-			if (existingFields === desiredFields) {
-				console.log(`  UNCHANGED ${prog.prefix.padEnd(10)} ${prog.name.padEnd(16)} ${existingProgId.slice(0, 12)}...`);
+				log(`  SKIP  ${relPath} (not found)`);
 				skipped++;
 				continue;
 			}
-		}
 
-		try {
-			if (existingProgId) {
-				const actor = client.objectActor.getOrCreate([existingProgId]);
-				await actor.setFields(JSON.stringify({
-					commands: mapVal(commandEntries),
-					manifest: mapVal({
-						entry: stringVal(prog.entry),
-						modules: mapVal(moduleEntries),
-					}),
-				}));
-				const tag = FORCE ? "FORCED" : "UPDATE";
-				console.log(`  ${tag.padEnd(9)} ${prog.prefix.padEnd(10)} ${prog.name.padEnd(16)} ${existingProgId.slice(0, 12)}... (${Object.keys(prog.modules).length} modules)`);
-				updated++;
-			} else {
-				const id = await store.create("program", fieldsJson);
-				console.log(`  CREATE    ${prog.prefix.padEnd(10)} ${prog.name.padEnd(16)} ${id.slice(0, 12)}... (${Object.keys(prog.modules).length} modules)`);
-				created++;
+			const lineCount = raw.toString("utf-8").split("\n").length;
+			const contentBase64 = raw.toString("base64");
+
+			const fieldsJson = JSON.stringify({
+				name: stringVal(name),
+				path: stringVal(relPath),
+				lines: intVal(lineCount),
+				size: intVal(raw.byteLength),
+			});
+
+			if (existingSourceId && !FORCE) {
+				const existing = await store.get(existingSourceId);
+				const existingContent = String(existing?.content ?? "");
+				if (existingContent === contentBase64) {
+					log(`  UNCHANGED ${relPath.padEnd(24)} ${kind.padEnd(12)} ${existingSourceId.slice(0, 12)}...`);
+					skipped++;
+					continue;
+				}
 			}
-		} catch (err) {
-			const msg = err instanceof Error ? err.message : String(err);
-			console.log(`  ERR       ${prog.name} \u2014 ${msg}`);
-			skipped++;
+
+			try {
+				if (existingSourceId) {
+					const actor = client.objectActor.getOrCreate([existingSourceId]);
+					await actor.setContent(contentBase64);
+					await actor.setFields(
+						JSON.stringify({
+							lines: intVal(lineCount),
+							size: intVal(raw.byteLength),
+						}),
+					);
+					const tag = FORCE ? "FORCED" : "UPDATE";
+					log(`  ${tag.padEnd(9)} ${relPath.padEnd(24)} ${kind.padEnd(12)} ${existingSourceId.slice(0, 12)}...`);
+					updated++;
+				} else {
+					const id = await store.create(kind, fieldsJson, contentBase64);
+					log(`  CREATE    ${relPath.padEnd(24)} ${kind.padEnd(12)} ${id.slice(0, 12)}...`);
+					created++;
+				}
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				log(`  ERR       ${relPath} \u2014 ${msg}`);
+				skipped++;
+			}
 		}
+
+		for (const prog of PROGRAMS) {
+			const existingProgId = existingByKey.get(`program::${prog.prefix}`);
+
+			const moduleEntries: Record<string, ReturnType<typeof stringVal>> = {};
+			let allOk = true;
+			for (const [filename, relPath] of Object.entries(prog.modules)) {
+				const absPath = resolve(projectRoot, relPath);
+				try {
+					const raw = readFileSync(absPath);
+					moduleEntries[filename] = stringVal(raw.toString("base64"));
+				} catch {
+					log(`  SKIP      ${prog.prefix} (missing ${relPath})`);
+					allOk = false;
+					break;
+				}
+			}
+			if (!allOk) {
+				skipped++;
+				continue;
+			}
+
+			const commandEntries: Record<string, ReturnType<typeof stringVal>> = {};
+			for (const [k, v] of Object.entries(prog.commands)) {
+				commandEntries[k] = stringVal(v);
+			}
+
+			const fieldsJson = JSON.stringify({
+				name: stringVal(prog.name),
+				prefix: stringVal(prog.prefix),
+				commands: mapVal(commandEntries),
+				manifest: mapVal({
+					entry: stringVal(prog.entry),
+					modules: mapVal(moduleEntries),
+				}),
+			});
+
+			if (existingProgId && !FORCE) {
+				const existing = await store.get(existingProgId);
+				const existingFields = canonicalFields(existing?.fields);
+				const desiredFields = canonicalFields(JSON.parse(fieldsJson));
+				if (existingFields === desiredFields) {
+					log(`  UNCHANGED ${prog.prefix.padEnd(10)} ${prog.name.padEnd(16)} ${existingProgId.slice(0, 12)}...`);
+					skipped++;
+					continue;
+				}
+			}
+
+			try {
+				if (existingProgId) {
+					const actor = client.objectActor.getOrCreate([existingProgId]);
+					await actor.setFields(
+						JSON.stringify({
+							commands: mapVal(commandEntries),
+							manifest: mapVal({
+								entry: stringVal(prog.entry),
+								modules: mapVal(moduleEntries),
+							}),
+						}),
+					);
+					const tag = FORCE ? "FORCED" : "UPDATE";
+					log(`  ${tag.padEnd(9)} ${prog.prefix.padEnd(10)} ${prog.name.padEnd(16)} ${existingProgId.slice(0, 12)}... (${Object.keys(prog.modules).length} modules)`);
+					updated++;
+				} else {
+					const id = await store.create("program", fieldsJson);
+					log(`  CREATE    ${prog.prefix.padEnd(10)} ${prog.name.padEnd(16)} ${id.slice(0, 12)}... (${Object.keys(prog.modules).length} modules)`);
+					created++;
+				}
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				log(`  ERR       ${prog.name} \u2014 ${msg}`);
+				skipped++;
+			}
+		}
+
+		return { created, updated, skipped };
 	}
 
-	console.log(`\nDone. ${created} created, ${updated} updated, ${skipped} skipped.`);
-
-	try {
-		const info = await store.info();
-		console.log(`Store: ${info.totalObjects} objects, ${info.totalChanges} changes.`);
-		for (const [typeKey, cnt] of Object.entries(info.byType)) {
-			console.log(`  ${typeKey}: ${cnt}`);
+	async function main() {
+		const FORCE = process.argv.includes("--force");
+		initDisk();
+		const client = createClient<typeof app>(ENDPOINT);
+		const store = client.storeActor.getOrCreate(["root"]);
+		console.log(FORCE ? "Bootstrapping Glon (force mode: existing objects will be updated)...\n" : "Bootstrapping Glon...\n");
+		const result = await bootstrapStore(store, client, { force: FORCE });
+		console.log(`\nDone. ${result.created} created, ${result.updated} updated, ${result.skipped} skipped.`);
+		try {
+			const info = await store.info();
+			console.log(`Store: ${info.totalObjects} objects, ${info.totalChanges} changes.`);
+			for (const [typeKey, cnt] of Object.entries(info.byType)) {
+				console.log(`  ${typeKey}: ${cnt}`);
+			}
+		} catch {
+			// Store info may fail if not fully ready; non-fatal.
 		}
-	} catch {
-		// Store info may fail if not fully ready; non-fatal.
+		process.exit(0);
 	}
-
-	process.exit(0);
-}
 
 main().catch((err) => {
 	console.error("Bootstrap failed:", err);

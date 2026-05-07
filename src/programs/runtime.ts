@@ -27,12 +27,70 @@ import type { ObjectState } from "../dag/dag.js";
 import { style } from "./shared.js";
 import * as cryptoMod from "../crypto.js";
 import * as detCanonical from "../det/canonical.js";
-import * as detMath from "../det/math.js";
+
+// ── Minimal JSON Schema validator ───────────────────────────────
+
+function validateSchema(value: unknown, schema: Record<string, unknown>, path = ""): string | null {
+	if (schema.type === "object") {
+		if (typeof value !== "object" || value === null || Array.isArray(value)) {
+			return `${path || "root"} must be an object`;
+		}
+		const obj = value as Record<string, unknown>;
+		const required = (schema.required as string[]) ?? [];
+		for (const key of required) {
+			if (!(key in obj)) {
+				return `${path || "root"}.${key} is required`;
+			}
+		}
+		const props = schema.properties as Record<string, Record<string, unknown>> | undefined;
+		if (props) {
+			for (const [key, subSchema] of Object.entries(props)) {
+				if (key in obj) {
+					const err = validateSchema(obj[key], subSchema, `${path || "root"}.${key}`);
+					if (err) return err;
+				}
+			}
+		}
+		return null;
+	}
+	if (schema.type === "array") {
+		if (!Array.isArray(value)) {
+			return `${path || "root"} must be an array`;
+		}
+		const itemSchema = schema.items as Record<string, unknown> | undefined;
+		if (itemSchema) {
+			for (let i = 0; i < value.length; i++) {
+				const err = validateSchema(value[i], itemSchema, `${path || "root"}[${i}]`);
+				if (err) return err;
+			}
+		}
+		return null;
+	}
+	if (schema.type === "string") {
+		if (typeof value !== "string") return `${path || "root"} must be a string`;
+		return null;
+	}
+	if (schema.type === "number") {
+		if (typeof value !== "number") return `${path || "root"} must be a number`;
+		return null;
+	}
+	if (schema.type === "integer") {
+		if (typeof value !== "number" || !Number.isInteger(value)) return `${path || "root"} must be an integer`;
+		return null;
+	}
+	if (schema.type === "boolean") {
+		if (typeof value !== "boolean") return `${path || "root"} must be a boolean`;
+		return null;
+	}
+	return null;
+	}
+
+	import * as detMath from "../det/math.js";
+
 import * as detEd25519 from "../det/ed25519.js";
 import * as det from "../det/index.js";
 import * as esbuild from "esbuild";
 
-// ── Types ───────────────────────────────────────────────────────
 
 /** Context passed to all program code (handlers, actor actions, ticks). */
 export interface ProgramContext {
@@ -135,13 +193,14 @@ export interface ProgramDef {
 	validator?: ValidatorFn;
 	validatedTypes?: string[];
 	/**
-	 * If `true`, every type in `validatedTypes` is a chain-mode type:
-	 * the kernel requires `author_sig` on every Change and verifies the
-	 * signature before the program's validator runs. Direct mutations
-	 * (setField, addBlock, etc.) on chain-mode objects are rejected;
-	 * callers must construct a signed Change and submit via pushChanges.
-	 */
-	chainMode?: boolean;
+		/**
+		 * If `true`, every type in `validatedTypes` is a chain-mode type:
+		 * the kernel requires `authExtension` on every Change and verifies the
+		 * signature before the program's validator runs. Direct mutations
+		 * (setField, addBlock, etc.) on chain-mode objects are rejected;
+		 * callers must construct a signed Change and submit via pushChanges.
+		 */
+		chainMode?: boolean;
 }
 
 /** A loaded program ready for dispatch. */
@@ -616,7 +675,10 @@ export async function dispatchActorAction(
 	if (typed) {
 		// typedActions receive a single input object as args[0].
 		const input = args[0];
-		// Optional: runtime schema validation could go here.
+		if (typed.inputSchema) {
+			const err = validateSchema(input, typed.inputSchema);
+			if (err) throw new Error(`Schema validation failed for action "${action}": ${err}`);
+		}
 		return await typed.handler(makeCtx(instance.state), input);
 	}
 

@@ -62,20 +62,7 @@ export function createFieldChange(
 	);
 }
 
-/** Single ContentSet op for raw byte content. */
-export function createContentChange(
-	objectId: string,
-	parentIds: Uint8Array[],
-	content: Uint8Array,
-	author?: string,
-): Change {
-	return createChange(
-		objectId,
-		[{ contentSet: { content } }],
-		parentIds,
-		author,
-	);
-}
+
 
 /** Single ObjectDelete op. */
 export function createDeleteChange(

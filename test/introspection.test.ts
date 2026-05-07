@@ -79,7 +79,23 @@ function createHarness() {
 				changes.push({
 					hex: `ch${nextHex++}`, objectId: id, parentIds: [], timestamp: nextTs++,
 					author: "test", id: new Uint8Array(0),
-					ops: [{ contentSet: { content: Buffer.from(b64, "base64") } }],
+					ops: [{
+						blockAdd: {
+							parentId: "",
+							afterId: "",
+							block: {
+								id: "__content__",
+								childrenIds: [],
+								content: {
+									custom: {
+										contentType: "glon/raw",
+										data: Buffer.from(b64, "base64"),
+										meta: {},
+									},
+								},
+							},
+						},
+					}],
 				});
 			},
 			deleteField: async (key: string) => {

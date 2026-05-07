@@ -7,10 +7,10 @@
 //
 // Two responsibilities:
 //   1. Generate, store, list named keypairs.
-//   2. Sign a Change on behalf of a named key. The wallet receives an
-//      unsigned Change (without `author_sig`), fills in pubkey/nonce/fee,
-//      computes canonical signing bytes, signs them, and returns the
-//      fully-formed signed Change with content-addressed `id` filled in.
+	//   2. Sign a Change on behalf of a named key. The wallet receives an
+	//      unsigned Change (without `authExtension`), fills in pubkey/nonce/fee,
+	//      computes canonical signing bytes, signs them, and returns the
+	//      fully-formed signed Change with content-addressed `id` filled in.
 //
 // What the wallet does NOT do:
 	//   - Construct token operations (that's /coin's job)
@@ -19,10 +19,10 @@
 //   - Verify signatures (the kernel does that on push)
 
 import type { ProgramDef, ProgramContext, ProgramActorDef } from "../runtime.js";
-import { encodeChange, decodeChange, type Change, type Signature } from "../../proto.js";
-import { canonicalEncodeChange, canonicalEncodeChangeForSigning } from "../../det/canonical.js";
-import { generateKeyPair, sign as ed25519Sign } from "../../det/ed25519.js";
-import { sha256, hexEncode, hexDecode } from "../../crypto.js";
+	import { encodeChange, decodeChange, encodeSignature, type Change, type Signature } from "../../proto.js";
+	import { generateKeyPair, sign as ed25519Sign } from "../../det/ed25519.js";
+	import { canonicalEncodeChange, canonicalEncodeChangeForSigning } from "../../det/canonical.js";
+	import { sha256, hexEncode, hexDecode } from "../../crypto.js";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync, renameSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -158,7 +158,7 @@ function doKeyForPubkey(pubkeyHex: string, path?: string): KeyInfo | null {
 interface SignChangeInput {
 	/** Wallet key name to sign with. */
 	name: string;
-	/** Base64-encoded Change to sign (without author_sig.signature). */
+	/** Base64-encoded Change to sign (without authExtension). */
 	changeB64: string;
 	/** Per-pubkey monotonic nonce. Caller must obtain from /consensus. */
 	nonce: number;
@@ -189,21 +189,24 @@ function doSignChange(input: SignChangeInput, path?: string): SignChangeResult {
 	// Decode the unsigned change.
 	const change = decodeChange(new Uint8Array(Buffer.from(input.changeB64, "base64")));
 
-	// Build the signature stub (pubkey, zeroed sig bytes, nonce, fee).
-	const sigStub: Signature = {
+	// Build the signature (pubkey, zeroed sig bytes, nonce, fee).
+	const sig: Signature = {
 		pubkey: hexDecode(entry.pubkey),
 		signature: new Uint8Array(64),
 		nonce: input.nonce,
 		fee: input.fee,
 	};
-	const candidate: Change = { ...change, authorSig: sigStub };
+	const candidate: Change = {
+		...change,
+		authExtension: { type: "ed25519", payload: encodeSignature(sig) },
+	};
 
-	// Compute the bytes the signer commits to: canonical(change with id zeroed and sig zeroed).
+	// Compute the bytes the signer commits to: canonical(change with id zeroed and payload zeroed).
 	const signingBytes = canonicalEncodeChangeForSigning(candidate);
-	const signature = ed25519Sign(hexDecode(entry.privateKey), signingBytes);
+	sig.signature = ed25519Sign(hexDecode(entry.privateKey), signingBytes);
 
-	// Insert signature, then compute the content-address.
-	candidate.authorSig = { ...sigStub, signature };
+	// Insert final signature, then compute the content-address.
+	candidate.authExtension = { type: "ed25519", payload: encodeSignature(sig) };
 	candidate.id = sha256(canonicalEncodeChange(candidate));
 
 	const encoded = encodeChange(candidate);
@@ -212,8 +215,7 @@ function doSignChange(input: SignChangeInput, path?: string): SignChangeResult {
 		id: hexEncode(candidate.id),
 		pubkey: entry.pubkey,
 	};
-}
-
+	}
 // ── CLI ──────────────────────────────────────────────────────────
 
 const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {

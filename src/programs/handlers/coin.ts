@@ -1983,6 +1983,14 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 
 			validate_op: {
 				description: "Validate a coin operation change against current bucket state",
+				inputSchema: {
+					type: "object",
+					required: ["objectId", "changeB64"],
+					properties: {
+						objectId: { type: "string" },
+						changeB64: { type: "string" },
+					},
+				},
 				handler: async (
 					ctx: ProgramContext,
 					input: { objectId: string; changeB64: string },
@@ -2001,6 +2009,17 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 
 			buildBucketGenesis: {
 				description: "Build a genesis change for a new coin bucket",
+				inputSchema: {
+					type: "object",
+					required: ["bucketId", "timestamp", "author", "tokenId"],
+					properties: {
+						bucketId: { type: "string" },
+						timestamp: { type: "integer" },
+						author: { type: "string" },
+						tokenId: { type: "string" },
+						capacity: { type: "integer" },
+					},
+				},
 				handler: async (_ctx: ProgramContext, args: {
 					bucketId: string;
 					timestamp: number;
@@ -2015,6 +2034,18 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 
 			buildCoinOp: {
 				description: "Build a change containing a single coin operation",
+				inputSchema: {
+					type: "object",
+					required: ["bucketId", "parentIds", "timestamp", "author", "op", "blockId"],
+					properties: {
+						bucketId: { type: "string" },
+						parentIds: { type: "array", items: { type: "string" } },
+						timestamp: { type: "integer" },
+						author: { type: "string" },
+						op: { type: "object" },
+						blockId: { type: "string" },
+					},
+				},
 				handler: async (_ctx: ProgramContext, args: {
 					bucketId: string;
 					parentIds: string[];
@@ -2037,6 +2068,7 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 
 			replayBucket: {
 				description: "Replay a bucket's block tree into derived state",
+				inputSchema: { type: "array", items: { type: "object" } },
 				handler: async (_ctx: ProgramContext, blocks: Block[]): Promise<BucketState> => {
 					return replayBucket(blocks);
 				},
@@ -2044,6 +2076,17 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 
 			buildOfferGenesis: {
 				description: "Build a genesis change for a new coin offer",
+				inputSchema: {
+					type: "object",
+					required: ["offerId", "timestamp", "author", "makerPubkey", "terms"],
+					properties: {
+						offerId: { type: "string" },
+						timestamp: { type: "integer" },
+						author: { type: "string" },
+						makerPubkey: { type: "string" },
+						terms: { type: "object" },
+					},
+				},
 				handler: async (_ctx: ProgramContext, args: {
 					offerId: string;
 					timestamp: number;
@@ -2072,6 +2115,7 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 
 			replayOffer: {
 				description: "Replay an offer's block tree into derived state",
+				inputSchema: { type: "array", items: { type: "object" } },
 				handler: async (_ctx: ProgramContext, blocks: Block[]): Promise<OfferState> => {
 					return replayOffer(blocks);
 				},

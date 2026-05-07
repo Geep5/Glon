@@ -20,26 +20,22 @@ import { db } from "rivetkit/db";
 import type { Change, Operation, Value, ObjectRef, Block, ObjectLink } from "./proto.js";
 import { encodeChange, encodeChangeForHashing, decodeChange, stringVal, intVal, floatVal, boolVal, mapVal, listVal, linkVal, displayValue } from "./proto.js";
 import { sha256, hexEncode, hexDecode, generateObjectId } from "./crypto.js";
-import {
-	createChange,
-	createGenesisChange,
-	createFieldChange,
-	createContentChange,
-	createDeleteChange,
-	changeId,
-} from "./dag/change.js";
+	import {
+		createChange,
+		createGenesisChange,
+		createFieldChange,
+		createDeleteChange,
+		changeId,
+	} from "./dag/change.js";
 
 import { computeState, findHeads, toSnapshot, getPrimaryContent, type ObjectState, type BlockProvenance } from "./dag/dag.js";
 import { initDisk, writeChange, readChangeByHex, listChangeFilesForObject, deleteChangesForObject, diskStats } from "./disk.js";
 
-
-
-import { getValidator, isChainModeType, getIndexHook, getAuthVerifier } from "./programs/runtime.js";
-import type { BatchValidationContext } from "./programs/runtime.js";
-
-import { canonicalEncodeChange, canonicalEncodeChangeForSigning } from "./det/canonical.js";
-import { verify as ed25519Verify } from "./det/ed25519.js";
-
+	import { decodeSignature } from "./proto.js";
+	import { getValidator, isChainModeType, getIndexHook, getAuthVerifier } from "./programs/runtime.js";
+	import type { BatchValidationContext } from "./programs/runtime.js";
+	import { canonicalEncodeChange, canonicalEncodeChangeForSigning } from "./det/canonical.js";
+	import { verify as ed25519Verify } from "./det/ed25519.js";
 import { style } from "./programs/shared.js";
 import {
 	assertPortAvailable,
@@ -237,7 +233,38 @@ const objectActor = actor({
 
 		setContent: (c, contentBase64: string) => {
 			const contentBytes = Buffer.from(contentBase64, "base64");
-			const change = createContentChange(c.state.id, headBytes(c), contentBytes);
+			const hasContentBlock = c.vars.blocks?.some((b: any) => b.id === "__content__");
+			const op: Operation = hasContentBlock
+				? {
+					blockUpdate: {
+						blockId: "__content__",
+						content: {
+							custom: {
+								contentType: "glon/raw",
+								data: contentBytes,
+								meta: {},
+							},
+						},
+					},
+				}
+				: {
+					blockAdd: {
+						parentId: "",
+						afterId: "",
+						block: {
+							id: "__content__",
+							childrenIds: [],
+							content: {
+								custom: {
+									contentType: "glon/raw",
+									data: contentBytes,
+									meta: {},
+								},
+							},
+						},
+					},
+				};
+			const change = createChange(c.state.id, [op], headBytes(c));
 			commitChange(c, change);
 		},
 
@@ -344,36 +371,20 @@ const objectActor = actor({
 
 			// ── Chain-mode auth gate ───────────────────────────────────
 			// Dispatch to registered auth verifiers by extension type.
-			// Falls back to legacy authorSig for backwards compat.
 			if (effectiveTypeKey && isChainModeType(effectiveTypeKey)) {
 				for (const change of decoded) {
-					let verified = false;
-
-					if (change.authExtension) {
-						const verifier = getAuthVerifier(change.authExtension.type);
-						if (!verifier) {
-							throw new Error(
-								`auth gate: no verifier registered for type "${change.authExtension.type}"`,
-							);
-						}
-						verified = verifier(change, change.authExtension.payload);
-					} else if (change.authorSig) {
-						// Backwards compat: legacy author_sig path
-						const sig = change.authorSig;
-						if (!sig.pubkey || sig.pubkey.length !== 32) {
-							throw new Error(`auth gate: pubkey must be 32 bytes`);
-						}
-						if (!sig.signature || sig.signature.length !== 64) {
-							throw new Error(`auth gate: signature must be 64 bytes`);
-						}
-						const signingBytes = canonicalEncodeChangeForSigning(change);
-						verified = ed25519Verify(sig.pubkey, signingBytes, sig.signature);
-					} else {
+					if (!change.authExtension) {
 						throw new Error(
-							`auth gate: chain-mode change for object ${change.objectId} is missing auth`,
+							`auth gate: chain-mode change for object ${change.objectId} is missing authExtension`,
 						);
 					}
-
+					const verifier = getAuthVerifier(change.authExtension.type);
+					if (!verifier) {
+						throw new Error(
+							`auth gate: no verifier registered for type "${change.authExtension.type}"`,
+						);
+					}
+					const verified = verifier(change, change.authExtension.payload);
 					if (!verified) {
 						throw new Error(`auth gate: invalid auth for change in ${change.objectId}`);
 					}
@@ -554,7 +565,23 @@ const storeActor = actor({
 
 			if (contentBase64) {
 				const contentBytes = Buffer.from(contentBase64, "base64");
-				const contentChange = createContentChange(objectId, lastHeads, contentBytes);
+				const contentChange = createChange(objectId, [{
+					blockAdd: {
+						parentId: "",
+						afterId: "",
+						block: {
+							id: "__content__",
+							childrenIds: [],
+							content: {
+								custom: {
+									contentType: "glon/raw",
+									data: contentBytes,
+									meta: {},
+								},
+							},
+						},
+					},
+				}], lastHeads);
 				writeChange(contentChange);
 				await indexChange(c, contentChange);
 				lastHeads = [contentChange.id];
@@ -941,9 +968,12 @@ const storeActor = actor({
 				// Signature gate
 				if (isChainModeType(effectiveTypeKey)) {
 					for (const change of changes) {
-						const sig = change.authorSig;
-						if (!sig || !sig.pubkey || sig.pubkey.length === 0) {
-							throw new Error(`signature gate: chain-mode change for object ${change.objectId} is missing author_sig`);
+						if (!change.authExtension || change.authExtension.type !== "ed25519") {
+							throw new Error(`signature gate: chain-mode change for object ${change.objectId} is missing ed25519 authExtension`);
+						}
+						const sig = decodeSignature(change.authExtension.payload);
+						if (!sig.pubkey || sig.pubkey.length === 0) {
+							throw new Error(`signature gate: chain-mode change for object ${change.objectId} is missing pubkey`);
 						}
 						if (sig.pubkey.length !== 32) {
 							throw new Error(`signature gate: pubkey must be 32 bytes (got ${sig.pubkey.length})`);

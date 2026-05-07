@@ -24,12 +24,11 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import walletProgram, { __test } from "../../src/programs/handlers/wallet.js";
-import { encodeChange, decodeChange, type Change } from "../../src/proto.js";
-import { canonicalEncodeChange, canonicalEncodeChangeForSigning } from "../../src/det/canonical.js";
-import { verify as ed25519Verify } from "../../src/det/ed25519.js";
-import { sha256, hexEncode, hexDecode } from "../../src/crypto.js";
-
-const { doNew, doList, doShow, doRemove, doKeyForPubkey, doSignChange } = __test;
+	import { encodeChange, decodeChange, encodeSignature, decodeSignature, type Change } from "../../src/proto.js";
+	import { canonicalEncodeChange, canonicalEncodeChangeForSigning } from "../../src/det/canonical.js";
+	import { verify as ed25519Verify } from "../../src/det/ed25519.js";
+	import { sha256, hexEncode, hexDecode } from "../../src/crypto.js";
+	const { doNew, doList, doShow, doRemove, doKeyForPubkey, doSignChange } = __test;
 
 // ── Temp-file harness ────────────────────────────────────────────
 
@@ -171,14 +170,15 @@ describe("wallet signing", () => {
 
 		// Decode the signed change and verify externally with the same pubkey.
 		const signed = decodeChange(new Uint8Array(Buffer.from(result.changeB64, "base64")));
-		assert.ok(signed.authorSig);
-		assert.equal(signed.authorSig!.signature.length, 64);
-		assert.equal(hexEncode(signed.authorSig!.pubkey), r.pubkey);
-		assert.equal(signed.authorSig!.nonce, 1);
-		assert.equal(signed.authorSig!.fee, 10);
+		assert.ok(signed.authExtension);
+		const sig = decodeSignature(signed.authExtension.payload);
+		assert.equal(sig.signature.length, 64);
+		assert.equal(hexEncode(sig.pubkey), r.pubkey);
+		assert.equal(sig.nonce, 1);
+		assert.equal(sig.fee, 10);
 
 		const signingBytes = canonicalEncodeChangeForSigning(signed);
-		const ok = ed25519Verify(signed.authorSig!.pubkey, signingBytes, signed.authorSig!.signature);
+		const ok = ed25519Verify(sig.pubkey, signingBytes, sig.signature);
 		assert.equal(ok, true, "signature must verify with the registered pubkey");
 
 		// id is sha256(canonical(signed change with id zeroed))
@@ -232,11 +232,11 @@ describe("wallet signing", () => {
 		const bobCh = decodeChange(new Uint8Array(Buffer.from(bobSig.changeB64, "base64")));
 
 		assert.equal(
-			ed25519Verify(hexDecode(aliceR.pubkey), canonicalEncodeChangeForSigning(aliceCh), aliceCh.authorSig!.signature),
+			ed25519Verify(hexDecode(aliceR.pubkey), canonicalEncodeChangeForSigning(aliceCh), decodeSignature(aliceCh.authExtension!.payload).signature),
 			true,
 		);
 		assert.equal(
-			ed25519Verify(hexDecode(bobR.pubkey), canonicalEncodeChangeForSigning(aliceCh), aliceCh.authorSig!.signature),
+			ed25519Verify(hexDecode(bobR.pubkey), canonicalEncodeChangeForSigning(aliceCh), decodeSignature(aliceCh.authExtension!.payload).signature),
 			false,
 		);
 	});

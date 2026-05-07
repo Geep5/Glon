@@ -46,18 +46,12 @@ message Change {
   // The DAG of ops remains canonical; snapshots just let us skip prefix replay.
   ObjectSnapshot snapshot = 7;  // optional state checkpoint (speeds up replay)
 
-  // Author signature, present iff the object is chain-mode. The kernel
-  // verifies it before any program validator sees the change.
-  // Field 20 (not 8) leaves room for future kernel-level fields.
-  Signature author_sig = 20;
+	  // Generic auth extension for extensible authentication.
+	  // The type field selects a registered verifier; the payload is opaque
+	  // to the kernel and interpreted by the verifier.
+	  AuthExtension auth_extension = 22;
 
-  // x402 payment authorization. When present, the change is treated as a
-  // pre-signed authorization with unique-nonce replay protection and time
-  // bounds instead of (or in addition to) the normal monotonic nonce check.
-  X402Auth x402_auth = 21;
-  AuthExtension auth_extension = 22;
-}
-
+	}
 message X402Auth {
   bytes  nonce       = 1;  // 32-byte unique nonce
   int64  valid_after  = 2; // unix seconds (inclusive)
@@ -69,10 +63,10 @@ message AuthExtension {
   bytes payload = 2;
 }
 
-// Ed25519 signature plus per-pubkey replay-protection nonce and per-change
-// fee. Signature bytes are over the canonical-encoded Change with `id` and
-// `author_sig.signature` cleared (pubkey/nonce/fee ARE included; the
-// signer commits to them).
+	// Ed25519 signature plus per-pubkey replay-protection nonce and per-change
+	// fee. For authExtension type "ed25519", the payload contains an encoded
+	// Signature. The signing bytes zero `id` and the signature bytes inside
+	// the payload; pubkey/nonce/fee ARE included (the signer commits to them).
 message Signature {
   bytes  pubkey    = 1;    // 32-byte Ed25519 public key
   bytes  signature = 2;    // 64-byte Ed25519 signature
@@ -87,7 +81,6 @@ message Operation {
     ObjectDelete  object_delete  = 2;
     FieldSet      field_set      = 3;
     FieldDelete   field_delete   = 4;
-    ContentSet    content_set    = 5;
     BlockAdd      block_add      = 6;
     BlockRemove   block_remove   = 7;
     BlockUpdate   block_update   = 8;
@@ -116,13 +109,7 @@ message FieldDelete {
   string key = 1;
 }
 
-// Set raw byte content (for file-like objects: source code,
-// images, binary data). Replaces the full content blob.
-message ContentSet {
-  bytes content = 1;
-}
-
-// Insert a block into the block tree.
+	// Insert a block into the block tree.
 message BlockAdd {
   string parent_id = 1;   // parent block id ("" = root level)
   string after_id  = 2;   // insert after this sibling ("" = first)

@@ -136,30 +136,7 @@ export function computeState(changes: Change[]): ObjectState {
 				state.fields.delete(op.fieldDelete.key);
 
 
-			} else if (op.contentSet) {
-				// ContentSet is deprecated: migrate to primary block.
-				const idx = state.blocks.findIndex((b) => b.id === "__content__");
-				const block: Block = {
-					id: "__content__",
-					childrenIds: [],
-					content: {
-						custom: {
-							contentType: "glon/raw",
-							data: op.contentSet.content,
-							meta: {},
-						},
-					},
-				};
-				if (idx >= 0) {
-					state.blocks[idx] = block;
-				} else {
-					state.blocks.push(block);
-				}
-				state.blockProvenance.set("__content__", {
-					changeId: change.id,
-					author: change.author,
-					timestamp: change.timestamp,
-				});
+
 			} else if (op.objectDelete) {
 				state.deleted = true;
 			} else if (op.blockAdd) {
@@ -220,11 +197,11 @@ export function findHeads(changes: Change[]): Uint8Array[] {
 
 // ── Snapshot ────────────────────────────────────────────────────────
 
-/** Extract primary content from a block tree (the migrated ContentSet block). */
-export function getPrimaryContent(blocks: Block[]): Uint8Array | undefined {
-	const block = blocks.find((b) => b.id === "__content__");
-	return block?.content?.custom?.data;
-}
+	/** Extract primary content from a block tree (the __content__ block). */
+	export function getPrimaryContent(blocks: Block[]): Uint8Array | undefined {
+		const block = blocks.find((b) => b.id === "__content__");
+		return block?.content?.custom?.data;
+	}
 
 /** Convert ObjectState to ObjectSnapshot (Map → Record). */
 export function toSnapshot(state: ObjectState): ObjectSnapshot {

@@ -4,11 +4,11 @@
  * The kernel-level guard: chain-mode objects MUST carry a valid Ed25519
  * signature on every Change. This test exercises:
  *
- *   1. A signed Change with valid sig+nonce+fee → accepted.
- *   2. A Change missing author_sig → rejected.
- *   3. A Change with a tampered signature → rejected.
- *   4. A Change with a wrong-pubkey signature → rejected.
- *   5. A Change whose id doesn't match canonical hash → rejected.
+	 *   1. A signed Change with valid sig+nonce+fee → accepted.
+	 *   2. A Change missing ed25519 authExtension → rejected.
+	 *   3. A Change with a tampered signature → rejected.
+	 *   4. A Change with a wrong-pubkey signature → rejected.
+	 *   5. A Change whose id doesn't match canonical hash → rejected.
  *   6. The same flow for non-chain-mode objects: no signature required.
  *   7. Direct mutators (setField etc.) on chain-mode objects → rejected.
  *
@@ -20,12 +20,13 @@
 import { describe, it } from "node:test";
 import { strict as assert } from "node:assert";
 import { sha256, hexEncode } from "../../src/crypto.js";
-import {
-	canonicalEncodeChange,
-	canonicalEncodeChangeForSigning,
-} from "../../src/det/canonical.js";
-import { generateKeyPair, sign as ed25519Sign, verify as ed25519Verify } from "../../src/det/ed25519.js";
-import type { Change } from "../../src/proto.js";
+	import { sha256, hexEncode } from "../../src/crypto.js";
+	import {
+		canonicalEncodeChange,
+		canonicalEncodeChangeForSigning,
+	} from "../../src/det/canonical.js";
+	import { generateKeyPair, sign as ed25519Sign, verify as ed25519Verify } from "../../src/det/ed25519.js";
+	import { encodeSignature, decodeSignature, type Change } from "../../src/proto.js";
 
 // ── Helpers ─────────────────────────────────────────────────────
 
@@ -46,53 +47,57 @@ function unsignedChange(objectId: string, typeKey: string): Change {
  * flow: build canonical bytes with sig.signature zeroed, sign them,
  * fill in the signature, recompute the canonical id.
  */
-function signChange(
-	change: Change,
-	keys: { publicKey: Uint8Array; privateKey: Uint8Array },
-	nonce: number,
-	fee: number,
-): Change {
-	const signed: Change = {
-		...change,
-		authorSig: {
+	function signChange(
+		change: Change,
+		keys: { publicKey: Uint8Array; privateKey: Uint8Array },
+		nonce: number,
+		fee: number,
+	): Change {
+		const sig = {
 			pubkey: keys.publicKey,
-			signature: new Uint8Array(64),  // placeholder, zeroed for signing
+			signature: new Uint8Array(64),
 			nonce,
 			fee,
-		},
-	};
-	const signingBytes = canonicalEncodeChangeForSigning(signed);
-	const sig = ed25519Sign(keys.privateKey, signingBytes);
-	signed.authorSig!.signature = sig;
-	signed.id = sha256(canonicalEncodeChange(signed));
-	return signed;
-}
+		};
+		const signed: Change = {
+			...change,
+			authExtension: { type: "ed25519", payload: encodeSignature(sig) },
+		};
+		const signingBytes = canonicalEncodeChangeForSigning(signed);
+		sig.signature = ed25519Sign(keys.privateKey, signingBytes);
+		signed.authExtension = { type: "ed25519", payload: encodeSignature(sig) };
+		signed.id = sha256(canonicalEncodeChange(signed));
+		return signed;
+	}
 
-/**
- * Mirror the kernel's signature gate exactly. We extract it as a function
- * so we can test it without running the full pushChanges pipeline.
- */
-function runSignatureGate(change: Change): { ok: true } | { ok: false; reason: string } {
-	const sig = change.authorSig;
-	if (!sig || !sig.pubkey || sig.pubkey.length === 0) {
-		return { ok: false, reason: "missing author_sig" };
+	/**
+	 * Mirror the kernel's signature gate exactly. We extract it as a function
+	 * so we can test it without running the full pushChanges pipeline.
+	 */
+	function runSignatureGate(change: Change): { ok: true } | { ok: false; reason: string } {
+		if (!change.authExtension || change.authExtension.type !== "ed25519") {
+			return { ok: false, reason: "missing ed25519 authExtension" };
+		}
+		const sig = decodeSignature(change.authExtension.payload);
+		if (!sig.pubkey || sig.pubkey.length === 0) {
+			return { ok: false, reason: "missing pubkey" };
+		}
+		if (sig.pubkey.length !== 32) {
+			return { ok: false, reason: `bad pubkey length ${sig.pubkey.length}` };
+		}
+		if (!sig.signature || sig.signature.length !== 64) {
+			return { ok: false, reason: `bad signature length ${sig.signature?.length ?? 0}` };
+		}
+		const signingBytes = canonicalEncodeChangeForSigning(change);
+		if (!ed25519Verify(sig.pubkey, signingBytes, sig.signature)) {
+			return { ok: false, reason: "invalid signature" };
+		}
+		const expectedId = sha256(canonicalEncodeChange(change));
+		if (hexEncode(expectedId) !== hexEncode(change.id)) {
+			return { ok: false, reason: "id does not match canonical hash" };
+		}
+		return { ok: true };
 	}
-	if (sig.pubkey.length !== 32) {
-		return { ok: false, reason: `bad pubkey length ${sig.pubkey.length}` };
-	}
-	if (!sig.signature || sig.signature.length !== 64) {
-		return { ok: false, reason: `bad signature length ${sig.signature?.length ?? 0}` };
-	}
-	const signingBytes = canonicalEncodeChangeForSigning(change);
-	if (!ed25519Verify(sig.pubkey, signingBytes, sig.signature)) {
-		return { ok: false, reason: "invalid signature" };
-	}
-	const expectedId = sha256(canonicalEncodeChange(change));
-	if (hexEncode(expectedId) !== hexEncode(change.id)) {
-		return { ok: false, reason: "id does not match canonical hash" };
-	}
-	return { ok: true };
-}
 
 // ── Tests ───────────────────────────────────────────────────────
 
@@ -104,7 +109,7 @@ describe("signature gate", () => {
 		assert.equal(result.ok, true);
 	});
 
-	it("rejects a Change missing author_sig", () => {
+	it("rejects a Change missing authExtension", () => {
 		const ch = unsignedChange("obj-1", "chain.coin.bucket");
 		ch.id = sha256(canonicalEncodeChange(ch));
 		const result = runSignatureGate(ch);
@@ -112,29 +117,34 @@ describe("signature gate", () => {
 		assert.match((result as any).reason, /missing/);
 	});
 
-	it("rejects a Change with empty pubkey on author_sig", () => {
+	it("rejects a Change with empty pubkey in authExtension payload", () => {
 		const ch: Change = {
 			...unsignedChange("obj-1", "chain.coin.bucket"),
-			authorSig: {
-				pubkey: new Uint8Array(0),
-				signature: new Uint8Array(64),
-				nonce: 1,
-				fee: 0,
+			authExtension: {
+				type: "ed25519",
+				payload: encodeSignature({
+					pubkey: new Uint8Array(0),
+					signature: new Uint8Array(64),
+					nonce: 1,
+					fee: 0,
+				}),
 			},
 		};
 		ch.id = sha256(canonicalEncodeChange(ch));
 		const result = runSignatureGate(ch);
 		assert.equal(result.ok, false);
 	});
-
 	it("rejects a Change with a wrong-length pubkey", () => {
 		const ch: Change = {
 			...unsignedChange("obj-1", "chain.coin.bucket"),
-			authorSig: {
-				pubkey: new Uint8Array(31),  // off by one
-				signature: new Uint8Array(64),
-				nonce: 1,
-				fee: 0,
+			authExtension: {
+				type: "ed25519",
+				payload: encodeSignature({
+					pubkey: new Uint8Array(31),  // off by one
+					signature: new Uint8Array(64),
+					nonce: 1,
+					fee: 0,
+				}),
 			},
 		};
 		ch.id = sha256(canonicalEncodeChange(ch));
@@ -146,8 +156,10 @@ describe("signature gate", () => {
 	it("rejects a Change with a tampered signature", () => {
 		const keys = generateKeyPair();
 		const ch = signChange(unsignedChange("obj-1", "chain.coin.bucket"), keys, 1, 10);
-		// Flip one byte of the signature.
-		ch.authorSig!.signature[0] ^= 0x01;
+		// Flip one byte of the signature inside the payload.
+		const sig = decodeSignature(ch.authExtension!.payload);
+		sig.signature[0] ^= 0x01;
+		ch.authExtension = { type: "ed25519", payload: encodeSignature(sig) };
 		// Recompute id with the tampered sig (otherwise the id check fails first).
 		ch.id = sha256(canonicalEncodeChange(ch));
 		const result = runSignatureGate(ch);
@@ -160,7 +172,9 @@ describe("signature gate", () => {
 		const bobKeys = generateKeyPair();
 		const ch = signChange(unsignedChange("obj-1", "chain.coin.bucket"), aliceKeys, 1, 10);
 		// Replace pubkey with bob's; signature was made by alice so verify must fail.
-		ch.authorSig!.pubkey = bobKeys.publicKey;
+		const sig = decodeSignature(ch.authExtension!.payload);
+		sig.pubkey = bobKeys.publicKey;
+		ch.authExtension = { type: "ed25519", payload: encodeSignature(sig) };
 		ch.id = sha256(canonicalEncodeChange(ch));
 		const result = runSignatureGate(ch);
 		assert.equal(result.ok, false);
@@ -181,7 +195,9 @@ describe("signature gate", () => {
 		const keys = generateKeyPair();
 		const ch = signChange(unsignedChange("obj-1", "chain.coin.bucket"), keys, 1, 10);
 		// User tries to pay less than they signed for.
-		ch.authorSig!.fee = 5;
+		const sig = decodeSignature(ch.authExtension!.payload);
+		sig.fee = 5;
+		ch.authExtension = { type: "ed25519", payload: encodeSignature(sig) };
 		ch.id = sha256(canonicalEncodeChange(ch));
 		const result = runSignatureGate(ch);
 		assert.equal(result.ok, false);
@@ -191,7 +207,9 @@ describe("signature gate", () => {
 	it("changing the nonce after signing invalidates the signature", () => {
 		const keys = generateKeyPair();
 		const ch = signChange(unsignedChange("obj-1", "chain.coin.bucket"), keys, 1, 10);
-		ch.authorSig!.nonce = 99;
+		const sig = decodeSignature(ch.authExtension!.payload);
+		sig.nonce = 99;
+		ch.authExtension = { type: "ed25519", payload: encodeSignature(sig) };
 		ch.id = sha256(canonicalEncodeChange(ch));
 		const result = runSignatureGate(ch);
 		assert.equal(result.ok, false);

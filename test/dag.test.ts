@@ -9,14 +9,13 @@
 
 import { describe, it } from "node:test";
 import { strict as assert } from "node:assert";
-import { computeState, findHeads, toSnapshot } from "../src/dag/dag.js";
-import {
-	createChange,
-	createGenesisChange,
-	createFieldChange,
-	createDeleteChange,
-	createContentChange,
-} from "../src/dag/change.js";
+	import { computeState, findHeads, toSnapshot, getPrimaryContent } from "../src/dag/dag.js";
+	import {
+		createChange,
+		createGenesisChange,
+		createFieldChange,
+		createDeleteChange,
+	} from "../src/dag/change.js";
 import { stringVal, intVal, floatVal, boolVal, mapVal, listVal, unwrapValue, displayValue, encodeChange, decodeChange, encodeChangeForHashing } from "../src/proto.js";
 import type { Change, Value } from "../src/proto.js";
 import { hexEncode, sha256 } from "../src/crypto.js";
@@ -85,9 +84,25 @@ describe("computeState", () => {
 
 	it("content set stores bytes", () => {
 		const genesis = createGenesisChange("obj-1", "file");
-		const content = createContentChange("obj-1", [genesis.id], Buffer.from("file data"));
+		const content = createChange("obj-1", [{
+			blockAdd: {
+				parentId: "",
+				afterId: "",
+				block: {
+					id: "__content__",
+					childrenIds: [],
+					content: {
+						custom: {
+							contentType: "glon/raw",
+							data: Buffer.from("file data"),
+							meta: {},
+						},
+					},
+				},
+			},
+		}], [genesis.id]);
 		const state = computeState([genesis, content]);
-		assert.equal(Buffer.from(state.content).toString(), "file data");
+		assert.equal(Buffer.from(getPrimaryContent(state.blocks) ?? new Uint8Array()).toString(), "file data");
 	});
 
 	it("object delete sets tombstone", () => {

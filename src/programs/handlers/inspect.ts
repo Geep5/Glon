@@ -19,7 +19,6 @@ function summarizeOps(change: Change): string {
 		if (op.objectDelete) parts.push("delete");
 		if (op.fieldSet) parts.push(`set(${op.fieldSet.key})`);
 		if (op.fieldDelete) parts.push(`del(${op.fieldDelete.key})`);
-		if (op.contentSet) parts.push(`content(${op.contentSet.content.byteLength}b)`);
 		if (op.blockAdd) parts.push("block+");
 		if (op.blockRemove) parts.push("block-");
 		if (op.blockUpdate) parts.push("block~");
@@ -80,7 +79,6 @@ function cmdChange(args: string[], ctx: ProgramContext): void {
 		if (op.objectDelete) ctx.print("  " + red("delete"));
 		if (op.fieldSet) ctx.print("  set     " + cyan(op.fieldSet.key) + "=" + ctx.displayValue(op.fieldSet.value));
 		if (op.fieldDelete) ctx.print("  del     " + cyan(op.fieldDelete.key));
-		if (op.contentSet) ctx.print("  content " + op.contentSet.content.byteLength + " bytes");
 		if (op.blockAdd) ctx.print("  block+  " + op.blockAdd.block.id);
 		if (op.blockRemove) ctx.print("  block-  " + op.blockRemove.blockId);
 		if (op.blockUpdate) ctx.print("  block~  " + op.blockUpdate.blockId);
@@ -248,7 +246,6 @@ function opSummaryStruct(op: any): Record<string, unknown> {
 	if (op.objectDelete) return { type: "objectDelete" };
 	if (op.fieldSet) return { type: "fieldSet", key: op.fieldSet.key };
 	if (op.fieldDelete) return { type: "fieldDelete", key: op.fieldDelete.key };
-	if (op.contentSet) return { type: "contentSet", bytes: op.contentSet.content?.byteLength ?? 0 };
 	if (op.blockAdd) return { type: "blockAdd", block_id: op.blockAdd.block?.id };
 	if (op.blockRemove) return { type: "blockRemove", block_id: op.blockRemove.blockId };
 	if (op.blockUpdate) return { type: "blockUpdate", block_id: op.blockUpdate.blockId };

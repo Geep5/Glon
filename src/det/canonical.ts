@@ -11,19 +11,17 @@
  * and sorting every map<> entry set by its key (lexicographic on UTF-8
  * bytes) before handing to protobufjs's standard encoder.
  *
- * ## Two encoders
- *
- * - `canonicalEncodeChange(change)` → bytes for content-addressing the
- *   change. The `id` field is zeroed; the `authorSig` field is preserved
- *   intact (the id commits to the signature, which prevents anyone from
- *   re-signing a change and having it land at the same id).
- *
- * - `canonicalEncodeChangeForSigning(change)` → bytes the author signs.
- *   Both `id` AND `authorSig.signature` are zeroed; pubkey/nonce/fee on
- *   the signature ARE present (the signature commits to them). This
- *   prevents a witness from re-binding a signature to different
- *   nonce/fee/pubkey values.
- *
+	 * ## Two encoders
+	 *
+	 * - `canonicalEncodeChange(change)` → bytes for content-addressing the
+	 *   change. The `id` field is zeroed; the `authExtension` field is
+	 *   preserved intact (the id commits to the payload, which prevents
+	 *   anyone from re-signing a change and having it land at the same id).
+	 *
+	 * - `canonicalEncodeChangeForSigning(change)` → bytes the author signs.
+	 *   Both `id` AND `authExtension.payload` are zeroed; type is preserved.
+	 *   This prevents a witness from re-binding a signature to different
+	 *   payload values.
  * ## Scope
  *
  * v1: only chain-mode objects use canonical encoding. Non-chain objects
@@ -122,8 +120,7 @@ function canonicalizeOperation(op: Operation): Operation {
 			},
 		};
 	}
-	// objectCreate / objectDelete / fieldDelete / contentSet / blockRemove / blockMove:
-	// no map<> nesting.
+	// objectCreate / objectDelete / fieldDelete / blockRemove / blockMove:
 	return op;
 }
 
@@ -153,67 +150,60 @@ function canonicalizeSnapshot(snap: ObjectSnapshot): ObjectSnapshot {
  * encoder and will produce byte-identical output across implementations.
  */
 
-function canonicalizeChange(change: Change): Change {
-	return {
-		id: change.id,
-		objectId: change.objectId,
-		parentIds: change.parentIds,
-		ops: change.ops.map(canonicalizeOperation),
-		timestamp: change.timestamp,
-		author: change.author,
-		authorSig: change.authorSig,
-		authExtension: change.authExtension
-			? { type: change.authExtension.type, payload: change.authExtension.payload }
-			: undefined,
-		snapshot: change.snapshot ? canonicalizeSnapshot(change.snapshot) : undefined,
-		x402Auth: change.x402Auth ? canonicalizeX402Auth(change.x402Auth) : undefined,
-	};
-}
-
-function canonicalizeX402Auth(auth: import("../proto.js").X402Auth): import("../proto.js").X402Auth {
-	return {
-		nonce: auth.nonce,
-		validAfter: auth.validAfter,
-		validBefore: auth.validBefore,
-	};
-}
+	function canonicalizeChange(change: Change): Change {
+		return {
+			id: change.id,
+			objectId: change.objectId,
+			parentIds: change.parentIds,
+			ops: change.ops.map(canonicalizeOperation),
+			timestamp: change.timestamp,
+			author: change.author,
+			authExtension: change.authExtension
+				? { type: change.authExtension.type, payload: change.authExtension.payload }
+				: undefined,
+			snapshot: change.snapshot ? canonicalizeSnapshot(change.snapshot) : undefined,
+		};
+	}
 
 // ── Public encoders ──────────────────────────────────────────────
 
-/**
- * Bytes used to compute the content-address (id) of a chain-mode change.
- * `id` is zeroed before encoding, but the `authorSig` (if present) is
- * included — meaning two changes with the same content but different
- * signatures produce different ids.
- */
-export function canonicalEncodeChange(change: Change): Uint8Array {
-	const copy = canonicalizeChange(change);
-	copy.id = new Uint8Array(0);
-	return proto.encodeChange(copy);
-}
-
-
-/**
- * Bytes the author signs. `id` is zeroed (unknown at signing time).
- * For authExtension, the payload is zeroed (the signature goes IN the payload).
- * For backwards compat, authorSig.signature is also zeroed if present.
- */
-export function canonicalEncodeChangeForSigning(change: Change): Uint8Array {
-	const copy = canonicalizeChange(change);
-	copy.id = new Uint8Array(0);
-	if (copy.authExtension) {
-		copy.authExtension = {
-			type: copy.authExtension.type,
-			payload: new Uint8Array(0),
-		};
+	/**
+	 * Bytes used to compute the content-address (id) of a chain-mode change.
+	 * `id` is zeroed before encoding, but the `authExtension` (if present) is
+	 * included — meaning two changes with the same content but different
+	 * signatures produce different ids.
+	 */
+	export function canonicalEncodeChange(change: Change): Uint8Array {
+		const copy = canonicalizeChange(change);
+		copy.id = new Uint8Array(0);
+		return proto.encodeChange(copy);
 	}
-	if (copy.authorSig) {
-		copy.authorSig = {
-			pubkey: copy.authorSig.pubkey,
-			signature: new Uint8Array(0),
-			nonce: copy.authorSig.nonce,
-			fee: copy.authorSig.fee,
-		};
+
+	/**
+	 * Bytes the author signs. `id` is zeroed (unknown at signing time).
+	 * For ed25519 authExtension, only the signature bytes inside the payload
+	 * are zeroed; pubkey/nonce/fee ARE committed. For other extension types,
+	 * the entire payload is zeroed.
+	 */
+	export function canonicalEncodeChangeForSigning(change: Change): Uint8Array {
+		const copy = canonicalizeChange(change);
+		copy.id = new Uint8Array(0);
+		if (copy.authExtension) {
+			if (copy.authExtension.type === "ed25519") {
+				const s = proto.decodeSignature(copy.authExtension.payload);
+				copy.authExtension = {
+					type: copy.authExtension.type,
+					payload: proto.encodeSignature({
+						...s,
+						signature: new Uint8Array(0),
+					}),
+				};
+			} else {
+				copy.authExtension = {
+					type: copy.authExtension.type,
+					payload: new Uint8Array(0),
+				};
+			}
+		}
+		return proto.encodeChange(copy);
 	}
-	return proto.encodeChange(copy);
-}

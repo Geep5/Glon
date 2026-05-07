@@ -35,9 +35,9 @@
 
 import type { ProgramDef, ProgramContext, ProgramActorDef, ValidatorFn, ValidationResult } from "../runtime.js";
 
-import { decodeSignature, decodeX402Auth } from "../../proto.js";
-import type { Change } from "../../proto.js";
-import { decodeChange, encodeChange } from "../../proto.js";
+	import { decodeSignature } from "../../proto.js";
+	import type { Change } from "../../proto.js";
+	import { decodeChange, encodeChange } from "../../proto.js";
 import { U64_MAX } from "../../det/math.js";
 import { hexEncode } from "../../crypto.js";
 import { dim, bold, cyan, red, green, yellow } from "../shared.js";
@@ -158,64 +158,19 @@ export function consensusGate(
 	state: PersistedState,
 	nowSeconds: number = Math.floor(Date.now() / 1000),
 ): { ok: true; nextState: PersistedState; kind: FeeKind } | { ok: false; reason: string } {
-	// Determine auth source: new authExtension takes priority, fall back to legacy fields.
-	const hasX402 = change.authExtension?.type === "x402" || !!change.x402Auth;
+	// Auth must be present via authExtension (kernel already verified).
 	const sig = change.authExtension?.type === "ed25519"
 		? (() => {
 				try {
-					const s = decodeSignature(change.authExtension!.payload);
-					return s;
+					return decodeSignature(change.authExtension!.payload);
 				} catch { return undefined; }
 			})()
-		: change.authorSig;
+		: undefined;
 
 	if (!sig) {
 		return { ok: false, reason: "consensus: change is not signed (kernel should have rejected)" };
 	}
 	const pubkeyHex = hexEncode(sig.pubkey);
-
-	// x402 authorization path: unique nonce + time bounds.
-	if (hasX402) {
-		const auth = change.x402Auth ?? (() => {
-			try {
-				return decodeX402Auth(change.authExtension!.payload);
-			} catch { return undefined; }
-		})();
-		if (!auth || !auth.nonce || auth.nonce.length === 0) {
-			return { ok: false, reason: "consensus: x402 auth missing nonce" };
-		}
-		const nonceHex = hexEncode(auth.nonce);
-		if (state.authNonces.includes(nonceHex)) {
-			return { ok: false, reason: `consensus: x402 nonce replay (${nonceHex.slice(0, 16)}…)` };
-		}
-		const SKEW_TOLERANCE_S = 30;
-		if (nowSeconds + SKEW_TOLERANCE_S < auth.validAfter) {
-			return { ok: false, reason: `consensus: x402 auth not yet valid (validAfter=${auth.validAfter}, now=${nowSeconds})` };
-		}
-		if (nowSeconds >= auth.validBefore + SKEW_TOLERANCE_S) {
-			return { ok: false, reason: `consensus: x402 auth expired (validBefore=${auth.validBefore}, now=${nowSeconds})` };
-		}
-		if (sig.nonce > Number.MAX_SAFE_INTEGER) {
-			return { ok: false, reason: "consensus: nonce exceeds safe integer range" };
-		}
-		if (BigInt(sig.fee) > U64_MAX) {
-			return { ok: false, reason: "consensus: fee exceeds uint64 max" };
-		}
-		const policy = feePolicyOf(state);
-		const kind = classifyForFee(change);
-		const minFee = minimumFee(kind, policy);
-		if (BigInt(sig.fee) < minFee) {
-			return { ok: false, reason: `consensus: fee ${sig.fee} below minimum ${minFee.toString()} for kind ${kind}` };
-		}
-		const nextAuthNonces = [...state.authNonces, nonceHex];
-		const nextNonces = { ...state.nonces, [pubkeyHex]: Math.max(state.nonces[pubkeyHex] ?? 0, sig.nonce) };
-		const nextState: PersistedState = {
-			nonces: nextNonces,
-			feePolicy: state.feePolicy,
-			authNonces: nextAuthNonces,
-		};
-		return { ok: true, nextState, kind };
-	}
 
 	// Standard path: monotonic nonce per pubkey.
 	const last = state.nonces[pubkeyHex] ?? 0;
@@ -250,8 +205,8 @@ export function consensusGate(
 		authNonces: state.authNonces,
 	};
 	return { ok: true, nextState, kind };
-}
 
+	}
 // ── Validator (registered with the runtime for chain-mode types) ─
 
 /**

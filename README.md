@@ -12,13 +12,13 @@ Take Git's content-addressed history, give each object its own durable actor (Ri
 
 **1. Objects, not files.** Each entity is a typed object identified by a UUID with a `type_key` (`agent`, `peer`, `chain.coin.bucket`, `program`, …). Structure emerges from `ObjectLink` field values, not from where something is "placed."
 
-**2. Changes, not state.** Every mutation is a `Change` protobuf — a list of `Operation`s (`ObjectCreate`, `FieldSet`, `FieldDelete`, `ContentSet`, `BlockAdd/Remove/Update/Move`, `ObjectDelete`) — whose id is `SHA-256` of its canonical bytes with id zeroed. Parents form the DAG; multiple parents are merges of concurrent edits. The `.pb` file on disk *is* the change; nothing supersedes it.
+**2. Changes, not state.** Every mutation is a `Change` protobuf — a list of `Operation`s (`ObjectCreate`, `ObjectDelete`, `FieldSet`, `FieldDelete`, `BlockAdd/Remove/Update/Move`) — whose id is `SHA-256` of its canonical bytes with id zeroed. Parents form the DAG; multiple parents are merges of concurrent edits. The `.pb` file on disk *is* the change; nothing supersedes it.
 
 **3. Actors, not databases.** Three actor kinds live in `src/index.ts`: `objectActor` (one per object, holds the inbox/outbox and serves sync), `storeActor` (singleton coordinator with a SQLite index that's a pure cache — delete it and it rebuilds from disk), and `programActor` (one per running program, owns its persistent state and tick loop).
 
-**4. Programs are objects.** Programs live in the DAG as type=`program` objects with a `manifest` ValueMap of filenames → source. `src/programs/runtime.ts` esbuild-compiles them at load time and starts their actors. The shell has zero built-ins — even `/help` is loaded from the store. To deploy a code change you re-bootstrap (push new source into the DAG) and restart, because the running daemon is executing what's in the graph, not what's on disk.
+**4. Programs are objects, dispatched by type.** Programs live in the DAG as type=`program` objects with a `manifest` ValueMap of filenames → source. `src/programs/runtime.ts` esbuild-compiles them at load time and starts their actors. The shell has zero built-ins — even `/help` is loaded from the store. Programs register their type-specific behavior at module load: index hooks via `registerIndexHook(typeKeys, fn)`, change-level auth verifiers via `registerAuthVerifier(authType, fn)`, validators via `registerValidator(typeKeys, fn)`. The kernel dispatches by `type_key` and never imports a specific handler — adding `/coin` doesn't require editing `src/index.ts`.
 
-**5. Self-hosted.** `src/bootstrap.ts` seeds the environment with its own source files as objects. The proto, the kernel, the runtime, every handler — all queryable as Glon objects. You can ask the system for the code that built it.
+**5. Self-hosted.** Bootstrap walks `src/`, `proto/`, and `scripts/`, hashes every file, and creates or updates the corresponding objects in the store. The proto, the kernel, the runtime, every handler — all queryable as Glon objects. You can ask the system for the code that built it, and the manifest is the filesystem rather than a parallel registry.
 
 ## The protocol (proto/glon.proto)
 
@@ -26,17 +26,21 @@ Three layers, deliberately separated:
 
 | Layer | Messages | Role |
 |-------|----------|------|
-| Change DAG | `Change`, `Operation`, `ObjectCreate/Delete`, `FieldSet/Delete`, `ContentSet`, `Block*`, `Signature`, `X402Auth` | Source of truth. Immutable, content-addressed. |
+| Change DAG | `Change`, `Operation`, `ObjectCreate/Delete`, `FieldSet/Delete`, `Block*`, `AuthExtension` | Source of truth. Immutable, content-addressed. |
 | Sync | `Envelope` wrapping `HeadAdvertise`, `HeadRequest`, `ChangePush`, `ChangeRequest`, `ObjectSubscribe`, `ObjectEvent`, `AppMessage` | Pull-based DAG exchange between actors. Typed, no JSON-on-the-wire. |
 | Computed State | `ObjectSnapshot`, `ObjectRef`, `Block`, `Value` (recursive `ValueMap`/`ValueList`/`ObjectLink`) | Derived from replay. `ObjectSnapshot` can be embedded in a Change as a replay-skip checkpoint, never as truth. |
 
 Values are recursive and typed at the protobuf level — string/int/float/bool/bytes/list/map/`ObjectLink` — so a browser can store cookie jars as nested maps and a spreadsheet can store cell metadata as typed lists without anyone touching `glon.proto`.
 
-Two kernel-level fields on `Change` matter for the chain layer below: `author_sig` (Ed25519 signature with per-pubkey monotonic nonce and fee), and `x402_auth` (pre-signed payment authorization with unique-nonce replay protection and time bounds).
+A `Change` carries one optional auth field: `auth_extension`, a generic `{type: string, payload: bytes}` shape. The kernel looks up a registered `AuthVerifierFn` by `type` and verifies the payload against the change's canonical bytes before any program validator sees the change. The chain layer registers `"ed25519"`; payment programs register their own (e.g. `"x402"`). The kernel itself knows nothing about either.
+
+There is no separate `ContentSet` op for raw byte content. An object that wants a primary blob — a source file, an image, a binary — stores it in a designated block with id `__content__` whose `CustomContent` carries the bytes. `getPrimaryContent(blocks)` extracts it. One concept (blocks) instead of two (blocks + content).
 
 ## What lives on top — the application layer
 
 Every directory under `src/programs/handlers/` is a hot-loadable program. They all use the same `ProgramDef` shape: an optional `handler` (CLI), optional `actor` (persistent state + actions + tick), and optional `validator` (gates synced changes for given `validatedTypes`).
+
+Actor actions can be declared as `typedActions: Record<string, ActionDef>`, where each `ActionDef` carries a description, an `inputSchema` (JSON Schema), and a handler taking `(ctx, input)`. The runtime validates inputs against the schema at dispatch time. The `/agent` program walks any registered program's typed actions and auto-generates tool descriptions for the LLM — wiring a new program as an agent tool is zero code on the agent side.
 
 There are roughly four families of programs in this repo:
 
@@ -46,8 +50,8 @@ There are roughly four families of programs in this repo:
 
 **Agent stack.** This is the bulk of the code:
 
-- `agent` (3.8k lines) — an LLM agent as a regular object. Every user prompt, assistant reply, tool_use, tool_result, and `compaction_summary` is a content-addressed Block. Tool registration is a scalar field; tools dispatch into other programs via `ctx.dispatchProgram(prefix, action, args)`. ReAct loop with auto-compaction at `contextWindow - reserveTokens`, walking back to the first user boundary that fits the kept-region budget. Subagents are real `agent` objects with a `spawn_parent` link; the parent's DAG records a single tool_use/tool_result whose payload is the compressed batch result.
-- `holdfast` (1.5k lines) — the generic harness. Configure once with `--name <agent>` and `--principal-<...>`, get back an agent wired with identity-aware ingest (every inbound message tagged `[from {name} on {source}, trust={level}]`), a peer directory, durable memory, scheduled reminders, shell access, and subagent spawning. Holds only a cache of `{agentId, agentName, principalPeerId}`; truth lives in the DAG.
+- `agent` — an LLM agent as a regular object. Every user prompt, assistant reply, tool_use, tool_result, and `compaction_summary` is a content-addressed Block. Tools dispatch into other programs via `ctx.dispatchProgram(prefix, action, args)` or `ctx.dispatchTypedAction(prefix, action, input)`. ReAct loop with auto-compaction at `contextWindow - reserveTokens`, walking back to the first user boundary that fits the kept-region budget. Subagents are real `agent` objects with a `spawn_parent` link; the parent's DAG records a single tool_use/tool_result whose payload is the compressed batch result.
+- `holdfast` — the generic harness. Configure once with `--name <agent>` and `--principal-<...>`, get back an agent wired with identity-aware ingest (every inbound message tagged `[from {name} on {source}, trust={level}]`), a peer directory, durable memory, scheduled reminders, shell access, and subagent spawning. Holds only a cache of `{agentId, agentName, principalPeerId}`; truth lives in the DAG.
 - `memory` — durable `pinned_fact` and `milestone` objects with `owner` links back to the agent and `sourced_from_blocks` references. Survives compaction because they're independent objects with their own DAGs.
 - `task` — thin CLI wrapper around `/agent.spawn` for batch subagent runs.
 - `auth` — Anthropic OAuth (Claude Pro/Max impersonating the official `claude` CLI) and API-key fallback. Credentials live in `~/.glon/auth.json`, mode 0600, never synced to peers.
@@ -56,14 +60,15 @@ There are roughly four families of programs in this repo:
 
 **Chain layer.** A small Chia-style proof-of-spacetime blockchain runs on top of the same kernel:
 
-- `wallet` — local Ed25519 keys, never on the DAG. Receives an unsigned `Change`, fills in `pubkey`/`nonce`/`fee`, signs the canonical bytes, returns it content-addressed.
-- `consensus` — validator gate for chain-mode types. Per-pubkey monotonic nonce, asymmetric fee floors (deploy 100×, mint 10×, other 1×), dispatches type-specific semantic checks to the owning program.
-- `coin` — UTXO-based fungible tokens. `chain.token` holds metadata; `chain.coin.bucket` objects hold up to 1000 coins each as `BlockAdd` ops. Atomic swaps via `chain.coin.offer` objects with two-pass replay so `settle` can land before its `escrow`/`pay`.
+- `wallet` — local Ed25519 keys, never on the DAG. Receives an unsigned `Change`, fills in the signature payload, returns it content-addressed.
+- `consensus` — validator gate for chain-mode types. Per-pubkey monotonic nonce, asymmetric fee floors (deploy 100×, mint 10×, other 1×), dispatches type-specific semantic checks to the owning program through its declared typed actions.
+- `coin` — UTXO-based fungible tokens. `chain.token` holds metadata; `chain.coin.bucket` objects hold up to 1000 coins each as `BlockAdd` ops. Atomic swaps via `chain.coin.offer` objects with two-pass replay so `settle` can land before its `escrow`/`pay`. Registers an `IndexHookFn` for `chain.coin.bucket` so the kernel maintains the SQL coin index without importing anything from this file.
+- `coin-x402` — pure helpers for x402 payment authorization (canonical encoding, signature verification). Used by `coin.ts` for offer settlement; could be picked up by other programs that want the same payment shape.
 - `anchor` — global ordering and Merkle state commitment over chain-mode head ids. Longest-chain fork choice with timestamp tiebreak. Inflation rewards in FIG (5 FIG base, halving every 1000 anchors) paid to anchor creators.
 - `plot` — real Proof of Space via shelling out to `chiapos` (Chia's plotter), default `k=25` (~600 MB) for testing, `k=32` (~101 GB) for mainnet-equivalent.
 - `timelord` — real Proof of Time via `chiavdf` (Wesolowski VDFs, class groups of unknown order, 1024-bit discriminant), default 5M iterations.
 
-The chain layer is genuinely separate from the object/agent kernel — it just rides the same `Change` DAG and uses `author_sig` / `x402_auth` to gate which changes survive `consensus.validate()` before the kernel writes them to disk.
+The chain layer is genuinely separate from the object/agent kernel — it just rides the same `Change` DAG, registers an Ed25519 verifier with the kernel for `auth_extension.type = "ed25519"`, and uses `consensus.validate()` to gate which changes survive before the kernel writes them to disk.
 
 ## Stack
 
@@ -94,16 +99,23 @@ npm run bootstrap
 npm run client
 ```
 
-The dev server fails fast if port 6420 is taken; override with `GLON_PORT`. Clients auto-discover the chosen port via `~/.glon/.endpoint`. For headless/automated use there's `scripts/daemon.ts`, which loads every program, runs their actors and tick loops, and exposes `POST /dispatch {prefix, action, args}` on `127.0.0.1:6430` so any external orchestrator can drive Glon without holding API keys.
+The dev server fails fast if port 6420 is taken; override with `GLON_PORT`. Clients auto-discover the chosen port via `~/.glon/.endpoint`.
+
+For headless/automated use there's `scripts/daemon.ts`, which loads every program, runs their actors and tick loops, and exposes `POST /dispatch {prefix, action, args}` on `127.0.0.1:6430` so any external orchestrator can drive Glon without holding API keys. Run it with `--dev` to enable a file watcher: when a `src/programs/handlers/*.ts` file changes, the daemon re-bootstraps the affected program object (disk → DAG), stops its actor, recompiles from the updated source, and restarts. Without `--dev`, programs only update on explicit `npm run bootstrap` followed by a daemon restart.
+
+The bootstrap is content-aware: it hashes each source file, compares against what's in the store, and prints `UNCHANGED` for no-op runs. Add `--force` to rewrite unconditionally if you've corrupted an object and want a clean reseed.
 
 ## Notable design choices, in case you forget why later
 
+- **The kernel knows nothing about specific programs.** Type-specific behavior — replay-time indexing, change-level auth verification, validator semantics, primary-content semantics — is registered by programs at module load. The kernel dispatches by `type_key` strings. `src/index.ts` does not import a single thing from `src/programs/handlers/`. Add a new program, register a hook, and the kernel routes work to it without any kernel change.
 - **Snapshots are never truth.** They live inside `Change` messages as a replay-skip optimization. The op DAG is canonical. This keeps full history recoverable even after aggressive checkpointing.
 - **The SQLite index is a cache.** Delete `~/.glon/index.db` and the next wake rebuilds it from `.pb` files on disk. This is the property that makes "every wake reads disk" tolerable.
-- **Programs run from the DAG, not from disk.** Editing a handler under `src/programs/handlers/` after bootstrap has *no effect* on the running daemon. To deploy a handler change: `npm run bootstrap` (push new source into typescript objects), then restart the daemon. Agent fields (system prompt, model, wired tools) are direct `object_set_field` writes — those take effect immediately.
+- **Programs run from the DAG, not from disk.** Editing a handler under `src/programs/handlers/` after bootstrap has *no effect* on the running daemon by default. To deploy a handler change in a non-dev process: `npm run bootstrap` (push new source into typescript objects), then restart the daemon. In `--dev` mode the watcher does both for you on save. Agent fields (system prompt, model, wired tools) are direct `object_set_field` writes — those take effect immediately regardless of mode.
 - **The agent doesn't have a database; the DAG is the database.** Conversation history, tool calls, compaction summaries, memory facts, subagent transcripts — all the same kind of thing, all replayable, all syncable, all inspectable from another peer that was never given an API key.
-- **Chain mode is opt-in per type.** Non-chain objects sync on a trust-the-peer basis. Chain-mode types route through `consensus.validate()` before the kernel writes anything to disk, with Ed25519 verified by the kernel itself before any program validator sees the change.
+- **Chain mode is opt-in per type.** Non-chain objects sync on a trust-the-peer basis. Chain-mode types route through `consensus.validate()` before the kernel writes anything to disk, with the relevant `AuthVerifierFn` (`"ed25519"` for the chain) verified by the kernel itself before any program validator sees the change.
+- **Auth on a Change is one generic field, not a fixed list.** The kernel sees `auth_extension: {type, payload}` and dispatches by type. Adding a new auth flavor — passkey signatures, attestations, future payment standards — is a new program registering a verifier, not a proto change.
 - **Local-only credentials.** Wallet keys (`~/.glon/wallet.json`) and Anthropic tokens (`~/.glon/auth.json`) are mode 0600, written atomically via `.tmp` + rename, and explicitly *never* part of the sync set. The chain knows you only by your raw pubkey.
+- **Shared utilities, not copy-paste.** ANSI styling and typed value extraction (`getString`, `getInt`, `getLink`, …) live in `src/programs/shared.ts` and are imported by every handler. No more 30 copies of `const DIM = "\x1b[2m"` and no more `obj.fields.foo?.stringValue` ladders.
 
 ## Repo layout
 
@@ -116,18 +128,22 @@ src/
   endpoint.ts                 port lockfile shared by every entry point
   env.ts                      side-effect .env loader
   index.ts                    objectActor / storeActor / programActor + Rivet registry
-  bootstrap.ts                seeds source files + programs as objects on first run
+  bootstrap.ts                walks src/, proto/, scripts/; hashes files;
+                              creates or updates the corresponding store objects
   client.ts                   the CLI shell (a pure program loader, no built-ins)
   dag/
     change.ts                 change construction + content-address hashing
-    dag.ts                    topological sort, snapshot replay, head computation
+    dag.ts                    topological sort, snapshot replay, head computation,
+                              getPrimaryContent for the __content__ block
   det/                        determinism layer for the chain
     canonical.ts              canonical encoding for signing
     ed25519.ts                signing + verification
     math.ts                   bounded big-int arithmetic
   sync/                       mDNS discovery + peer types (the wire layer)
   programs/
-    runtime.ts                module bundler, actor lifecycle, validator dispatch
+    runtime.ts                module bundler, actor lifecycle, dispatch table,
+                              registries (validator, indexHook, authVerifier)
+    shared.ts                 ANSI styling + typed field extractors
     handlers/                 one file per program (~30, see Application Layer above)
 scripts/                      operational tools (daemon, dispatch, dumps, repairs)
 test/                         unit tests for kernel, agents, chain, programs

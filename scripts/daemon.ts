@@ -29,6 +29,8 @@
 	import { resolveEndpoint } from "../src/endpoint.js";
 	import { readFileSync, watch } from "node:fs";
 	import { resolve, basename } from "node:path";
+	import { style } from "../src/programs/shared.js";
+	import { bootstrapStore } from "../src/bootstrap.js";
 
 const ENDPOINT = resolveEndpoint();
 const client = createClient<typeof app>(ENDPOINT);
@@ -42,34 +44,45 @@ async function resolveId(raw: string): Promise<string | null> {
 	return resolved ?? null;
 }
 
-function buildContext(overrides: Partial<ProgramContext> = {}): ProgramContext {
-	return {
-		client,
-		store,
-		resolveId,
-		stringVal, intVal, floatVal, boolVal, mapVal, listVal, linkVal, displayValue,
-		listChangeFiles,
-		readChangeByHex,
-		hexEncode,
-		print: (msg: string) => console.log(msg),
-		randomUUID,
-		state: {},
-		emit: () => {},
-		programId: "",
-		objectActor: (id: string) => client.objectActor.getOrCreate([id]),
-		dispatchProgram: async (prefix: string, action: string, args: unknown[]) => {
-			const inst = getProgramActorByPrefix(prefix);
-			if (!inst) throw new Error(`Program not running: ${prefix}`);
-			return await dispatchActorAction(
-				inst.programId,
-				action,
-				args,
-				(state) => buildContext({ state, programId: inst.programId }),
-			);
-		},
-		...overrides,
-	};
-}
+	function buildContext(overrides: Partial<ProgramContext> = {}): ProgramContext {
+		return {
+			client,
+			store,
+			resolveId,
+			stringVal, intVal, floatVal, boolVal, mapVal, listVal, linkVal, displayValue,
+			listChangeFiles,
+			readChangeByHex,
+			hexEncode,
+			print: (msg: string) => console.log(msg),
+			style,
+			randomUUID,
+			state: {},
+			emit: () => {},
+			programId: "",
+			objectActor: (id: string) => client.objectActor.getOrCreate([id]),
+			dispatchProgram: async (prefix: string, action: string, args: unknown[]) => {
+				const inst = getProgramActorByPrefix(prefix);
+				if (!inst) throw new Error(`Program not running: ${prefix}`);
+				return await dispatchActorAction(
+					inst.programId,
+					action,
+					args,
+					(state) => buildContext({ state, programId: inst.programId }),
+				);
+			},
+			dispatchTypedAction: async (prefix: string, action: string, input: unknown) => {
+				const inst = getProgramActorByPrefix(prefix);
+				if (!inst) throw new Error(`Program not running: ${prefix}`);
+				return await dispatchActorAction(
+					inst.programId,
+					action,
+					[input],
+					(state) => buildContext({ state, programId: inst.programId }),
+				);
+			},
+			...overrides,
+		};
+	}
 
 	async function main() {
 		const DEV = process.argv.includes("--dev");
@@ -98,7 +111,7 @@ function buildContext(overrides: Partial<ProgramContext> = {}): ProgramContext {
 			const debounceMs = 300;
 			const pending = new Map<string, ReturnType<typeof setTimeout>>();
 
-			watch(handlersDir, { recursive: false }, (eventType, filename) => {
+			watch(handlersDir, { recursive: true }, (eventType, filename) => {
 				if (!filename || !filename.endsWith(".ts")) return;
 				const existing = pending.get(filename);
 				if (existing) clearTimeout(existing);
@@ -106,7 +119,7 @@ function buildContext(overrides: Partial<ProgramContext> = {}): ProgramContext {
 					filename,
 					setTimeout(async () => {
 						pending.delete(filename);
-						console.log(`[dev] ${filename} changed → reloading programs`);
+						console.log(`[dev] ${filename} changed → bootstrapping + reloading`);
 
 						try {
 							// Stop all running actors.
@@ -119,6 +132,9 @@ function buildContext(overrides: Partial<ProgramContext> = {}): ProgramContext {
 									// ignore stop errors
 								}
 							}
+
+							// Bootstrap disk changes into the store first.
+							await bootstrapStore(store, client, { quiet: true });
 
 							// Reload all programs (recompiles from store).
 							programs = await loadPrograms(store, client);

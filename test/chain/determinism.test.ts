@@ -14,77 +14,76 @@
  *   3. Subprocess agreement: spawning a fresh Node process to encode the
  *      same Change yields the same bytes, simulating two nodes on the
  *      network.
- *   4. `canonicalEncodeChangeForSigning` zeroes both `id` and
- *      `authorSig.signature` while preserving pubkey/nonce/fee — the
- *      contract the signature gate depends on.
+	 *   4. `canonicalEncodeChangeForSigning` zeroes both `id` and
+	 *      the signature bytes inside `authExtension.payload` while preserving
+	 *      pubkey/nonce/fee — the contract the signature gate depends on.
  *
  * Run: npx tsx --test test/chain/determinism.test.ts
  */
 
-import { describe, it } from "node:test";
-import { strict as assert } from "node:assert";
-import * as childProcess from "node:child_process";
-import { sha256, hexEncode } from "../../src/crypto.js";
-import { canonicalEncodeChange, canonicalEncodeChangeForSigning } from "../../src/det/canonical.js";
-import { stringVal, intVal, mapVal, listVal, type Change, type Value } from "../../src/proto.js";
+	import { describe, it } from "node:test";
+	import { strict as assert } from "node:assert";
+	import * as childProcess from "node:child_process";
+	import { sha256, hexEncode } from "../../src/crypto.js";
+	import { canonicalEncodeChange, canonicalEncodeChangeForSigning } from "../../src/det/canonical.js";
+	import { stringVal, intVal, mapVal, listVal, encodeSignature, decodeSignature, type Change, type Value } from "../../src/proto.js";
 
-// ── Fixtures ────────────────────────────────────────────────────
-
-/** A Change exercising every map-bearing op variant. */
-function makeRichChange(mapInsertOrder: string[] = ["a", "b", "c"]): Change {
-	const fields: Record<string, Value> = {};
-	for (const k of mapInsertOrder) {
-		fields[k] = stringVal(`v-${k}`);
-	}
-	return {
-		id: new Uint8Array(0),
-		objectId: "obj-1",
-		parentIds: [new Uint8Array([1, 2, 3])],
-		ops: [
-			{ objectCreate: { typeKey: "chain.coin.bucket" } },
-			{
-				fieldSet: {
-					key: "metadata",
-					value: mapVal(fields),
-				},
-			},
-			{
-				fieldSet: {
-					key: "nested_list",
-					value: listVal([
-						mapVal({ x: stringVal("1"), y: stringVal("2") }),
-						mapVal({ y: stringVal("4"), x: stringVal("3") }),  // different order
-					]),
-				},
-			},
-			{
-				blockAdd: {
-					parentId: "",
-					afterId: "",
-					block: {
-						id: "blk-1",
-						childrenIds: [],
-						content: {
-							custom: {
-								contentType: "chain.coin.bucket.op",
-								data: new Uint8Array(),
-								meta: { op: "Mint", to: "alice", amount: "1000" },
-							},
-						},
-					},
-				},
-			},
-		],
-		timestamp: 1700000000000,
-		author: "test",
-		authorSig: {
+	/** A Change exercising every map-bearing op variant. */
+	function makeRichChange(mapInsertOrder: string[] = ["a", "b", "c"]): Change {
+		const fields: Record<string, Value> = {};
+		for (const k of mapInsertOrder) {
+			fields[k] = stringVal(`v-${k}`);
+		}
+		const sig = {
 			pubkey: new Uint8Array(32).fill(0xab),
 			signature: new Uint8Array(64).fill(0xcd),
 			nonce: 1,
 			fee: 100,
-		},
-	};
-}
+		};
+		return {
+			id: new Uint8Array(0),
+			objectId: "obj-1",
+			parentIds: [new Uint8Array([1, 2, 3])],
+			ops: [
+				{ objectCreate: { typeKey: "chain.coin.bucket" } },
+				{
+					fieldSet: {
+						key: "metadata",
+						value: mapVal(fields),
+					},
+				},
+				{
+					fieldSet: {
+						key: "nested_list",
+						value: listVal([
+							mapVal({ x: stringVal("1"), y: stringVal("2") }),
+							mapVal({ y: stringVal("4"), x: stringVal("3") }),  // different order
+						]),
+					},
+				},
+				{
+					blockAdd: {
+						parentId: "",
+						afterId: "",
+						block: {
+							id: "blk-1",
+							childrenIds: [],
+							content: {
+								custom: {
+									contentType: "chain.coin.bucket.op",
+									data: new Uint8Array(),
+									meta: { op: "Mint", to: "alice", amount: "1000" },
+								},
+							},
+						},
+					},
+				},
+			],
+			timestamp: 1700000000000,
+			author: "test",
+			authExtension: { type: "ed25519", payload: encodeSignature(sig) },
+		};
+	}
 
 // ── Tests ───────────────────────────────────────────────────────
 
@@ -141,18 +140,20 @@ describe("canonicalEncodeChange", () => {
 		assert.equal(hexEncode(a), hexEncode(b), "id is zeroed; encoding ignores incoming value");
 	});
 
-	it("DOES include authorSig in the encoding (id commits to signature)", () => {
+	it("DOES include authExtension in the encoding (id commits to payload)", () => {
 		const c = makeRichChange();
-		const withDifferentSig: Change = {
+		const withDifferentPayload: Change = {
 			...c,
-			authorSig: c.authorSig ? { ...c.authorSig, signature: new Uint8Array(64).fill(0xff) } : undefined,
+			authExtension: c.authExtension
+				? { ...c.authExtension, payload: new Uint8Array(64).fill(0xff) }
+				: undefined,
 		};
 		const a = canonicalEncodeChange(c);
-		const b = canonicalEncodeChange(withDifferentSig);
+		const b = canonicalEncodeChange(withDifferentPayload);
 		assert.notEqual(
 			hexEncode(a),
 			hexEncode(b),
-			"different signatures must produce different ids",
+			"different authExtension payloads must produce different ids",
 		);
 	});
 
@@ -165,13 +166,15 @@ describe("canonicalEncodeChange", () => {
 		const script = `
 			import { sha256, hexEncode } from "./src/crypto.ts";
 			import { canonicalEncodeChange } from "./src/det/canonical.ts";
-			import { stringVal, mapVal, listVal } from "./src/proto.ts";
+			import { stringVal, mapVal, listVal, encodeSignature } from "./src/proto.ts";
 			const fields = {};
 			for (const k of ["a", "b", "c"]) fields[k] = stringVal("v-" + k);
-			const change = ${JSON.stringify({
-				placeholder: "rebuild below",
-			})};
-			// We rebuild the Change inline because Uint8Array doesn't survive JSON.
+			const sig = {
+				pubkey: new Uint8Array(32).fill(0xab),
+				signature: new Uint8Array(64).fill(0xcd),
+				nonce: 1,
+				fee: 100,
+			};
 			const c = {
 				id: new Uint8Array(0),
 				objectId: "obj-1",
@@ -191,12 +194,7 @@ describe("canonicalEncodeChange", () => {
 				],
 				timestamp: 1700000000000,
 				author: "test",
-				authorSig: {
-					pubkey: new Uint8Array(32).fill(0xab),
-					signature: new Uint8Array(64).fill(0xcd),
-					nonce: 1,
-					fee: 100,
-				},
+				authExtension: { type: "ed25519", payload: encodeSignature(sig) },
 			};
 			process.stdout.write(hexEncode(sha256(canonicalEncodeChange(c))));
 		`;
@@ -213,22 +211,25 @@ describe("canonicalEncodeChange", () => {
 	});
 });
 
-describe("canonicalEncodeChangeForSigning", () => {
-	it("zeroes authorSig.signature but preserves pubkey/nonce/fee", () => {
+	describe("canonicalEncodeChangeForSigning", () => {
+	it("zeroes signature bytes inside authExtension.payload but preserves type", () => {
 		const c1 = makeRichChange();
+		const s1 = decodeSignature(c1.authExtension!.payload);
 		const c2: Change = {
 			...c1,
-			authorSig: c1.authorSig
-				? { ...c1.authorSig, signature: new Uint8Array(64).fill(0xff) }
+			authExtension: c1.authExtension
+				? {
+						...c1.authExtension,
+						payload: encodeSignature({ ...s1, signature: new Uint8Array(64).fill(0xff) }),
+					}
 				: undefined,
 		};
-		// Different signature bytes → SAME signing payload (signature is what's
-		// being computed, so it can't be in its own input).
+		// Different signature bytes → SAME signing payload (signature bytes are
+		// what's being computed, so they can't be in their own input).
 		const a = canonicalEncodeChangeForSigning(c1);
 		const b = canonicalEncodeChangeForSigning(c2);
 		assert.equal(hexEncode(a), hexEncode(b));
 	});
-
 	it("differs from canonicalEncodeChange (signature is excluded)", () => {
 		const c = makeRichChange();
 		const signing = canonicalEncodeChangeForSigning(c);
@@ -238,13 +239,20 @@ describe("canonicalEncodeChangeForSigning", () => {
 
 	it("changing nonce or fee changes the signing payload", () => {
 		const c1 = makeRichChange();
+		const s1 = decodeSignature(c1.authExtension!.payload);
 		const c2: Change = {
 			...c1,
-			authorSig: c1.authorSig ? { ...c1.authorSig, nonce: c1.authorSig.nonce + 1 } : undefined,
+			authExtension: {
+				type: "ed25519",
+				payload: encodeSignature({ ...s1, nonce: s1.nonce + 1 }),
+			},
 		};
 		const c3: Change = {
 			...c1,
-			authorSig: c1.authorSig ? { ...c1.authorSig, fee: c1.authorSig.fee + 1 } : undefined,
+			authExtension: {
+				type: "ed25519",
+				payload: encodeSignature({ ...s1, fee: s1.fee + 1 }),
+			},
 		};
 		const a = canonicalEncodeChangeForSigning(c1);
 		const b = canonicalEncodeChangeForSigning(c2);

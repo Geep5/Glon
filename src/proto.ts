@@ -74,7 +74,6 @@ export interface ObjectCreate { typeKey: string; }
 export interface ObjectDelete {}
 export interface FieldSet { key: string; value: Value; }
 export interface FieldDelete { key: string; }
-export interface ContentSet { content: Uint8Array; }
 export interface BlockAdd { parentId: string; afterId: string; block: Block; }
 export interface BlockRemove { blockId: string; }
 export interface BlockUpdate { blockId: string; content: BlockContent; }
@@ -85,7 +84,6 @@ export interface Operation {
 	objectDelete?: ObjectDelete;
 	fieldSet?: FieldSet;
 	fieldDelete?: FieldDelete;
-	contentSet?: ContentSet;
 	blockAdd?: BlockAdd;
 	blockRemove?: BlockRemove;
 	blockUpdate?: BlockUpdate;
@@ -93,21 +91,17 @@ export interface Operation {
 }
 
 
-export interface Change {
-	id: Uint8Array;
-	objectId: string;
-	parentIds: Uint8Array[];
-	ops: Operation[];
-	snapshot?: ObjectSnapshot;
-	timestamp: number;
-	author: string;
-	/** Present iff the object is chain-mode. Verified in the kernel. */
-	authorSig?: Signature;
-	/** x402 payment authorization. Unique nonce + time bounds for pull payments. */
-	x402Auth?: X402Auth;
-  /** Generic auth extension for extensible authentication. */
-  authExtension?: AuthExtension;
-}
+	export interface Change {
+		id: Uint8Array;
+		objectId: string;
+		parentIds: Uint8Array[];
+		ops: Operation[];
+		snapshot?: ObjectSnapshot;
+		timestamp: number;
+		author: string;
+		/** Generic auth extension for extensible authentication. */
+		authExtension?: AuthExtension;
+	}
 
 export interface X402Auth {
 	nonce: Uint8Array;

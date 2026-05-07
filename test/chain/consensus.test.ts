@@ -16,9 +16,9 @@
 
 import { describe, it, beforeEach } from "node:test";
 import { strict as assert } from "node:assert";
-import consensusProgram, { __test, DEFAULT_BASE_FEE, DEPLOY_FEE_MULTIPLIER, MINT_FEE_MULTIPLIER } from "../../src/programs/handlers/consensus.js";
-import type { Change } from "../../src/proto.js";
-
+	import consensusProgram, { __test, DEFAULT_BASE_FEE, DEPLOY_FEE_MULTIPLIER, MINT_FEE_MULTIPLIER } from "../../src/programs/handlers/consensus.js";
+	import { encodeSignature } from "../../src/proto.js";
+	import type { Change } from "../../src/proto.js";
 const {
 	classifyForFee,
 	minimumFee,
@@ -36,87 +36,90 @@ function alicePub(): Uint8Array {
 	return Buffer.from(ALICE_PUB_HEX, "hex");
 }
 
-function deployChange(opts?: { nonce?: number; fee?: number }): Change {
-	const c: Change = {
-		id: new Uint8Array(0),
-		objectId: "bucket-1",
-		parentIds: [],
-		ops: [{ objectCreate: { typeKey: "chain.coin.bucket" } }],
-		timestamp: 1,
-		author: "test",
-		authorSig: {
+	function deployChange(opts?: { nonce?: number; fee?: number }): Change {
+		const sig = {
 			pubkey: alicePub(),
 			signature: new Uint8Array(64),
 			nonce: opts?.nonce ?? 1,
 			fee: opts?.fee ?? Number(DEFAULT_BASE_FEE * DEPLOY_FEE_MULTIPLIER),
-		},
-	};
-	return c;
-}
+		};
+		const c: Change = {
+			id: new Uint8Array(0),
+			objectId: "bucket-1",
+			parentIds: [],
+			ops: [{ objectCreate: { typeKey: "chain.coin.bucket" } }],
+			timestamp: 1,
+			author: "test",
+			authExtension: { type: "ed25519", payload: encodeSignature(sig) },
+		};
+		return c;
+	}
 
-function transferChange(opts?: { nonce?: number; fee?: number }): Change {
-	const c: Change = {
-		id: new Uint8Array(0),
-		objectId: "bucket-1",
-		parentIds: [],
-		ops: [{
-			blockAdd: {
-				parentId: "", afterId: "",
-				block: {
-					id: "blk-x", childrenIds: [],
-					content: {
-						custom: {
-							contentType: "chain.coin.op",
-							data: new Uint8Array(),
-							meta: { op: "create", coin_id: "c1", owner_pubkey: BOB_PUB_HEX, amount: "10" },
-						},
-					},
-				},
-			},
-		}],
-		timestamp: 2,
-		author: "test",
-		authorSig: {
+	function transferChange(opts?: { nonce?: number; fee?: number }): Change {
+		const sig = {
 			pubkey: alicePub(),
 			signature: new Uint8Array(64),
 			nonce: opts?.nonce ?? 2,
 			fee: opts?.fee ?? Number(DEFAULT_BASE_FEE),
-		},
-	};
-	return c;
-}
-
-function mintChange(opts?: { nonce?: number; fee?: number }): Change {
-	const c: Change = {
-		id: new Uint8Array(0),
-		objectId: "bucket-1",
-		parentIds: [],
-		ops: [{
-			blockAdd: {
-				parentId: "", afterId: "",
-				block: {
-					id: "blk-mint", childrenIds: [],
-					content: {
-						custom: {
-							contentType: "chain.coin.op",
-							data: new Uint8Array(),
-							meta: { op: "Mint", coin_id: "c2", owner_pubkey: BOB_PUB_HEX, amount: "5" },
+		};
+		const c: Change = {
+			id: new Uint8Array(0),
+			objectId: "bucket-1",
+			parentIds: [],
+			ops: [{
+				blockAdd: {
+					parentId: "", afterId: "",
+					block: {
+						id: "blk-x", childrenIds: [],
+						content: {
+							custom: {
+								contentType: "chain.coin.op",
+								data: new Uint8Array(),
+								meta: { op: "create", coin_id: "c1", owner_pubkey: BOB_PUB_HEX, amount: "10" },
+							},
 						},
 					},
 				},
-			},
-		}],
-		timestamp: 3,
-		author: "test",
-		authorSig: {
+			}],
+			timestamp: 2,
+			author: "test",
+			authExtension: { type: "ed25519", payload: encodeSignature(sig) },
+		};
+		return c;
+	}
+
+	function mintChange(opts?: { nonce?: number; fee?: number }): Change {
+		const sig = {
 			pubkey: alicePub(),
 			signature: new Uint8Array(64),
 			nonce: opts?.nonce ?? 3,
 			fee: opts?.fee ?? Number(DEFAULT_BASE_FEE * MINT_FEE_MULTIPLIER),
-		},
-	};
-	return c;
-}
+		};
+		const c: Change = {
+			id: new Uint8Array(0),
+			objectId: "bucket-1",
+			parentIds: [],
+			ops: [{
+				blockAdd: {
+					parentId: "", afterId: "",
+					block: {
+						id: "blk-mint", childrenIds: [],
+						content: {
+							custom: {
+								contentType: "chain.coin.op",
+								data: new Uint8Array(),
+								meta: { op: "Mint", coin_id: "c2", owner_pubkey: BOB_PUB_HEX, amount: "5" },
+							},
+						},
+					},
+				},
+			}],
+			timestamp: 3,
+			author: "test",
+			authExtension: { type: "ed25519", payload: encodeSignature(sig) },
+		};
+		return c;
+	}
 
 function emptyState() {
 	return loadState({});
@@ -191,9 +194,9 @@ describe("consensusGate — happy path", () => {
 });
 
 describe("consensusGate — rejections", () => {
-	it("rejects a Change with no author_sig", () => {
+	it("rejects a Change with no authExtension", () => {
 		const c = deployChange();
-		c.authorSig = undefined;
+		c.authExtension = undefined;
 		const r = consensusGate(c, emptyState());
 		assert.equal(r.ok, false);
 		assert.match((r as any).reason, /not signed/);
