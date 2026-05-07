@@ -12,10 +12,10 @@ import type { Change } from "../../src/proto.js";
 
 import { randomBytes } from "node:crypto";
 
-const {
-	canonicalAuthBytes,
-	verifyX402Auth,
-} = (await import("../../src/programs/handlers/coin.js")).__test;
+	import {
+		canonicalAuthBytes,
+		verifyX402Auth,
+	} from "../../src/programs/handlers/coin-x402.js";
 
 const {
 	consensusGate,

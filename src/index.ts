@@ -1123,6 +1123,12 @@ const programActor = actor({
 					if (!inst) throw new Error(`Program not running: ${prefix}`);
 					return await dispatch2(inst.programId, actionName, actionArgs, makeCtx);
 				},
+				dispatchTypedAction: async (prefix: string, actionName: string, input: unknown) => {
+					const { getProgramActorByPrefix, dispatchActorAction: dispatch2 } = await import("./programs/runtime.js");
+					const inst = getProgramActorByPrefix(prefix);
+					if (!inst) throw new Error(`Program not running: ${prefix}`);
+					return await dispatch2(inst.programId, actionName, [input], makeCtx);
+				},
 			});
 			const result = await dispatchActorAction(c.state.programId, action, args, makeCtx);
 			return JSON.stringify(result ?? null);

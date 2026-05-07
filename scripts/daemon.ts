@@ -9,24 +9,26 @@
  * Run: npx tsx scripts/daemon.ts
  */
 
-import "../src/env.js"; // side-effect: load .env into process.env
-import { createClient } from "rivetkit/client";
-import type { app } from "../src/index.js";
-import { diskStats, readChangeByHex, listChangeFiles } from "../src/disk.js";
-import { hexEncode } from "../src/crypto.js";
-import { stringVal, intVal, floatVal, boolVal, mapVal, listVal, linkVal, displayValue } from "../src/proto.js";
-import {
-	loadPrograms,
-	startProgramActor,
-	stopProgramActor,
-	dispatchActorAction,
-	getProgramActorByPrefix,
-	listProgramActors,
-	type ProgramContext,
-	type ProgramEntry,
-} from "../src/programs/runtime.js";
-import { randomUUID } from "node:crypto";
-import { resolveEndpoint } from "../src/endpoint.js";
+	import "../src/env.js"; // side-effect: load .env into process.env
+	import { createClient } from "rivetkit/client";
+	import type { app } from "../src/index.js";
+	import { diskStats, readChangeByHex, listChangeFiles } from "../src/disk.js";
+	import { hexEncode } from "../src/crypto.js";
+	import { stringVal, intVal, floatVal, boolVal, mapVal, listVal, linkVal, displayValue } from "../src/proto.js";
+	import {
+		loadPrograms,
+		startProgramActor,
+		stopProgramActor,
+		dispatchActorAction,
+		getProgramActorByPrefix,
+		listProgramActors,
+		type ProgramContext,
+		type ProgramEntry,
+	} from "../src/programs/runtime.js";
+	import { randomUUID } from "node:crypto";
+	import { resolveEndpoint } from "../src/endpoint.js";
+	import { readFileSync, watch } from "node:fs";
+	import { resolve, basename } from "node:path";
 
 const ENDPOINT = resolveEndpoint();
 const client = createClient<typeof app>(ENDPOINT);
@@ -69,25 +71,79 @@ function buildContext(overrides: Partial<ProgramContext> = {}): ProgramContext {
 	};
 }
 
-async function main() {
-	console.log(`[daemon] connecting to ${ENDPOINT}`);
-	const programs: ProgramEntry[] = await loadPrograms(store, client);
-	console.log(`[daemon] loaded ${programs.length} programs`);
+	async function main() {
+		const DEV = process.argv.includes("--dev");
+		console.log(`[daemon] connecting to ${ENDPOINT}${DEV ? " (dev mode)" : ""}`);
+		let programs: ProgramEntry[] = await loadPrograms(store, client);
+		console.log(`[daemon] loaded ${programs.length} programs`);
 
-	let started = 0;
-	for (const prog of programs) {
-		try {
-			const inst = await startProgramActor(prog, (state) => buildContext({ state, programId: prog.id }));
-			if (inst) {
-				console.log(`[daemon] started ${prog.prefix} (actor=${!!prog.def?.actor}, tickMs=${prog.def?.actor?.tickMs ?? "-"})`);
-				started++;
+		let started = 0;
+		for (const prog of programs) {
+			try {
+				const inst = await startProgramActor(prog, (state) => buildContext({ state, programId: prog.id }));
+				if (inst) {
+					console.log(`[daemon] started ${prog.prefix} (actor=${!!prog.def?.actor}, tickMs=${prog.def?.actor?.tickMs ?? "-"})`);
+					started++;
+				}
+			} catch (err: any) {
+				console.log(`[daemon] failed to start ${prog.prefix}: ${err?.message ?? err}`);
 			}
-		} catch (err: any) {
-			console.log(`[daemon] failed to start ${prog.prefix}: ${err?.message ?? err}`);
 		}
-	}
-	console.log(`[daemon] ${started} actor(s) running. Diskstats:`, diskStats());
+		console.log(`[daemon] ${started} actor(s) running. Diskstats:`, diskStats());
 
+		// ── Dev-mode file watcher ──────────────────────────────────
+		// Hot-reload programs when their handler source files change.
+		if (DEV) {
+			const handlersDir = resolve(import.meta.dirname ?? ".", "../src/programs/handlers");
+			const debounceMs = 300;
+			const pending = new Map<string, ReturnType<typeof setTimeout>>();
+
+			watch(handlersDir, { recursive: false }, (eventType, filename) => {
+				if (!filename || !filename.endsWith(".ts")) return;
+				const existing = pending.get(filename);
+				if (existing) clearTimeout(existing);
+				pending.set(
+					filename,
+					setTimeout(async () => {
+						pending.delete(filename);
+						console.log(`[dev] ${filename} changed → reloading programs`);
+
+						try {
+							// Stop all running actors.
+							for (const prog of programs) {
+								try {
+									await stopProgramActor(prog.id, (state) =>
+										buildContext({ state, programId: prog.id }),
+									);
+								} catch {
+									// ignore stop errors
+								}
+							}
+
+							// Reload all programs (recompiles from store).
+							programs = await loadPrograms(store, client);
+
+							// Restart actors.
+							for (const prog of programs) {
+								try {
+									const inst = await startProgramActor(prog, (state) =>
+										buildContext({ state, programId: prog.id }),
+									);
+									if (inst) {
+										console.log(`[dev] reloaded ${prog.prefix}`);
+									}
+								} catch (err: any) {
+									console.log(`[dev] failed to start ${prog.prefix}: ${err?.message ?? err}`);
+								}
+							}
+						} catch (err: any) {
+							console.log(`[dev] reload failed: ${err?.message ?? err}`);
+						}
+					}, debounceMs),
+				);
+			});
+			console.log(`[dev] watching ${handlersDir}`);
+		}
 	// Track recurring tasks for inspection / toggling
 	const taskHandles: Map<string, ReturnType<typeof setInterval> | null> = new Map();
 
@@ -209,9 +265,9 @@ async function main() {
 						return;
 					}
 
-					// Verify signature via coin actor
-					const coin = await import("../src/programs/handlers/coin.js");
-					const valid = coin.__test.verifyX402Auth(auth, signature);
+					// Verify signature via coin x402 helper
+					const { verifyX402Auth } = await import("../src/programs/handlers/coin-x402.js");
+					const valid = verifyX402Auth(auth, signature);
 					if (!valid) {
 						res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
 						res.end(JSON.stringify({ valid: false, error: "invalid signature" }));

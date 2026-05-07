@@ -81,37 +81,52 @@ export interface ProgramContext {
 	objectActor: (id: string, opts?: { createWithInput?: unknown }) => unknown;
 
 	/**
-	 * Dispatch an action on another program's actor by prefix.
-	 * Throws if no program is running at that prefix or the action is unknown.
-	 */
-	dispatchProgram: (prefix: string, action: string, args: unknown[]) => Promise<unknown>;
-}
+		 * Dispatch an action on another program's actor by prefix.
+		 * Throws if no program is running at that prefix or the action is unknown.
+		 */
+		dispatchProgram: (prefix: string, action: string, args: unknown[]) => Promise<unknown>;
 
+		/** Typed dispatch: passes a single input object to a typedAction handler. */
+		dispatchTypedAction: <T = unknown>(prefix: string, action: string, input: T) => Promise<unknown>;
+	}
 
-/** Validation result returned by program validators. */
-export interface ValidationResult {
-	valid: boolean;
-	error?: string;
-}
+	/** Validation result returned by program validators. */
+	export interface ValidationResult {
+		valid: boolean;
+		error?: string;
+	}
 
-/** Context passed to validators during cross-object batch validation. */
-export interface BatchValidationContext {
-	/** All changes in the batch, across all objects. */
-	allChanges: Change[];
-}
+	/** Typed action definition with optional JSON Schema validation. */
+	export interface ActionDef<TInput = unknown, TOutput = unknown> {
+		/** Human-readable description for docs / tool registries. */
+		description?: string;
+		/** JSON Schema for the single input argument (default: any). */
+		inputSchema?: Record<string, unknown>;
+		/** Handler receiving (ctx, input). */
+		handler: (ctx: ProgramContext, input: TInput) => Promise<TOutput> | TOutput;
+	}
 
-/** A program validator function. Receives changes for its object plus optional batch context. */
-export type ValidatorFn = (changes: Change[], context?: BatchValidationContext) => ValidationResult;
+	/** Context passed to validators during cross-object batch validation. */
+	export interface BatchValidationContext {
+		/** All changes in the batch, across all objects. */
+		allChanges: Change[];
+	}
 
-/** Shape of a program's actor definition (exported from module programs). */
-export interface ProgramActorDef {
-	createState?: () => Record<string, any>;
-	onCreate?: (ctx: ProgramContext) => Promise<void> | void;
-	onDestroy?: (ctx: ProgramContext) => Promise<void> | void;
-	actions?: Record<string, (ctx: ProgramContext, ...args: any[]) => any>;
-	tickMs?: number;
-	onTick?: (ctx: ProgramContext) => Promise<void> | void;
-}
+	/** A program validator function. Receives changes for its object plus optional batch context. */
+	export type ValidatorFn = (changes: Change[], context?: BatchValidationContext) => ValidationResult;
+
+	/** Shape of a program's actor definition (exported from module programs). */
+	export interface ProgramActorDef {
+		createState?: () => Record<string, any>;
+		onCreate?: (ctx: ProgramContext) => Promise<void> | void;
+		onDestroy?: (ctx: ProgramContext) => Promise<void> | void;
+		/** Legacy untyped actions map. */
+		actions?: Record<string, (ctx: ProgramContext, ...args: any[]) => any>;
+		/** Typed actions with optional schema metadata. */
+		typedActions?: Record<string, ActionDef>;
+		tickMs?: number;
+		onTick?: (ctx: ProgramContext) => Promise<void> | void;
+	}
 
 /** Full program definition (exported from module programs via `export default`). */
 export interface ProgramDef {
@@ -595,6 +610,15 @@ export async function dispatchActorAction(
 ): Promise<any> {
 	const instance = actorInstances.get(programId);
 	if (!instance) throw new Error(`No running program actor: ${programId}`);
+
+	// Prefer typedActions over legacy actions.
+	const typed = instance.def.typedActions?.[action];
+	if (typed) {
+		// typedActions receive a single input object as args[0].
+		const input = args[0];
+		// Optional: runtime schema validation could go here.
+		return await typed.handler(makeCtx(instance.state), input);
+	}
 
 	const actionFn = instance.def.actions?.[action];
 	if (!actionFn) throw new Error(`Unknown action "${action}" on program ${instance.prefix}`);

@@ -33,9 +33,9 @@ import { hexEncode, hexDecode } from "../../crypto.js";
 
 
 
-import { randomBytes } from "node:crypto";
-import { verify as ed25519Verify } from "../../det/ed25519.js";
-import { dim, bold, cyan, red, green, yellow } from "../shared.js";
+	import { randomBytes } from "node:crypto";
+	import { dim, bold, cyan, red, green, yellow } from "../shared.js";
+	import { X402Authorization, canonicalAuthBytes, verifyX402Auth } from "./coin-x402.js";
 
 // ── Constants ────────────────────────────────────────────────────
 
@@ -562,43 +562,6 @@ export function validateOfferChange(
 	return { valid: true };
 }
 // ── Handler (CLI) ────────────────────────────────────────────────
-
-// ── x402 helpers ─────────────────────────────────────────────────
-
-interface X402Authorization {
-	scheme: "exact";
-	network: "glon:v1";
-	from: string;
-	to: string;
-	value: string;
-	asset: string;
-	validAfter: number;
-	validBefore: number;
-	nonce: string;
-}
-
-function canonicalAuthBytes(auth: X402Authorization): Uint8Array {
-	const sorted = {
-		asset: auth.asset,
-		from: auth.from,
-		network: auth.network,
-		nonce: auth.nonce,
-		scheme: auth.scheme,
-		to: auth.to,
-		validAfter: auth.validAfter,
-		validBefore: auth.validBefore,
-		value: auth.value,
-	};
-	return new TextEncoder().encode(JSON.stringify(sorted));
-}
-
-function verifyX402Auth(auth: X402Authorization, signatureHex: string): boolean {
-	const msg = canonicalAuthBytes(auth);
-	const sig = hexDecode(signatureHex);
-	const pubkey = hexDecode(auth.from);
-	if (sig.length !== 64 || pubkey.length !== 32) return false;
-	return ed25519Verify(pubkey, msg, sig);
-}
 
 async function buildX402SettleBatch(
 	auth: X402Authorization,
@@ -1959,144 +1922,162 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 
 // ── Actor (programmatic API) ─────────────────────────────────────
 
-const actorDef: ProgramActorDef = {
-	createState: () => ({}),
-	actions: {
+	const actorDef: ProgramActorDef = {
+		createState: () => ({}),
+		actions: {
 
-		validate_op: async (
-			ctx: ProgramContext,
-			input: { objectId: string; changeB64: string },
-		): Promise<ValidationResult> => {
-			const store = ctx.store as any;
-			const obj = await store.get(input.objectId);
-			const priorBlocks = obj?.blocks ?? [];
-			const typeKey = obj?.typeKey ?? "";
-			const change = decodeChange(new Uint8Array(Buffer.from(input.changeB64, "base64")));
-			if (typeKey === OFFER_TYPE_KEY) {
-				return validateOfferChange(change, priorBlocks);
-			}
-			return validateBucketChange(change, priorBlocks);
+			/** Build a signed x402 authorization. Returns { authorization, signature }. */
+			authorizePayment: async (ctx: ProgramContext, input: {
+				tokenId: string;
+				amount: string;
+				recipient: string;
+				validForSec?: number;
+				keyName?: string;
+			}): Promise<{ authorization: X402Authorization; signature: string }> => {
+				const keyName = input.keyName ?? "default";
+				const keyInfo = await ctx.dispatchProgram("/wallet", "show", [keyName]) as { pubkey: string } | null;
+				if (!keyInfo) throw new Error(`wallet key "${keyName}" not found`);
+				const nonceBytes = randomBytes(32);
+				const nonceHex = nonceBytes.toString("hex");
+				const now = Math.floor(Date.now() / 1000);
+				const auth: X402Authorization = {
+					scheme: "exact",
+					network: "glon:v1",
+					from: keyInfo.pubkey,
+					to: input.recipient,
+					value: input.amount,
+					asset: input.tokenId,
+					validAfter: now,
+					validBefore: now + (input.validForSec ?? 60),
+					nonce: nonceHex,
+				};
+				const msg = canonicalAuthBytes(auth);
+				const { signature } = await ctx.dispatchProgram("/wallet", "sign", [keyName, Buffer.from(msg).toString("base64")]) as { signature: string };
+				return { authorization: auth, signature };
+			},
+
+			/** Settle an x402 authorization. Returns { ok: true } or throws. */
+			settlePayment: async (ctx: ProgramContext, input: {
+				authorization: X402Authorization;
+				signature: string;
+				keyName?: string;
+			}): Promise<{ ok: true }> => {
+				if (!verifyX402Auth(input.authorization, input.signature)) {
+					throw new Error("x402: invalid authorization signature");
+				}
+				const now = Math.floor(Date.now() / 1000);
+				if (now < input.authorization.validAfter) throw new Error("x402: authorization not yet valid");
+				if (now >= input.authorization.validBefore) throw new Error("x402: authorization expired");
+
+				const batch = await buildX402SettleBatch(input.authorization, ctx, input.keyName ?? "default");
+				const store = ctx.store as any;
+				await store.pushChangesBatch(JSON.stringify(batch));
+
+				// Record nonce consumed
+				await ctx.dispatchProgram("/consensus", "recordX402Accepted", [input.authorization.nonce]);
+
+				return { ok: true };
+			},
 		},
+		typedActions: {
 
-		buildBucketGenesis: async (_ctx: ProgramContext, args: {
-			bucketId: string;
-			timestamp: number;
-			author: string;
-			tokenId: string;
-			capacity?: number;
-		}): Promise<{ changeB64: string }> => {
-			const change = buildBucketGenesisChange(args);
-			return { changeB64: Buffer.from(encodeChange(change)).toString("base64") };
+			validate_op: {
+				description: "Validate a coin operation change against current bucket state",
+				handler: async (
+					ctx: ProgramContext,
+					input: { objectId: string; changeB64: string },
+				): Promise<ValidationResult> => {
+					const store = ctx.store as any;
+					const obj = await store.get(input.objectId);
+					const priorBlocks = obj?.blocks ?? [];
+					const typeKey = obj?.typeKey ?? "";
+					const change = decodeChange(new Uint8Array(Buffer.from(input.changeB64, "base64")));
+					if (typeKey === OFFER_TYPE_KEY) {
+						return validateOfferChange(change, priorBlocks);
+					}
+					return validateBucketChange(change, priorBlocks);
+				},
+			},
+
+			buildBucketGenesis: {
+				description: "Build a genesis change for a new coin bucket",
+				handler: async (_ctx: ProgramContext, args: {
+					bucketId: string;
+					timestamp: number;
+					author: string;
+					tokenId: string;
+					capacity?: number;
+				}): Promise<{ changeB64: string }> => {
+					const change = buildBucketGenesisChange(args);
+					return { changeB64: Buffer.from(encodeChange(change)).toString("base64") };
+				},
+			},
+
+			buildCoinOp: {
+				description: "Build a change containing a single coin operation",
+				handler: async (_ctx: ProgramContext, args: {
+					bucketId: string;
+					parentIds: string[];
+					timestamp: number;
+					author: string;
+					op: CoinOp;
+					blockId: string;
+				}): Promise<{ changeB64: string }> => {
+					const change = buildCoinOpChange({
+						bucketId: args.bucketId,
+						parentIds: args.parentIds.map(hexDecode),
+						timestamp: args.timestamp,
+						author: args.author,
+						op: args.op,
+						blockId: args.blockId,
+					});
+					return { changeB64: Buffer.from(encodeChange(change)).toString("base64") };
+				},
+			},
+
+			replayBucket: {
+				description: "Replay a bucket's block tree into derived state",
+				handler: async (_ctx: ProgramContext, blocks: Block[]): Promise<BucketState> => {
+					return replayBucket(blocks);
+				},
+			},
+
+			buildOfferGenesis: {
+				description: "Build a genesis change for a new coin offer",
+				handler: async (_ctx: ProgramContext, args: {
+					offerId: string;
+					timestamp: number;
+					author: string;
+					makerPubkey: string;
+					terms: OfferTerms;
+				}): Promise<{ changeB64: string }> => {
+					const termsJson = JSON.stringify(args.terms);
+					const change: Change = {
+						id: new Uint8Array(0),
+						objectId: args.offerId,
+						parentIds: [],
+						ops: [
+							{ objectCreate: { typeKey: OFFER_TYPE_KEY } },
+							{ fieldSet: { key: "maker_pubkey", value: { stringValue: args.makerPubkey } } },
+							{ fieldSet: { key: "terms", value: { stringValue: termsJson } } },
+							{ fieldSet: { key: "status", value: { stringValue: "open" } } },
+							{ fieldSet: { key: "nonce", value: { stringValue: crypto.randomUUID().replace(/-/g, "").slice(0, 16) } } },
+						],
+						timestamp: args.timestamp,
+						author: args.author,
+					};
+					return { changeB64: Buffer.from(encodeChange(change)).toString("base64") };
+				},
+			},
+
+			replayOffer: {
+				description: "Replay an offer's block tree into derived state",
+				handler: async (_ctx: ProgramContext, blocks: Block[]): Promise<OfferState> => {
+					return replayOffer(blocks);
+				},
+			},
 		},
-
-		buildCoinOp: async (_ctx: ProgramContext, args: {
-			bucketId: string;
-			parentIds: string[];
-			timestamp: number;
-			author: string;
-			op: CoinOp;
-			blockId: string;
-		}): Promise<{ changeB64: string }> => {
-			const change = buildCoinOpChange({
-				bucketId: args.bucketId,
-				parentIds: args.parentIds.map(hexDecode),
-				timestamp: args.timestamp,
-				author: args.author,
-				op: args.op,
-				blockId: args.blockId,
-			});
-			return { changeB64: Buffer.from(encodeChange(change)).toString("base64") };
-		},
-
-
-		replayBucket: async (_ctx: ProgramContext, blocks: Block[]): Promise<BucketState> => {
-			return replayBucket(blocks);
-		},
-
-		buildOfferGenesis: async (_ctx: ProgramContext, args: {
-			offerId: string;
-			timestamp: number;
-			author: string;
-			makerPubkey: string;
-			terms: OfferTerms;
-		}): Promise<{ changeB64: string }> => {
-			const termsJson = JSON.stringify(args.terms);
-			const change: Change = {
-				id: new Uint8Array(0),
-				objectId: args.offerId,
-				parentIds: [],
-				ops: [
-					{ objectCreate: { typeKey: OFFER_TYPE_KEY } },
-					{ fieldSet: { key: "maker_pubkey", value: { stringValue: args.makerPubkey } } },
-					{ fieldSet: { key: "terms", value: { stringValue: termsJson } } },
-					{ fieldSet: { key: "status", value: { stringValue: "open" } } },
-					{ fieldSet: { key: "nonce", value: { stringValue: crypto.randomUUID().replace(/-/g, "").slice(0, 16) } } },
-				],
-				timestamp: args.timestamp,
-				author: args.author,
-			};
-			return { changeB64: Buffer.from(encodeChange(change)).toString("base64") };
-		},
-
-		replayOffer: async (_ctx: ProgramContext, blocks: Block[]): Promise<OfferState> => {
-			return replayOffer(blocks);
-		},
-
-
-		/** Build a signed x402 authorization. Returns { authorization, signature }. */
-		authorizePayment: async (ctx: ProgramContext, input: {
-			tokenId: string;
-			amount: string;
-			recipient: string;
-			validForSec?: number;
-			keyName?: string;
-		}): Promise<{ authorization: X402Authorization; signature: string }> => {
-			const keyName = input.keyName ?? "default";
-			const keyInfo = await ctx.dispatchProgram("/wallet", "show", [keyName]) as { pubkey: string } | null;
-			if (!keyInfo) throw new Error(`wallet key "${keyName}" not found`);
-			const nonceBytes = randomBytes(32);
-			const nonceHex = nonceBytes.toString("hex");
-			const now = Math.floor(Date.now() / 1000);
-			const auth: X402Authorization = {
-				scheme: "exact",
-				network: "glon:v1",
-				from: keyInfo.pubkey,
-				to: input.recipient,
-				value: input.amount,
-				asset: input.tokenId,
-				validAfter: now,
-				validBefore: now + (input.validForSec ?? 60),
-				nonce: nonceHex,
-			};
-			const msg = canonicalAuthBytes(auth);
-			const { signature } = await ctx.dispatchProgram("/wallet", "sign", [keyName, Buffer.from(msg).toString("base64")]) as { signature: string };
-			return { authorization: auth, signature };
-		},
-
-		/** Settle an x402 authorization. Returns { ok: true } or throws. */
-		settlePayment: async (ctx: ProgramContext, input: {
-			authorization: X402Authorization;
-			signature: string;
-			keyName?: string;
-		}): Promise<{ ok: true }> => {
-			if (!verifyX402Auth(input.authorization, input.signature)) {
-				throw new Error("x402: invalid authorization signature");
-			}
-			const now = Math.floor(Date.now() / 1000);
-			if (now < input.authorization.validAfter) throw new Error("x402: authorization not yet valid");
-			if (now >= input.authorization.validBefore) throw new Error("x402: authorization expired");
-
-			const batch = await buildX402SettleBatch(input.authorization, ctx, input.keyName ?? "default");
-			const store = ctx.store as any;
-			await store.pushChangesBatch(JSON.stringify(batch));
-
-			// Record nonce consumed
-			await ctx.dispatchProgram("/consensus", "recordX402Accepted", [input.authorization.nonce]);
-
-			return { ok: true };
-		},
-	},
-};
+	};
 
 
 const program: ProgramDef = {

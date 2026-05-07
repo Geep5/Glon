@@ -76,6 +76,16 @@ function buildContext(overrides?: Partial<ProgramContext>): ProgramContext {
 				(state) => buildContext({ state, programId: inst.programId }),
 			);
 		},
+		dispatchTypedAction: async (prefix: string, action: string, input: unknown) => {
+			const inst = getProgramActorByPrefix(prefix);
+			if (!inst) throw new Error(`Program not running: ${prefix}`);
+			return await dispatchActorAction(
+				inst.programId,
+				action,
+				[input],
+				(state) => buildContext({ state, programId: inst.programId }),
+			);
+		},
 		...overrides,
 	};
 }
