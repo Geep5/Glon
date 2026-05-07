@@ -1,230 +1,139 @@
 # glon
 
-An autonomous-agent operating environment where every agent has a wallet, a DAG-backed long-term memory, and the ability to recall any object from the past.
+A distributed object environment where every mutation is a content-addressed protobuf message in a DAG, every object is a durable actor, and every program — including the ones running the shell — is itself an object you can replay, sync, and inspect.
 
-glon is a single stack with three layers designed together:
+There is no folder hierarchy and no central database. Objects are typed, link to each other, and live in a flat graph. State is never written; it is *computed* by replaying changes from genesis to heads.
 
-1. **A distributed object kernel.** Every entity is a content-addressed object in a DAG. Changes are immutable, signed, and replayable. Objects are actors: they wake, compute state from their history, and sleep. No external database.
+## The big idea, in one breath
 
+Take Git's content-addressed history, give each object its own durable actor (Rivet) with a sync inbox, replace files-and-folders with typed objects-and-links, and let programs be just another kind of object that happens to define a handler, an actor, and a validator. You end up with a substrate where a tic-tac-toe game, an LLM agent's conversation, a Discord bridge, a UTXO ledger, and the runtime that loads them are all the same kind of thing.
 
-2. **An agent harness (Holdfast).** Identity-aware conversation ingest, durable memory (pinned facts + milestone arcs), scheduled reminders, persistent shell sessions, and subagent batching. An agent's entire conversation lives as blocks in its object's DAG. Compaction keeps context windows bounded without losing history.
+## The kernel — five primitives
 
-3. **Native crypto.** Every agent owns an Ed25519 keypair in a local wallet. Agents deploy UTXO tokens, create atomic swap offers, sign transactions, and hold balances. The same signature gate that protects chain-mode objects also authenticates agent actions.
-What makes this an ideal environment for agents:
+**1. Objects, not files.** Each entity is a typed object identified by a UUID with a `type_key` (`agent`, `peer`, `chain.coin.bucket`, `program`, …). Structure emerges from `ObjectLink` field values, not from where something is "placed."
 
-- **Nothing is ever lost.** Deleted objects and compacted conversation blocks remain in the DAG. Agents can `recall` any past block or `inject` any object — even tombstoned ones — back into their active context.
-- **Agents are stateful by default.** Memory, tools, conversation history, and scheduled tasks are all native object types, not external integrations.
-- **Agents have money.** Wallet keys are agent-owned and local-only. Token operations are signed changes in the same DAG as everything else.
-- **Self-describing.** The system bootstraps its own source code into the store. Query glon for the code that built it.
+**2. Changes, not state.** Every mutation is a `Change` protobuf — a list of `Operation`s (`ObjectCreate`, `FieldSet`, `FieldDelete`, `ContentSet`, `BlockAdd/Remove/Update/Move`, `ObjectDelete`) — whose id is `SHA-256` of its canonical bytes with id zeroed. Parents form the DAG; multiple parents are merges of concurrent edits. The `.pb` file on disk *is* the change; nothing supersedes it.
 
-Inspired by [Anytype](https://anytype.io)'s object-graph philosophy, [Rivet](https://rivet.gg)'s durable actors, [Chia](https://www.chia.net/)'s proof-of-space-and-time consensus, and [oh-my-pi](https://github.com/can1357/oh-my-pi)'s agent harness.
+**3. Actors, not databases.** Three actor kinds live in `src/index.ts`: `objectActor` (one per object, holds the inbox/outbox and serves sync), `storeActor` (singleton coordinator with a SQLite index that's a pure cache — delete it and it rebuilds from disk), and `programActor` (one per running program, owns its persistent state and tick loop).
+
+**4. Programs are objects.** Programs live in the DAG as type=`program` objects with a `manifest` ValueMap of filenames → source. `src/programs/runtime.ts` esbuild-compiles them at load time and starts their actors. The shell has zero built-ins — even `/help` is loaded from the store. To deploy a code change you re-bootstrap (push new source into the DAG) and restart, because the running daemon is executing what's in the graph, not what's on disk.
+
+**5. Self-hosted.** `src/bootstrap.ts` seeds the environment with its own source files as objects. The proto, the kernel, the runtime, every handler — all queryable as Glon objects. You can ask the system for the code that built it.
+
+## The protocol (proto/glon.proto)
+
+Three layers, deliberately separated:
+
+| Layer | Messages | Role |
+|-------|----------|------|
+| Change DAG | `Change`, `Operation`, `ObjectCreate/Delete`, `FieldSet/Delete`, `ContentSet`, `Block*`, `Signature`, `X402Auth` | Source of truth. Immutable, content-addressed. |
+| Sync | `Envelope` wrapping `HeadAdvertise`, `HeadRequest`, `ChangePush`, `ChangeRequest`, `ObjectSubscribe`, `ObjectEvent`, `AppMessage` | Pull-based DAG exchange between actors. Typed, no JSON-on-the-wire. |
+| Computed State | `ObjectSnapshot`, `ObjectRef`, `Block`, `Value` (recursive `ValueMap`/`ValueList`/`ObjectLink`) | Derived from replay. `ObjectSnapshot` can be embedded in a Change as a replay-skip checkpoint, never as truth. |
+
+Values are recursive and typed at the protobuf level — string/int/float/bool/bytes/list/map/`ObjectLink` — so a browser can store cookie jars as nested maps and a spreadsheet can store cell metadata as typed lists without anyone touching `glon.proto`.
+
+Two kernel-level fields on `Change` matter for the chain layer below: `author_sig` (Ed25519 signature with per-pubkey monotonic nonce and fee), and `x402_auth` (pre-signed payment authorization with unique-nonce replay protection and time bounds).
+
+## What lives on top — the application layer
+
+Every directory under `src/programs/handlers/` is a hot-loadable program. They all use the same `ProgramDef` shape: an optional `handler` (CLI), optional `actor` (persistent state + actions + tick), and optional `validator` (gates synced changes for given `validatedTypes`).
+
+There are roughly four families of programs in this repo:
+
+**Object plumbing.** `crud` (create/list/get/set/delete), `inspect` (DAG history, change details, sync state), `graph` (link traversal, BFS), `ipc` (inter-object messaging), `gc` (retention policies), `sync` (mDNS + HTTP P2P sync — service name `_glon._tcp.local`), `help`.
+
+**Generic apps.** `ttt` (tic-tac-toe where every move is a content-addressed change), `comment` (threaded discussions), `chat` (thin alias on top of `comment`, with legacy block fallback for the pre-migration history), `todo`, `remind` (scheduled actions), `peer` (people and agents — display name, kind, trust level, contact handles).
+
+**Agent stack.** This is the bulk of the code:
+
+- `agent` (3.8k lines) — an LLM agent as a regular object. Every user prompt, assistant reply, tool_use, tool_result, and `compaction_summary` is a content-addressed Block. Tool registration is a scalar field; tools dispatch into other programs via `ctx.dispatchProgram(prefix, action, args)`. ReAct loop with auto-compaction at `contextWindow - reserveTokens`, walking back to the first user boundary that fits the kept-region budget. Subagents are real `agent` objects with a `spawn_parent` link; the parent's DAG records a single tool_use/tool_result whose payload is the compressed batch result.
+- `holdfast` (1.5k lines) — the generic harness. Configure once with `--name <agent>` and `--principal-<...>`, get back an agent wired with identity-aware ingest (every inbound message tagged `[from {name} on {source}, trust={level}]`), a peer directory, durable memory, scheduled reminders, shell access, and subagent spawning. Holds only a cache of `{agentId, agentName, principalPeerId}`; truth lives in the DAG.
+- `memory` — durable `pinned_fact` and `milestone` objects with `owner` links back to the agent and `sourced_from_blocks` references. Survives compaction because they're independent objects with their own DAGs.
+- `task` — thin CLI wrapper around `/agent.spawn` for batch subagent runs.
+- `auth` — Anthropic OAuth (Claude Pro/Max impersonating the official `claude` CLI) and API-key fallback. Credentials live in `~/.glon/auth.json`, mode 0600, never synced to peers.
+
+**I/O bridges.** `discord` (Gateway WS for presence + 3-second REST poll for DMs, routes inbound to `/holdfast.ingest`), `google` (cheatsheet for the `gws` CLI), `browser` (cheatsheet for a local Skyvern instance on :8000), `web` (curl/jq/pandoc recipes), `shell` (persistent bash sessions an agent can drive), `anytype` (local Anytype REST API).
+
+**Chain layer.** A small Chia-style proof-of-spacetime blockchain runs on top of the same kernel:
+
+- `wallet` — local Ed25519 keys, never on the DAG. Receives an unsigned `Change`, fills in `pubkey`/`nonce`/`fee`, signs the canonical bytes, returns it content-addressed.
+- `consensus` — validator gate for chain-mode types. Per-pubkey monotonic nonce, asymmetric fee floors (deploy 100×, mint 10×, other 1×), dispatches type-specific semantic checks to the owning program.
+- `coin` — UTXO-based fungible tokens. `chain.token` holds metadata; `chain.coin.bucket` objects hold up to 1000 coins each as `BlockAdd` ops. Atomic swaps via `chain.coin.offer` objects with two-pass replay so `settle` can land before its `escrow`/`pay`.
+- `anchor` — global ordering and Merkle state commitment over chain-mode head ids. Longest-chain fork choice with timestamp tiebreak. Inflation rewards in FIG (5 FIG base, halving every 1000 anchors) paid to anchor creators.
+- `plot` — real Proof of Space via shelling out to `chiapos` (Chia's plotter), default `k=25` (~600 MB) for testing, `k=32` (~101 GB) for mainnet-equivalent.
+- `timelord` — real Proof of Time via `chiavdf` (Wesolowski VDFs, class groups of unknown order, 1024-bit discriminant), default 5M iterations.
+
+The chain layer is genuinely separate from the object/agent kernel — it just rides the same `Change` DAG and uses `author_sig` / `x402_auth` to gate which changes survive `consensus.validate()` before the kernel writes them to disk.
+
+## Stack
+
+- **Language.** TypeScript, ESM. ~99.8% of the repo by line count.
+- **Runtime.** Node 20+ via `tsx` (no build step in dev). Uses `node:sqlite` for the store index and `node:dgram` for mDNS.
+- **Actors.** `rivetkit` 2.x. `objectActor` and `storeActor` are defined in `src/index.ts`; `programActor` is dynamically materialized per program by `runtime.ts`.
+- **Wire format.** `protobufjs`. Schema in `proto/glon.proto`. Canonical encoding for signing lives in `src/det/canonical.ts`.
+- **Crypto.** SHA-256 for content addressing (`src/crypto.ts`); Ed25519 for chain signatures (`src/det/ed25519.ts`); `randomBytes` for nonces.
+- **Determinism.** `src/det/` carries the bits the chain layer needs to be reproducible across machines: canonical proto encoding, signing, big-int math (`U64_MAX`, `U128_MAX`, bounded add, checked sub).
+- **Bundler.** `esbuild`, used at runtime to compile programs out of the DAG.
+- **Optional native binaries.** `chiapos` and `chiavdf` under `~/.glon/bin/` if you want real PoSpace/PoT. Optional Skyvern at `127.0.0.1:8000` if agents need a real browser.
+- **Other deps.** `nostr-tools` is in `package.json` (presumably for an identity/event-bridge experiment, no handler imports it directly in this snapshot).
 
 ## Quick start
 
 ```bash
 git clone https://github.com/Geep5/glon.git
 cd glon && npm install
-cp .env.example .env        # add at least one LLM API key
+cp .env.example .env
 
-# Terminal 1 — actor host (keep running)
+# terminal 1 — actor host
 npm run dev
 
-# Terminal 2 — seed programs into the store (first run only)
+# terminal 2 — first run only: seed source files + programs into the DAG
 npm run bootstrap
 
-# Terminal 3 — interactive shell
+# terminal 3 — interactive shell
 npm run client
 ```
 
-In the client, create your agent:
+The dev server fails fast if port 6420 is taken; override with `GLON_PORT`. Clients auto-discover the chosen port via `~/.glon/.endpoint`. For headless/automated use there's `scripts/daemon.ts`, which loads every program, runs their actors and tick loops, and exposes `POST /dispatch {prefix, action, args}` on `127.0.0.1:6430` so any external orchestrator can drive Glon without holding API keys.
+
+## Notable design choices, in case you forget why later
+
+- **Snapshots are never truth.** They live inside `Change` messages as a replay-skip optimization. The op DAG is canonical. This keeps full history recoverable even after aggressive checkpointing.
+- **The SQLite index is a cache.** Delete `~/.glon/index.db` and the next wake rebuilds it from `.pb` files on disk. This is the property that makes "every wake reads disk" tolerable.
+- **Programs run from the DAG, not from disk.** Editing a handler under `src/programs/handlers/` after bootstrap has *no effect* on the running daemon. To deploy a handler change: `npm run bootstrap` (push new source into typescript objects), then restart the daemon. Agent fields (system prompt, model, wired tools) are direct `object_set_field` writes — those take effect immediately.
+- **The agent doesn't have a database; the DAG is the database.** Conversation history, tool calls, compaction summaries, memory facts, subagent transcripts — all the same kind of thing, all replayable, all syncable, all inspectable from another peer that was never given an API key.
+- **Chain mode is opt-in per type.** Non-chain objects sync on a trust-the-peer basis. Chain-mode types route through `consensus.validate()` before the kernel writes anything to disk, with Ed25519 verified by the kernel itself before any program validator sees the change.
+- **Local-only credentials.** Wallet keys (`~/.glon/wallet.json`) and Anthropic tokens (`~/.glon/auth.json`) are mode 0600, written atomically via `.tmp` + rename, and explicitly *never* part of the sync set. The chain knows you only by your raw pubkey.
+
+## Repo layout
 
 ```
-glon> /holdfast setup --name Graice --principal-name Grant
+proto/glon.proto              the protocol — single source of schema truth
+src/
+  proto.ts                    typed encode/decode wrappers around protobufjs
+  crypto.ts                   SHA-256, hex, object-id generation
+  disk.ts                     per-object .pb file storage + listing
+  endpoint.ts                 port lockfile shared by every entry point
+  env.ts                      side-effect .env loader
+  index.ts                    objectActor / storeActor / programActor + Rivet registry
+  bootstrap.ts                seeds source files + programs as objects on first run
+  client.ts                   the CLI shell (a pure program loader, no built-ins)
+  dag/
+    change.ts                 change construction + content-address hashing
+    dag.ts                    topological sort, snapshot replay, head computation
+  det/                        determinism layer for the chain
+    canonical.ts              canonical encoding for signing
+    ed25519.ts                signing + verification
+    math.ts                   bounded big-int arithmetic
+  sync/                       mDNS discovery + peer types (the wire layer)
+  programs/
+    runtime.ts                module bundler, actor lifecycle, validator dispatch
+    handlers/                 one file per program (~30, see Application Layer above)
+scripts/                      operational tools (daemon, dispatch, dumps, repairs)
+test/                         unit tests for kernel, agents, chain, programs
+docs/                         design notes for coin offers + the trading-agent system
 ```
-
-Then talk to it:
-
-```
-glon> /holdfast say Hello!
-```
-
-Every script auto-loads `.env`. The dev server binds `:6420` (set `GLON_PORT` to override). Clients auto-discover via `~/.glon/.endpoint`.
-
-**Models:** Set the agent's `model` field to switch providers.
-- Anthropic (default): `claude-sonnet-4-20250514`
-- Kimi (Moonshot): `moonshot-v1-8k`, `moonshot-v1-32k`, etc.
-
-- Kimi Coding (`sk-kimi-*` keys): `kimi-for-coding`
-
-**Headless:** `npx tsx scripts/daemon.ts` loads programs and exposes `POST /dispatch` on `:6430`.
-
----
-
-## Programs
-
-Zero built-in commands. Every feature below is a program loaded from the store at startup.
-
-| Program | Layer | Purpose |
-| --- | --- | --- |
-| `/help` | — | List available programs |
-| `/crud` | Kernel | Create, list, get, set, delete, search objects |
-| `/inspect` | Kernel | DAG history, change details, sync state |
-| `/ipc` | Kernel | Inter-object messaging (inbox/outbox) |
-| `/graph` | Kernel | Object link traversal, neighbours, BFS |
-| `/agent` | Harness | LLM agents with DAG-backed conversation, tool dispatch, auto-compaction, subagent spawning |
-| `/memory` | Harness | Durable agent memory: pinned facts and milestone arcs |
-| `/peer` | Harness | Identity, trust level, contact handles |
-| `/remind` | Harness | Scheduled actions |
-| `/discord` | Harness | Discord bridge |
-| `/holdfast` | Harness | Agent harness: identity-aware ingest + memory + reminders + shell + subagents |
-| `/wallet` | Crypto | Local-only Ed25519 keychain |
-| `/coin` | Crypto | UTXO tokens + atomic offers (chain.coin.offer) |
-| `/consensus` | Crypto | Validator gate for chain-mode: nonce + fee + semantic checks |
-| `/anchor` | Crypto | State commitment + PoST gate + inflation rewards |
-| `/plot` | Crypto | Proof of Space (chiapos) |
-| `/timelord` | Crypto | Proof of Time (chiavdf) |
-
----
-
-## Agents and Holdfast
-
-`/agent` treats an `agent`-typed glon object as the durable home of a conversation. Every prompt, assistant text, `tool_use`, `tool_result`, and `compaction_summary` is a block in that object's DAG.
-
-| Agent feature | Kernel primitive |
-|---|---|
-| Conversation history | Content-addressed `Change`s in a DAG (one `objectActor` per agent) |
-| User / assistant turn | `Block` with `text` content and style tag |
-| Tool call / result | `Block` with `custom` content and `tool_use_id` pairing |
-| Compaction | `compaction_summary` block pointing at `firstKeptBlockId`; older blocks stay in DAG |
-| Tool registration | Scalar `tools` field listing `{name, description, target_prefix, target_action, bound_args}` |
-| Memory | `pinned_fact` / `milestone` objects with `owner` link back to the agent |
-| Subagents | More `objectActor`s of `typeKey="agent"` with `spawn_parent` link |
-| Block recall | New `user_text` block quoting a previous block, landing after latest compaction cut |
-| Todo lists | `todo_write` tool with follow-up reminder loop after compaction/idle |
-
-**`/holdfast`** wraps `/agent` with identity-aware ingest, memory, reminders, shell, and subagents. Configure once:
-
-```
-glon> /holdfast setup --name Graice --principal-name Grant
-  Holdfast ready — Graice
-  agent:     7f141408-…
-  principal: 9a3c5d20-…
-  tools:     50 wired
-
-glon> /holdfast say My wife's name is Sarah. Save that.
-  Graice (to Grant)
-  Saved. wife_name=Sarah.
-  (memory_upsert_fact)
-
-# Restart — the fact survives.
-glon> /holdfast say What's my wife's name?
-  Sarah.
-  (no tool calls — served from memory digest)
-```
-
-**Subagent batch:**
-
-```
-glon> /task spawn c07aa4d3 '{
-  "context": "looking at the codebase shape",
-  "schema": {"type":"object","required":["findings"],"properties":{"findings":{"type":"array"}}},
-  "tasks": [
-    {"id":"a","agentTemplate":"explore","assignment":"map src/programs/handlers"},
-    {"id":"b","agentTemplate":"explore","assignment":"map src/dag"}
-  ]
-}'
-
-glon> /agent tree c07aa4d3
-  · Graice [agent]  c07aa4d3
-  ├─ ✓ explore-a [explore] task=a
-  └─ ✓ explore-b [explore] task=b
-```
-
-**Auth:** Anthropic: API key (`ANTHROPIC_API_KEY` in `.env`) or Claude Pro/Max subscription (`/auth login anthropic`). Kimi (Moonshot AI): API key (`KIMI_API_KEY` in `.env`) or `/auth login kimi <key>`. Set the agent's `model` field to a kimi model (e.g. `moonshot-v1-8k`) to route requests there.
-
----
-
-## Crypto
-
-A signed-token chain layered on the same per-actor DAG primitives. Four programs (`/wallet`, `/coin`, `/consensus`, `/anchor`) plus a kernel-level Ed25519 signature gate.
-
-| Feature | Primitive |
-|---|---|
-| Signed transactions | `Change.author_sig` (Ed25519 + nonce + fee). Kernel verifies sig + canonical hash before validator dispatch |
-| Replay protection | Per-pubkey monotonic nonce in `/consensus` actor state |
-| Asymmetric fees | Deploy: base×100, Mint: base×10, Other: base×1 |
-| Wallet | Local-only `${GLON_DATA}/wallet.json` (mode 0600) |
-| Determinism | `src/det/` — canonical proto encoder (sorted map<> entries), BigInt-only math, raw Ed25519 via `node:crypto` |
-
-### `/coin` — UTXO model
-
-- `chain.token` objects hold metadata only (name, symbol, decimals, owner, supply).
-- `chain.coin.bucket` objects hold up to 1000 coins as `BlockAdd` ops with `contentType="chain.coin.op"`.
-- Each coin is a block: `create {coin_id, owner_pubkey, amount}` or `spend {coin_id}`.
-- SQLite `coins` table indexes unspent outputs for O(1) balance/holder queries.
-- Transfer = spend input coins + create output coins (recipient + change back to sender).
-
-```
-glon> /wallet new alice
-glon> /coin deploy Figgies FIG 1000 --decimals=0 --key=alice
-  Coin deployed!
-    token:  90c86a5a...
-    bucket: 7b3d2e1f...
-
-glon> /coin transfer 90c86a5a... b2c3d4e5... 250 --key=alice
-  Transferred 250 to b2c3d4e5...
-    change: 750 back to sender
-
-glon> /coin balance 90c86a5a... a1b2c3d4...
-  FIG  750
-
-```
-
-### `/coin offer` — atomic swaps
-
-Peer-to-peer N-for-M token trades with cross-object batch atomicity. Offers never expire.
-
-- `chain.coin.offer` objects hold terms (`offered` vs `requested`), escrowed coins, and payment coins.
-- `offer_escrow` — maker deposits offered coins.
-- `offer_pay` — taker deposits requested coins.
-- `offer_settle` — atomic batch writes spend+pay+settle across bucket(s) and offer object.
-- `offer_cancel` — maker refunds escrow.
-- `offer_claim` — each party spends their output coins from the settled offer into their own bucket.
-
-```
-glon> /coin offer create <token_id> <amount> <request_token_id> <request_amount> --key=alice
-glon> /coin offer accept <offer_id> --key=bob
-glon> /coin offer claim <offer_id> --key=alice
-glon> /coin offer list
-glon> /coin offer info <offer_id>
-```
-
-### `/anchor` — state commitment
-
-- `chain.anchor` objects with `merkle_root` (SHA-256 binary Merkle tree over chain-mode heads), `height`, `previous_anchor`.
-- Fork choice: longest chain. Auto-tick every 60s.
-- PoST: VDF proofs via `chiavdf`, plot proofs via `chiapos`. Inflation rewards halve every 1,000 anchors.
-
----
-
-## Sister projects
-
-- **[glonAstrolabe](https://github.com/Geep5/glonAstrolabe)** — interactive 3D viewer for any glon environment. Objects as planets, live event stream, inspector panel, search, click-to-recall.
-
----
-
-## FAQ / Misc
-
-**Deploying handler changes.** Programs run from the DAG, not disk. Edit `src/programs/handlers/*.ts`, then `npm run bootstrap` to push source into the store, then restart the daemon. Agent fields (system prompt, model, tools) take effect immediately via `setField`.
-
-**Port collisions.** The dev server fails fast if `:6420` is bound. Set `GLON_PORT` in `.env` to override. All clients read `~/.glon/.endpoint` so they auto-track the port.
-
-**Discord bridge.** Create app at [Discord Developer Portal](https://discord.com/developers/applications) → Bot tab → copy token into `.env` as `DISCORD_BOT_TOKEN`. OAuth2 URL Generator: scope `bot`, permissions `Send Messages` + `Read Message History`. Find your user id (Settings → Advanced → Developer Mode → right-click name → Copy User ID) for `/holdfast setup --principal-discord <id>`.
-
-**State rent.** Reserved `storage_credit` field on coin metadata objects (`chain.token` typed, always `"0"` in v1). Deferred.
-
-**Sync.** Pull-based over HTTP with protobuf `Envelope`. Chain-mode signature gate means forged Changes are rejected before disk. Full P2P hardening (mDNS discovery, Bloom filters, reputation) is deferred.
 
 ## License
 
-MIT
+MIT.
