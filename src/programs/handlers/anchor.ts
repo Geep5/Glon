@@ -17,21 +17,8 @@ import { sha256, hexEncode, hexDecode } from "../../crypto.js";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { dim, bold, cyan, red, green } from "../shared.js";
 
-// ── ANSI ─────────────────────────────────────────────────────────
-
-const DIM = "\x1b[2m";
-const BOLD = "\x1b[1m";
-const CYAN = "\x1b[36m";
-const RED = "\x1b[31m";
-const GREEN = "\x1b[32m";
-const RESET = "\x1b[0m";
-
-function dim(s: string) { return `${DIM}${s}${RESET}`; }
-function bold(s: string) { return `${BOLD}${s}${RESET}`; }
-function cyan(s: string) { return `${CYAN}${s}${RESET}`; }
-function red(s: string) { return `${RED}${s}${RESET}`; }
-function green(s: string) { return `${GREEN}${s}${RESET}`; }
 
 // ── Constants ────────────────────────────────────────────────────
 

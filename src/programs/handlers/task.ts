@@ -19,18 +19,7 @@ import { __test as agentInternals } from "./agent.js";
 
 const { renderSubagentTree, countDescendants } = agentInternals;
 
-// ── ANSI ─────────────────────────────────────────────────────────
-const DIM = "\x1b[2m";
-const BOLD = "\x1b[1m";
-const GREEN = "\x1b[32m";
-const RED = "\x1b[31m";
-const YELLOW = "\x1b[33m";
-const RESET = "\x1b[0m";
-const dim = (s: string) => `${DIM}${s}${RESET}`;
-const bold = (s: string) => `${BOLD}${s}${RESET}`;
-const green = (s: string) => `${GREEN}${s}${RESET}`;
-const red = (s: string) => `${RED}${s}${RESET}`;
-const yellow = (s: string) => `${YELLOW}${s}${RESET}`;
+import { dim, bold, green, red, yellow } from "../shared.js";
 
 function extractString(v: unknown): string | undefined {
 	if (v === null || v === undefined) return undefined;

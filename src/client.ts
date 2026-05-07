@@ -17,23 +17,12 @@ import { hexEncode } from "./crypto.js";
 import { stringVal, intVal, floatVal, boolVal, mapVal, listVal, linkVal, displayValue } from "./proto.js";
 import { loadPrograms, dispatchProgram, startProgramActor, dispatchActorAction, getProgramActorByPrefix, type ProgramContext, type ProgramEntry } from "./programs/runtime.js";
 import { randomUUID } from "node:crypto";
+
+import { style, dim, bold, cyan, red, green } from "./programs/shared.js";
 import { resolveEndpoint } from "./endpoint.js";
 
 const ENDPOINT = resolveEndpoint();
 
-// ── ANSI helpers ─────────────────────────────────────────────────
-const DIM = "\x1b[2m";
-const BOLD = "\x1b[1m";
-const CYAN = "\x1b[36m";
-const GREEN = "\x1b[32m";
-const RED = "\x1b[31m";
-const RESET = "\x1b[0m";
-
-function dim(s: string): string { return `${DIM}${s}${RESET}`; }
-function bold(s: string): string { return `${BOLD}${s}${RESET}`; }
-function cyan(s: string): string { return `${CYAN}${s}${RESET}`; }
-function green(s: string): string { return `${GREEN}${s}${RESET}`; }
-function red(s: string): string { return `${RED}${s}${RESET}`; }
 
 // ── Client setup ─────────────────────────────────────────────────
 const client = createClient<typeof app>(ENDPOINT);
@@ -69,6 +58,8 @@ function buildContext(overrides?: Partial<ProgramContext>): ProgramContext {
 		readChangeByHex,
 		hexEncode,
 		print: (msg: string) => console.log(msg),
+
+		style,
 		randomUUID,
 		// v2 defaults (overridden by program actors)
 		state: {},

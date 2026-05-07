@@ -13,7 +13,12 @@
 // The SQL index is rebuilt from buckets on every object index.
 
 
-import type { ProgramDef, ProgramContext, ProgramActorDef, ValidatorFn, ValidationResult } from "../runtime.js";
+
+import type { ProgramDef, ProgramContext, ProgramActorDef, ValidatorFn, ValidationResult, IndexHookFn } from "../runtime.js";
+
+import { registerIndexHook } from "../runtime.js";
+
+import type { ObjectState } from "../../dag/dag.js";
 import type { Change, Block } from "../../proto.js";
 import { encodeChange, decodeChange } from "../../proto.js";
 import {
@@ -30,22 +35,7 @@ import { hexEncode, hexDecode } from "../../crypto.js";
 
 import { randomBytes } from "node:crypto";
 import { verify as ed25519Verify } from "../../det/ed25519.js";
-// ── ANSI ─────────────────────────────────────────────────────────
-
-const DIM = "\x1b[2m";
-const BOLD = "\x1b[1m";
-const CYAN = "\x1b[36m";
-const RED = "\x1b[31m";
-const GREEN = "\x1b[32m";
-const YELLOW = "\x1b[33m";
-const RESET = "\x1b[0m";
-
-function dim(s: string) { return `${DIM}${s}${RESET}`; }
-function bold(s: string) { return `${BOLD}${s}${RESET}`; }
-function cyan(s: string) { return `${CYAN}${s}${RESET}`; }
-function red(s: string) { return `${RED}${s}${RESET}`; }
-function green(s: string) { return `${GREEN}${s}${RESET}`; }
-function yellow(s: string) { return `${YELLOW}${s}${RESET}`; }
+import { dim, bold, cyan, red, green, yellow } from "../shared.js";
 
 // ── Constants ────────────────────────────────────────────────────
 
@@ -2149,6 +2139,32 @@ const program: ProgramDef = {
 };
 
 export default program;
+
+
+// ── Index hook ───────────────────────────────────────────────────
+
+/** Rebuild the SQLite coins index for a single bucket object. */
+async function indexCoins(c: any, computed: ObjectState): Promise<void> {
+	await c.db.execute("DELETE FROM coins WHERE bucket_id = ?", computed.id);
+	const tokenField = computed.fields.get("token_id");
+	let tokenId = "";
+	if (tokenField?.linkValue?.targetId) {
+		tokenId = tokenField.linkValue.targetId;
+	} else if (typeof tokenField === "string") {
+		tokenId = tokenField;
+	}
+	const state = replayBucket(computed.blocks);
+	for (const [coinId, coin] of state.coins) {
+		await c.db.execute(
+			`INSERT INTO coins (coin_id, bucket_id, token_id, owner_pubkey, amount, spent, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			coinId, computed.id, tokenId, coin.owner, coin.amount, coin.spent ? 1 : 0, computed.createdAt,
+		);
+	}
+}
+
+// Register at module load so the kernel dispatches without hardcoding.
+registerIndexHook([BUCKET_TYPE_KEY], indexCoins);
 
 // ── Internal exports for testing ─────────────────────────────────
 

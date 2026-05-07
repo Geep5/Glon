@@ -15,6 +15,10 @@
 
 import type { Value, Change, ObjectRef } from "../proto.js";
 import * as proto from "../proto.js";
+
+import type { ObjectState } from "../dag/dag.js";
+
+import { style } from "./shared.js";
 import * as cryptoMod from "../crypto.js";
 import * as detCanonical from "../det/canonical.js";
 import * as detMath from "../det/math.js";
@@ -48,6 +52,10 @@ export interface ProgramContext {
 
 	// Output
 	print: (msg: string) => void;
+
+
+	// Styling
+	style: typeof style;
 
 	// Utils
 	randomUUID: () => string;
@@ -424,6 +432,26 @@ export function getValidator(typeKey: string): ValidatorFn | undefined {
 /** Whether a typeKey participates in chain consensus (signature gate, validator dispatch). */
 export function isChainModeType(typeKey: string): boolean {
 	return chainModeTypes.has(typeKey);
+}
+
+
+// ── Index hook registry ─────────────────────────────────────────
+
+/** Type-specific index hook: called by the kernel after indexing an object's
+ *  generic state (objects table + links table). Programs register hooks for
+ *  their type keys; the kernel dispatches by type_key without hardcoding. */
+export type IndexHookFn = (c: any, computed: ObjectState) => Promise<void>;
+
+const indexHooks = new Map<string, IndexHookFn>();
+
+/** Register an index hook for one or more type keys. */
+export function registerIndexHook(typeKeys: string[], fn: IndexHookFn): void {
+	for (const key of typeKeys) indexHooks.set(key, fn);
+}
+
+/** Get the index hook for a given type key (if any). */
+export function getIndexHook(typeKey: string): IndexHookFn | undefined {
+	return indexHooks.get(typeKey);
 }
 
 // ── Program actor instances ─────────────────────────────────────

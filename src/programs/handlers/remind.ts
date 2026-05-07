@@ -22,25 +22,7 @@
 
 import type { ProgramDef, ProgramContext, ProgramActorDef } from "../runtime.js";
 
-// ── ANSI ─────────────────────────────────────────────────────────
-
-const DIM = "\x1b[2m";
-const BOLD = "\x1b[1m";
-const CYAN = "\x1b[36m";
-const RED = "\x1b[31m";
-const GREEN = "\x1b[32m";
-const YELLOW = "\x1b[33m";
-const MAGENTA = "\x1b[35m";
-const RESET = "\x1b[0m";
-
-function dim(s: string) { return `${DIM}${s}${RESET}`; }
-function bold(s: string) { return `${BOLD}${s}${RESET}`; }
-function cyan(s: string) { return `${CYAN}${s}${RESET}`; }
-function red(s: string) { return `${RED}${s}${RESET}`; }
-function green(s: string) { return `${GREEN}${s}${RESET}`; }
-function yellow(s: string) { return `${YELLOW}${s}${RESET}`; }
-function magenta(s: string) { return `${MAGENTA}${s}${RESET}`; }
-
+import { dim, bold, cyan, red, green, yellow, magenta } from "../shared.js";
 // ── Constants ────────────────────────────────────────────────────
 
 const DEFAULT_TICK_MS = 30_000;

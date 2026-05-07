@@ -12,11 +12,8 @@
 // date; bump it when @anyproto/anytype-mcp updates.
 
 import type { ProgramDef, ProgramContext } from "../runtime.js";
+import { dim, bold, cyan } from "../shared.js";
 
-const DIM = "\x1b[2m"; const BOLD = "\x1b[1m"; const CYAN = "\x1b[36m"; const RESET = "\x1b[0m";
-const dim = (s: string) => `${DIM}${s}${RESET}`;
-const bold = (s: string) => `${BOLD}${s}${RESET}`;
-const cyan = (s: string) => `${CYAN}${s}${RESET}`;
 
 const handler = async (_cmd: string, _args: string[], ctx: ProgramContext) => {
 	const { print } = ctx;

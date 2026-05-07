@@ -1,17 +1,6 @@
 import type { ProgramDef, ProgramContext, ProgramActorDef } from "../runtime.js";
+import { dim, bold, cyan, red, green } from "../shared.js";
 
-const DIM = "\x1b[2m";
-const BOLD = "\x1b[1m";
-const CYAN = "\x1b[36m";
-const GREEN = "\x1b[32m";
-const RED = "\x1b[31m";
-const RESET = "\x1b[0m";
-
-function dim(s: string) { return `${DIM}${s}${RESET}`; }
-function bold(s: string) { return `${BOLD}${s}${RESET}`; }
-function cyan(s: string) { return `${CYAN}${s}${RESET}`; }
-function green(s: string) { return `${GREEN}${s}${RESET}`; }
-function red(s: string) { return `${RED}${s}${RESET}`; }
 
 function short(id: string): string {
 	return id.length > 12 ? id.slice(0, 12) + "..." : id;

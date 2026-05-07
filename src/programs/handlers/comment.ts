@@ -33,22 +33,7 @@
 // any object id. /chat is now a thin alias around /comment.
 
 import type { ProgramDef, ProgramContext, ProgramActorDef } from "../runtime.js";
-
-// ── ANSI ─────────────────────────────────────────────────────────
-
-const DIM = "\x1b[2m";
-const BOLD = "\x1b[1m";
-const CYAN = "\x1b[36m";
-const RED = "\x1b[31m";
-const GREEN = "\x1b[32m";
-const YELLOW = "\x1b[33m";
-const RESET = "\x1b[0m";
-const dim = (s: string) => `${DIM}${s}${RESET}`;
-const bold = (s: string) => `${BOLD}${s}${RESET}`;
-const cyan = (s: string) => `${CYAN}${s}${RESET}`;
-const red = (s: string) => `${RED}${s}${RESET}`;
-const green = (s: string) => `${GREEN}${s}${RESET}`;
-const yellow = (s: string) => `${YELLOW}${s}${RESET}`;
+import { dim, bold, cyan, red, green, yellow } from "../shared.js";
 
 // ── Constants ────────────────────────────────────────────────────
 

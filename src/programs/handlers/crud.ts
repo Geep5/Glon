@@ -8,19 +8,8 @@
 
 import type { ProgramDef, ProgramContext, ProgramActorDef } from "../runtime.js";
 import type { Value } from "../../proto.js";
+import { dim, bold, cyan, green, red } from "../shared.js";
 
-const DIM = "\x1b[2m";
-const BOLD = "\x1b[1m";
-const CYAN = "\x1b[36m";
-const GREEN = "\x1b[32m";
-const RED = "\x1b[31m";
-const RESET = "\x1b[0m";
-
-function dim(s: string): string { return `${DIM}${s}${RESET}`; }
-function bold(s: string): string { return `${BOLD}${s}${RESET}`; }
-function cyan(s: string): string { return `${CYAN}${s}${RESET}`; }
-function green(s: string): string { return `${GREEN}${s}${RESET}`; }
-function red(s: string): string { return `${RED}${s}${RESET}`; }
 
 /** Parse a user-supplied string into a proto Value. */
 function parseValue(raw: string, ctx: ProgramContext) {

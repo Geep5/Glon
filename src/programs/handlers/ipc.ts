@@ -7,18 +7,8 @@
 
 import type { ProgramDef, ProgramContext } from "../runtime.js";
 
-const DIM = "\x1b[2m";
-const BOLD = "\x1b[1m";
-const CYAN = "\x1b[36m";
-const GREEN = "\x1b[32m";
-const RED = "\x1b[31m";
-const RESET = "\x1b[0m";
 
-function dim(s: string): string { return `${DIM}${s}${RESET}`; }
-function bold(s: string): string { return `${BOLD}${s}${RESET}`; }
-function cyan(s: string): string { return `${CYAN}${s}${RESET}`; }
-function green(s: string): string { return `${GREEN}${s}${RESET}`; }
-function red(s: string): string { return `${RED}${s}${RESET}`; }
+import { dim, bold, cyan, red, green } from "../shared.js";
 
 async function cmdSend(args: string[], ctx: ProgramContext): Promise<void> {
 	if (args.length < 3) {

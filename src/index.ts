@@ -31,12 +31,14 @@ import {
 import { computeState, findHeads, toSnapshot, type ObjectState, type BlockProvenance } from "./dag/dag.js";
 import { initDisk, writeChange, readChangeByHex, listChangeFilesForObject, deleteChangesForObject, diskStats } from "./disk.js";
 
-import { getValidator, isChainModeType } from "./programs/runtime.js";
+
+import { getValidator, isChainModeType, getIndexHook } from "./programs/runtime.js";
 import type { BatchValidationContext } from "./programs/runtime.js";
 
 import { canonicalEncodeChange, canonicalEncodeChangeForSigning } from "./det/canonical.js";
 import { verify as ed25519Verify } from "./det/ed25519.js";
-import { replayBucket, decodeCoinOp, BUCKET_TYPE_KEY } from "./programs/handlers/coin.js";
+
+import { style } from "./programs/shared.js";
 import {
 	assertPortAvailable,
 	clearEndpointLockfile,
@@ -412,8 +414,9 @@ const objectActor = actor({
 					result.state.updatedAt,
 				);
 			}
-			if (result && result.state.typeKey === BUCKET_TYPE_KEY) {
-				await store.indexCoinBucket(result.state.id);
+
+			if (result) {
+				await store.runIndexHook(result.state.id);
 			}
 			c.broadcast("synced", { id: c.state.id, headIds: c.vars.headIds });
 		},
@@ -712,9 +715,13 @@ const storeActor = actor({
 			);
 		},
 
-		indexCoinBucket: async (c, bucketId: string): Promise<void> => {
-			const result = loadFromDisk(bucketId);
-			if (result) await indexCoins(c, result.state);
+
+		runIndexHook: async (c, objectId: string): Promise<void> => {
+			const result = loadFromDisk(objectId);
+			if (result) {
+				const hook = getIndexHook(result.state.typeKey);
+				if (hook) await hook(c, result.state);
+			}
 		},
 
 		// ── Link queries ─────────────────────────────────────────
@@ -828,9 +835,13 @@ const storeActor = actor({
 				"SELECT id FROM objects WHERE type_key = ? AND deleted = 0",
 				"chain.coin.bucket",
 			)) as unknown as { id: string }[];
+
 			for (const ref of refs) {
 				const result = loadFromDisk(ref.id);
-				if (result) await indexCoins(c, result.state);
+				if (result) {
+					const hook = getIndexHook(result.state.typeKey);
+					if (hook) await hook(c, result.state);
+				}
 			}
 			return { rebuilt: refs.length };
 		},
@@ -967,9 +978,6 @@ const storeActor = actor({
 				const result = loadFromDisk(objectId);
 				if (result) {
 					await indexObject(c, result.state);
-					if (result.state.typeKey === BUCKET_TYPE_KEY) {
-						await indexCoins(c, result.state);
-					}
 				}
 
 				for (const change of groupMap.get(objectId)!) {
@@ -1041,29 +1049,11 @@ async function indexObject(c: any, computed: ObjectState): Promise<void> {
 			);
 		}
 	}
-	if (computed.typeKey === BUCKET_TYPE_KEY) {
-		await indexCoins(c, computed);
-	}
+
+	const hook = getIndexHook(computed.typeKey);
+	if (hook) await hook(c, computed);
 }
 
-async function indexCoins(c: any, computed: ObjectState): Promise<void> {
-	await c.db.execute("DELETE FROM coins WHERE bucket_id = ?", computed.id);
-	const tokenField = computed.fields.get("token_id");
-	let tokenId = "";
-	if (tokenField?.linkValue?.targetId) {
-		tokenId = tokenField.linkValue.targetId;
-	} else if (typeof tokenField === "string") {
-		tokenId = tokenField;
-	}
-	const state = replayBucket(computed.blocks);
-	for (const [coinId, coin] of state.coins) {
-		await c.db.execute(
-			`INSERT INTO coins (coin_id, bucket_id, token_id, owner_pubkey, amount, spent, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			coinId, computed.id, tokenId, coin.owner, coin.amount, coin.spent ? 1 : 0, computed.createdAt,
-		);
-	}
-}
 
 // ── Program Actor ─────────────────────────────────────────────────
 //
@@ -1104,6 +1094,8 @@ const programActor = actor({
 				readChangeByHex: () => null,
 				hexEncode,
 				print: (msg: string) => console.log(msg),
+
+				style,
 				randomUUID: () => generateObjectId(),
 				state,
 				emit: (channel: string, data: any) => {
