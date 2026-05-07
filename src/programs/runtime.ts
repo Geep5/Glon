@@ -442,6 +442,15 @@ export function getProgramActorByPrefix(prefix: string): ProgramActorInstance | 
 	}
 	return undefined;
 }
+/** List all running program actor instances. */
+export function listProgramActors(): Array<{ programId: string; prefix: string; tickMs: number | null; hasTick: boolean }> {
+	return Array.from(actorInstances.values()).map((inst) => ({
+		programId: inst.programId,
+		prefix: inst.prefix,
+		tickMs: inst.def.tickMs ?? null,
+		hasTick: !!inst.tickHandle,
+	}));
+}
 
 /** Start a program actor instance. */
 export async function startProgramActor(

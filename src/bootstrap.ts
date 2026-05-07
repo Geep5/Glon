@@ -64,8 +64,10 @@ const SOURCES = [
 	"src/programs/handlers/anchor.ts",
 	"src/programs/handlers/plot.ts",
 	"src/programs/handlers/timelord.ts",
-	"src/programs/handlers/coin.ts",
-	"package.json",
+  "src/programs/handlers/coin.ts",
+  "src/programs/handlers/trading.ts",
+  "scripts/trading-rounds.ts",
+  "package.json",
 	"tsconfig.json",
 ];
 
@@ -461,7 +463,20 @@ const PROGRAMS: ProgramDef[] = [
 		},
 		entry: "auth.ts",
 		modules: { "auth.ts": "src/programs/handlers/auth.ts" },
-	},
+  },
+  {
+    prefix: "/trading",
+    name: "Trading",
+    commands: {
+      spawn: "Spawn N trading agents from filter output",
+      status: "Show round status and agent positions",
+      leaderboard: "Show ranked leaderboard",
+      start: "Manually start a round",
+      history: "Show agent's round history",
+    },
+    entry: "trading.ts",
+    modules: { "trading.ts": "src/programs/handlers/trading.ts" },
+  },
 ];
 
 const KIND_MAP: Record<string, string> = {

@@ -25,6 +25,11 @@ import {
 	bigToString,
 } from "../../det/math.js";
 import { hexEncode, hexDecode } from "../../crypto.js";
+
+
+
+import { randomBytes } from "node:crypto";
+import { verify as ed25519Verify } from "../../det/ed25519.js";
 // ── ANSI ─────────────────────────────────────────────────────────
 
 const DIM = "\x1b[2m";
@@ -567,6 +572,157 @@ export function validateOfferChange(
 	return { valid: true };
 }
 // ── Handler (CLI) ────────────────────────────────────────────────
+
+// ── x402 helpers ─────────────────────────────────────────────────
+
+interface X402Authorization {
+	scheme: "exact";
+	network: "glon:v1";
+	from: string;
+	to: string;
+	value: string;
+	asset: string;
+	validAfter: number;
+	validBefore: number;
+	nonce: string;
+}
+
+function canonicalAuthBytes(auth: X402Authorization): Uint8Array {
+	const sorted = {
+		asset: auth.asset,
+		from: auth.from,
+		network: auth.network,
+		nonce: auth.nonce,
+		scheme: auth.scheme,
+		to: auth.to,
+		validAfter: auth.validAfter,
+		validBefore: auth.validBefore,
+		value: auth.value,
+	};
+	return new TextEncoder().encode(JSON.stringify(sorted));
+}
+
+function verifyX402Auth(auth: X402Authorization, signatureHex: string): boolean {
+	const msg = canonicalAuthBytes(auth);
+	const sig = hexDecode(signatureHex);
+	const pubkey = hexDecode(auth.from);
+	if (sig.length !== 64 || pubkey.length !== 32) return false;
+	return ed25519Verify(pubkey, msg, sig);
+}
+
+async function buildX402SettleBatch(
+	auth: X402Authorization,
+	ctx: ProgramContext,
+	facilitatorKeyName: string,
+): Promise<Array<{ objectId: string; changesBase64: string }>> {
+	const { objectActor, dispatchProgram, randomUUID } = ctx;
+	const senderPubkey = auth.from;
+	const tokenId = auth.asset;
+	const amount = auth.value;
+	const toPubkey = auth.to;
+
+	const store = ctx.store as any;
+	const selected = await store.coinSelect(tokenId, senderPubkey, amount) as { coin_id: string; bucket_id: string; amount: string }[];
+	let sum = 0n;
+	for (const c of selected) sum += BigInt(c.amount);
+	if (sum < BigInt(amount)) {
+		throw new Error(`Insufficient balance: have ${sum.toString()}, need ${amount}`);
+	}
+
+	const batchEntries: Array<{ objectId: string; changesBase64: string }> = [];
+
+	for (const coin of selected) {
+		const bucketActor = objectActor(coin.bucket_id);
+		const heads = await bucketActor.getHeads() as string[];
+		const spendChange = buildCoinOpChange({
+			bucketId: coin.bucket_id,
+			parentIds: heads.map(hexDecode),
+			timestamp: Date.now(),
+			author: "x402-settle",
+			op: { kind: "spend", coinId: coin.coin_id },
+			blockId: randomUUID().replace(/-/g, "").slice(0, 16),
+		});
+		const spendB64 = Buffer.from(encodeChange(spendChange)).toString("base64");
+		const nonce: number = await dispatchProgram("/consensus", "getNonce", [senderPubkey]) as number;
+		const { changeB64: signedB64 } = await dispatchProgram("/wallet", "signChange", [{
+			name: facilitatorKeyName,
+			changeB64: spendB64,
+			nonce: nonce + 1,
+			fee: 1,
+		}]) as { changeB64: string };
+		batchEntries.push({ objectId: coin.bucket_id, changesBase64: signedB64 });
+	}
+
+	const changeAmount = subChecked(sum, parseUint(amount));
+	const outputs: { coinId: string; owner: string; amount: string }[] = [
+		{ coinId: randomUUID().replace(/-/g, "").slice(0, 16), owner: toPubkey, amount },
+	];
+	if (changeAmount > BIG_ZERO) {
+		outputs.push({
+			coinId: randomUUID().replace(/-/g, "").slice(0, 16),
+			owner: senderPubkey,
+			amount: bigToString(changeAmount),
+		});
+	}
+
+	let outputBucketId: string | null = null;
+	const allBuckets = await store.list(BUCKET_TYPE_KEY) as { id: string }[];
+	for (const ref of allBuckets) {
+		const bucket = await store.get(ref.id) as any;
+		if (bucket?.fields?.token_id?.linkValue?.targetId !== tokenId) continue;
+		const bState = replayBucket(bucket.blocks ?? []);
+		let unspentCount = 0;
+		for (const c of bState.coins.values()) if (!c.spent) unspentCount++;
+		if (unspentCount + outputs.length <= MAX_COINS_PER_BUCKET) {
+			outputBucketId = ref.id;
+			break;
+		}
+	}
+
+	if (!outputBucketId) {
+		outputBucketId = randomUUID().replace(/-/g, "").slice(0, 24);
+		const genesisChange = buildBucketGenesisChange({
+			bucketId: outputBucketId,
+			timestamp: Date.now(),
+			author: "x402-settle",
+			tokenId,
+		});
+		const genesisB64 = Buffer.from(encodeChange(genesisChange)).toString("base64");
+		const nonce: number = await dispatchProgram("/consensus", "getNonce", [senderPubkey]) as number;
+		const { changeB64: signedGenesisB64 } = await dispatchProgram("/wallet", "signChange", [{
+			name: facilitatorKeyName,
+			changeB64: genesisB64,
+			nonce: nonce + 1,
+			fee: 1,
+		}]) as { changeB64: string };
+		const bucketActor = objectActor(outputBucketId, { createWithInput: { id: outputBucketId } });
+		await bucketActor.pushChanges(signedGenesisB64);
+	}
+
+	const outBucketActor = objectActor(outputBucketId);
+	for (const out of outputs) {
+		const heads = await outBucketActor.getHeads() as string[];
+		const createChange = buildCoinOpChange({
+			bucketId: outputBucketId,
+			parentIds: heads.map(hexDecode),
+			timestamp: Date.now(),
+			author: "x402-settle",
+			op: { kind: "create", coinId: out.coinId, ownerPubkey: out.owner, amount: out.amount },
+			blockId: randomUUID().replace(/-/g, "").slice(0, 16),
+		});
+		const createB64 = Buffer.from(encodeChange(createChange)).toString("base64");
+		const nonce: number = await dispatchProgram("/consensus", "getNonce", [senderPubkey]) as number;
+		const { changeB64: signedCreateB64 } = await dispatchProgram("/wallet", "signChange", [{
+			name: facilitatorKeyName,
+			changeB64: createB64,
+			nonce: nonce + 1,
+			fee: 1,
+		}]) as { changeB64: string };
+		batchEntries.push({ objectId: outputBucketId, changesBase64: signedCreateB64 });
+	}
+
+	return batchEntries;
+}
 
 const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 	const { print, resolveId, randomUUID, dispatchProgram, objectActor, store } = ctx;
@@ -1681,6 +1837,114 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 			break;
 		}
 
+		case "authorize": {
+			const rawTokenId = args[0];
+			const amount = args[1];
+			const toPubkey = args[2];
+			const validForArg = args.find((a) => a.startsWith("--valid-for="));
+			const validForSec = validForArg ? Number(validForArg.split("=")[1]) : 60;
+			const keyArg = args.find((a) => a.startsWith("--key="));
+			const keyName = keyArg ? keyArg.split("=")[1] : "default";
+
+			if (!rawTokenId || !amount || !toPubkey) {
+				print(red("Usage: coin authorize <token_id> <amount> <recipient_pubkey> [--valid-for=seconds] [--key=name]"));
+				break;
+			}
+			try {
+				const tokenId = (await resolveId(rawTokenId)) ?? rawTokenId;
+				const keyInfo: any = await dispatchProgram("/wallet", "show", [keyName]);
+				if (!keyInfo) { print(red(`Wallet key "${keyName}" not found`)); break; }
+				const payerPubkey = keyInfo.pubkey as string;
+
+				// Generate random 32-byte nonce
+				const nonceBytes = randomBytes(32);
+				const nonceHex = nonceBytes.toString("hex");
+
+				const now = Math.floor(Date.now() / 1000);
+				const auth: X402Authorization = {
+					scheme: "exact",
+					network: "glon:v1",
+					from: payerPubkey,
+					to: toPubkey,
+					value: amount,
+					asset: tokenId,
+					validAfter: now,
+					validBefore: now + validForSec,
+					nonce: nonceHex,
+				};
+
+
+				const msg = canonicalAuthBytes(auth);
+				const { signature } = await dispatchProgram("/wallet", "sign", [keyName, Buffer.from(msg).toString("base64")]) as { signature: string };
+
+				print(green("Authorization created"));
+				print(dim("  from: ") + payerPubkey.slice(0, 16) + "...");
+				print(dim("  to:   ") + toPubkey.slice(0, 16) + "...");
+				print(dim("  value: ") + amount);
+				print(dim("  asset: ") + tokenId.slice(0, 16) + "...");
+				print(dim("  valid: ") + auth.validAfter + " → " + auth.validBefore);
+				print(dim("  nonce: ") + nonceHex.slice(0, 16) + "...");
+
+				print(JSON.stringify({ authorization: auth, signature }));
+			} catch (err: any) {
+				print(red("Error: ") + (err?.message ?? String(err)));
+			}
+			break;
+		}
+
+		case "settle": {
+			const authJson = args[0];
+			const signatureHex = args[1];
+			const keyArg = args.find((a) => a.startsWith("--key="));
+			const keyName = keyArg ? keyArg.split("=")[1] : "default";
+
+			if (!authJson || !signatureHex) {
+				print(red("Usage: coin settle <authorization_json> <signature_hex> [--key=name]"));
+				break;
+			}
+			try {
+				const parsed = JSON.parse(authJson);
+				const auth: X402Authorization = parsed.authorization ?? parsed;
+
+				if (!verifyX402Auth(auth, signatureHex)) {
+					print(red("Invalid authorization signature"));
+					break;
+				}
+
+				const now = Math.floor(Date.now() / 1000);
+				if (now < auth.validAfter) {
+					print(red("Authorization not yet valid"));
+					break;
+				}
+				if (now >= auth.validBefore) {
+					print(red("Authorization expired"));
+					break;
+				}
+
+				// Check nonce not consumed
+				const consensusStatus: any = await dispatchProgram("/consensus", "status", []);
+				if (consensusStatus.authNonces?.includes(auth.nonce)) {
+					print(red("Authorization nonce already consumed"));
+					break;
+				}
+
+				const batch = await buildX402SettleBatch(auth, ctx, keyName);
+				await (store as any).pushChangesBatch(JSON.stringify(batch));
+
+				// Record nonce consumed
+				await dispatchProgram("/consensus", "recordX402Accepted", [auth.nonce]);
+
+				print(green("Settled!"));
+				print(dim("  amount: ") + auth.value);
+				print(dim("  to:     ") + auth.to.slice(0, 16) + "...");
+				print(dim("  nonce:  ") + auth.nonce.slice(0, 16) + "...");
+			} catch (err: any) {
+				print(red("Error: ") + (err?.message ?? String(err)));
+			}
+			break;
+		}
+
+
 		default: {
 
 			print([
@@ -1693,7 +1957,11 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 				`    ${cyan("coin holders")} ${dim("<token_id>")}                  all balances, descending`,
 				`    ${cyan("coin info")} ${dim("<token_id>")}                     metadata + supply + owner`,
 				`    ${cyan("coin offer")} ${dim("<subcommand>")}                      peer-to-peer atomic swaps`,
+				`    ${cyan("coin authorize")} ${dim("<token_id> <amount> <to_pubkey> [--valid-for=60] [--key=name]")}  sign x402 authorization`,
+
+				`    ${cyan("coin settle")} ${dim("<auth_json> <sig_hex> [--key=name]")}          settle x402 authorization`,
 				dim(`  Each token is backed by chain.coin.bucket objects (max ${MAX_COINS_PER_BUCKET} coins each).`),
+
 			].join("\n"));
 		}
 	}
@@ -1783,6 +2051,60 @@ const actorDef: ProgramActorDef = {
 		replayOffer: async (_ctx: ProgramContext, blocks: Block[]): Promise<OfferState> => {
 			return replayOffer(blocks);
 		},
+
+
+		/** Build a signed x402 authorization. Returns { authorization, signature }. */
+		authorizePayment: async (ctx: ProgramContext, input: {
+			tokenId: string;
+			amount: string;
+			recipient: string;
+			validForSec?: number;
+			keyName?: string;
+		}): Promise<{ authorization: X402Authorization; signature: string }> => {
+			const keyName = input.keyName ?? "default";
+			const keyInfo = await ctx.dispatchProgram("/wallet", "show", [keyName]) as { pubkey: string } | null;
+			if (!keyInfo) throw new Error(`wallet key "${keyName}" not found`);
+			const nonceBytes = randomBytes(32);
+			const nonceHex = nonceBytes.toString("hex");
+			const now = Math.floor(Date.now() / 1000);
+			const auth: X402Authorization = {
+				scheme: "exact",
+				network: "glon:v1",
+				from: keyInfo.pubkey,
+				to: input.recipient,
+				value: input.amount,
+				asset: input.tokenId,
+				validAfter: now,
+				validBefore: now + (input.validForSec ?? 60),
+				nonce: nonceHex,
+			};
+			const msg = canonicalAuthBytes(auth);
+			const { signature } = await ctx.dispatchProgram("/wallet", "sign", [keyName, Buffer.from(msg).toString("base64")]) as { signature: string };
+			return { authorization: auth, signature };
+		},
+
+		/** Settle an x402 authorization. Returns { ok: true } or throws. */
+		settlePayment: async (ctx: ProgramContext, input: {
+			authorization: X402Authorization;
+			signature: string;
+			keyName?: string;
+		}): Promise<{ ok: true }> => {
+			if (!verifyX402Auth(input.authorization, input.signature)) {
+				throw new Error("x402: invalid authorization signature");
+			}
+			const now = Math.floor(Date.now() / 1000);
+			if (now < input.authorization.validAfter) throw new Error("x402: authorization not yet valid");
+			if (now >= input.authorization.validBefore) throw new Error("x402: authorization expired");
+
+			const batch = await buildX402SettleBatch(input.authorization, ctx, input.keyName ?? "default");
+			const store = ctx.store as any;
+			await store.pushChangesBatch(JSON.stringify(batch));
+
+			// Record nonce consumed
+			await ctx.dispatchProgram("/consensus", "recordX402Accepted", [input.authorization.nonce]);
+
+			return { ok: true };
+		},
 	},
 };
 
@@ -1831,6 +2153,7 @@ export default program;
 // ── Internal exports for testing ─────────────────────────────────
 
 
+
 export const __test = {
 	decodeCoinOp,
 	encodeCoinOp,
@@ -1843,4 +2166,6 @@ export const __test = {
 	buildBucketGenesisChange,
 	buildCoinOpChange,
 	MAX_COINS_PER_BUCKET,
+	canonicalAuthBytes,
+	verifyX402Auth,
 };

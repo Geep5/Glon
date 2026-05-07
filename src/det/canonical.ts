@@ -145,6 +145,7 @@ function canonicalizeSnapshot(snap: ObjectSnapshot): ObjectSnapshot {
 	};
 }
 
+
 /**
  * Produce a Change with every map<> entry sort-keyed in lexicographic
  * order. The returned object can be passed to any standard protobuf
@@ -154,12 +155,21 @@ function canonicalizeChange(change: Change): Change {
 	return {
 		id: change.id,
 		objectId: change.objectId,
-		parentIds: change.parentIds,           // order-significant; do not sort
+		parentIds: change.parentIds,
 		ops: change.ops.map(canonicalizeOperation),
 		timestamp: change.timestamp,
 		author: change.author,
-		authorSig: change.authorSig,           // signature struct itself has no map<>
+		authorSig: change.authorSig,
 		snapshot: change.snapshot ? canonicalizeSnapshot(change.snapshot) : undefined,
+		x402Auth: change.x402Auth ? canonicalizeX402Auth(change.x402Auth) : undefined,
+	};
+}
+
+function canonicalizeX402Auth(auth: import("../proto.js").X402Auth): import("../proto.js").X402Auth {
+	return {
+		nonce: auth.nonce,
+		validAfter: auth.validAfter,
+		validBefore: auth.validBefore,
 	};
 }
 

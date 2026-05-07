@@ -325,6 +325,16 @@ const actorDef: ProgramActorDef = {
 		signChange: async (_ctx: ProgramContext, input: SignChangeInput, opts?: { path?: string }) => {
 			return doSignChange(input, opts?.path);
 		},
+
+		/** Sign an arbitrary message (base64). Returns { signature: hex, pubkey: hex }. */
+		sign: async (_ctx: ProgramContext, name: string, messageB64: string, opts?: { path?: string }) => {
+			const file = readWalletFile(opts?.path);
+			const entry = file.keys[name];
+			if (!entry) throw new Error(`wallet.sign: no key named "${name}"`);
+			const msg = new Uint8Array(Buffer.from(messageB64, "base64"));
+			const signature = ed25519Sign(hexDecode(entry.privateKey), msg);
+			return { signature: hexEncode(signature), pubkey: entry.pubkey };
+		},
 	},
 };
 

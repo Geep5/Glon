@@ -855,6 +855,38 @@ const BASE_TOOLS: ToolSpec[] = [
 		target_prefix: "/crud",
 		target_action: "addBlock",
 	},
+
+	{
+		name: "x402_authorize",
+		description: "Create a signed x402 payment authorization. Returns an authorization JSON + signature that a facilitator can later settle. Use when you need to pre-authorize a payment for a service or API.",
+		input_schema: {
+			type: "object",
+			properties: {
+				token_id: { type: "string", description: "The token to pay with" },
+				amount: { type: "string", description: "Amount in the token's base units" },
+				recipient: { type: "string", description: "Recipient Ed25519 pubkey hex" },
+				valid_for_sec: { type: "number", description: "How long the authorization is valid (default 60)" },
+			},
+			required: ["token_id", "amount", "recipient"],
+		},
+		target_prefix: "/coin",
+		target_action: "authorizePayment",
+	},
+	{
+		name: "x402_settle",
+		description: "Settle an x402 payment authorization. Verifies the payer's signature, checks nonce/time bounds, constructs spend+create changes, and submits the batch. Use when you are the facilitator receiving an authorization.",
+		input_schema: {
+			type: "object",
+			properties: {
+				authorization: { type: "object", description: "The x402 authorization object" },
+				signature: { type: "string", description: "Hex signature from the payer" },
+				key_name: { type: "string", description: "Facilitator wallet key name (default 'default')" },
+			},
+			required: ["authorization", "signature"],
+		},
+		target_prefix: "/coin",
+		target_action: "settlePayment",
+	},
 ];
 
 // ── Memory tools ─────────────────────────────────────────────────

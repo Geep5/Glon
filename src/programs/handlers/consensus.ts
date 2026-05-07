@@ -125,11 +125,14 @@ export function minimumFee(kind: FeeKind, policy: FeePolicy): bigint {
  * keep the format JSON-friendly (decimal strings for BigInts that may
  * exceed 2^53; nonces are uint64 so use plain numbers).
  */
+
 interface PersistedState {
 	/** pubkey_hex → last-seen nonce (number; uint64 fits Number-safe range up to 2^53). */
 	nonces: Record<string, number>;
 	/** Current fee policy. baseFee stored as decimal string for BigInt round-trip. */
 	feePolicy: { baseFee: string };
+	/** Seen x402 authorization nonces (hex string). Prevents replay of pull-payment authorizations. */
+	authNonces: string[];
 }
 
 function loadState(raw: Record<string, any>): PersistedState {
@@ -137,12 +140,14 @@ function loadState(raw: Record<string, any>): PersistedState {
 	const baseFeeStr = (raw.feePolicy && typeof raw.feePolicy === "object" && typeof raw.feePolicy.baseFee === "string")
 		? raw.feePolicy.baseFee
 		: DEFAULT_BASE_FEE.toString(10);
-	return { nonces, feePolicy: { baseFee: baseFeeStr } };
+	const authNonces = Array.isArray(raw.authNonces) ? raw.authNonces : [];
+	return { nonces, feePolicy: { baseFee: baseFeeStr }, authNonces };
 }
 
 function saveState(target: Record<string, any>, s: PersistedState): void {
 	target.nonces = s.nonces;
 	target.feePolicy = s.feePolicy;
+	target.authNonces = s.authNonces;
 }
 
 function feePolicyOf(s: PersistedState): FeePolicy {
@@ -160,17 +165,58 @@ function feePolicyOf(s: PersistedState): FeePolicy {
 	 * Does NOT call /coin or any other type-specific validator. The caller
  * does that after this returns ok.
  */
+
 export function consensusGate(
 	change: Change,
 	state: PersistedState,
+	nowSeconds: number = Math.floor(Date.now() / 1000),
 ): { ok: true; nextState: PersistedState; kind: FeeKind } | { ok: false; reason: string } {
 	if (!change.authorSig) {
 		return { ok: false, reason: "consensus: change is not signed (kernel should have rejected)" };
 	}
 	const sig = change.authorSig;
-
-	// Nonce monotonicity. Per-pubkey strictly increasing.
 	const pubkeyHex = hexEncode(sig.pubkey);
+
+	// x402 authorization path: unique nonce + time bounds.
+	if (change.x402Auth) {
+		const auth = change.x402Auth;
+		if (!auth.nonce || auth.nonce.length === 0) {
+			return { ok: false, reason: "consensus: x402 auth missing nonce" };
+		}
+		const nonceHex = hexEncode(auth.nonce);
+		if (state.authNonces.includes(nonceHex)) {
+			return { ok: false, reason: `consensus: x402 nonce replay (${nonceHex.slice(0, 16)}…)` };
+		}
+		const SKEW_TOLERANCE_S = 30;
+		if (nowSeconds + SKEW_TOLERANCE_S < auth.validAfter) {
+			return { ok: false, reason: `consensus: x402 auth not yet valid (validAfter=${auth.validAfter}, now=${nowSeconds})` };
+		}
+		if (nowSeconds >= auth.validBefore + SKEW_TOLERANCE_S) {
+			return { ok: false, reason: `consensus: x402 auth expired (validBefore=${auth.validBefore}, now=${nowSeconds})` };
+		}
+		if (sig.nonce > Number.MAX_SAFE_INTEGER) {
+			return { ok: false, reason: "consensus: nonce exceeds safe integer range" };
+		}
+		if (BigInt(sig.fee) > U64_MAX) {
+			return { ok: false, reason: "consensus: fee exceeds uint64 max" };
+		}
+		const policy = feePolicyOf(state);
+		const kind = classifyForFee(change);
+		const minFee = minimumFee(kind, policy);
+		if (BigInt(sig.fee) < minFee) {
+			return { ok: false, reason: `consensus: fee ${sig.fee} below minimum ${minFee.toString()} for kind ${kind}` };
+		}
+		const nextAuthNonces = [...state.authNonces, nonceHex];
+		const nextNonces = { ...state.nonces, [pubkeyHex]: Math.max(state.nonces[pubkeyHex] ?? 0, sig.nonce) };
+		const nextState: PersistedState = {
+			nonces: nextNonces,
+			feePolicy: state.feePolicy,
+			authNonces: nextAuthNonces,
+		};
+		return { ok: true, nextState, kind };
+	}
+
+	// Standard path: monotonic nonce per pubkey.
 	const last = state.nonces[pubkeyHex] ?? 0;
 	if (sig.nonce <= last) {
 		return {
@@ -200,6 +246,7 @@ export function consensusGate(
 	const nextState: PersistedState = {
 		nonces: nextNonces,
 		feePolicy: state.feePolicy,
+		authNonces: state.authNonces,
 	};
 	return { ok: true, nextState, kind };
 }
@@ -298,6 +345,7 @@ export async function validateFully(
 
 // ── Handler (CLI) ────────────────────────────────────────────────
 
+
 const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 	const { print } = ctx;
 	const state = loadState(ctx.state ?? {});
@@ -311,6 +359,7 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 			print(dim("    min Mint:   ") + minimumFee("Mint", policy).toString());
 			print(dim("    min Other:  ") + minimumFee("Other", policy).toString());
 			print(dim("    nonces:     ") + String(Object.keys(state.nonces).length) + " pubkey(s) tracked");
+			print(dim("    x402 nonces: ") + String(state.authNonces.length) + " consumed");
 			break;
 		}
 		case "nonces": {
@@ -353,10 +402,12 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 
 // ── Actor (programmatic API) ──────────────────────────────────────
 
+
 const actorDef: ProgramActorDef = {
 	createState: (): Record<string, unknown> => ({
 		nonces: {},
 		feePolicy: { baseFee: DEFAULT_BASE_FEE.toString(10) },
+		authNonces: [],
 	}),
 
 	actions: {
@@ -390,6 +441,16 @@ const actorDef: ProgramActorDef = {
 			s.nonces[pubkeyHex] = nonce;
 			saveState(ctx.state, s);
 			return { pubkey: pubkeyHex, nonce };
+		},
+
+		/** Record a consumed x402 authorization nonce. Idempotent. */
+		recordX402Accepted: async (ctx: ProgramContext, nonceHex: string) => {
+			const s = loadState(ctx.state ?? {});
+			if (!s.authNonces.includes(nonceHex)) {
+				s.authNonces.push(nonceHex);
+				saveState(ctx.state, s);
+			}
+			return { nonce: nonceHex };
 		},
 
 		/** Set the base fee. Returns the new policy. */
@@ -447,15 +508,23 @@ export default program;
 // glon's validator API were async or threaded a ctx through. Both are
 // reasonable v2 changes; for v1 the mirror keeps the validator pure.
 
+
 let MIRROR_STATE: PersistedState = {
 	nonces: {},
 	feePolicy: { baseFee: DEFAULT_BASE_FEE.toString(10) },
+	authNonces: [],
 };
 
 // Patch the actor actions to keep the mirror in sync.
 const originalRecord = actorDef.actions!.recordAccepted!;
 actorDef.actions!.recordAccepted = async (ctx: ProgramContext, pubkeyHex: string, nonce: number) => {
 	const result = await originalRecord(ctx, pubkeyHex, nonce);
+	MIRROR_STATE = loadState(ctx.state ?? {});
+	return result;
+};
+const originalRecordX402 = actorDef.actions!.recordX402Accepted!;
+actorDef.actions!.recordX402Accepted = async (ctx: ProgramContext, nonceHex: string) => {
+	const result = await originalRecordX402(ctx, nonceHex);
 	MIRROR_STATE = loadState(ctx.state ?? {});
 	return result;
 };
@@ -475,10 +544,12 @@ export const __test = {
 	loadState,
 	saveState,
 	feePolicyOf,
+
 	resetMirror: () => {
 		MIRROR_STATE = {
 			nonces: {},
 			feePolicy: { baseFee: DEFAULT_BASE_FEE.toString(10) },
+			authNonces: [],
 		};
 	},
 	getMirror: () => MIRROR_STATE,

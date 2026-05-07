@@ -33,6 +33,7 @@ package glon;
 // ARE the change. There is no wrapper, no metadata file, no index
 // entry that supersedes the bytes.
 
+
 message Change {
   bytes  id         = 1;    // SHA-256 content address
   string object_id  = 2;    // stable object identifier
@@ -49,6 +50,17 @@ message Change {
   // verifies it before any program validator sees the change.
   // Field 20 (not 8) leaves room for future kernel-level fields.
   Signature author_sig = 20;
+
+  // x402 payment authorization. When present, the change is treated as a
+  // pre-signed authorization with unique-nonce replay protection and time
+  // bounds instead of (or in addition to) the normal monotonic nonce check.
+  X402Auth x402_auth = 21;
+}
+
+message X402Auth {
+  bytes  nonce       = 1;  // 32-byte unique nonce
+  int64  valid_after  = 2; // unix seconds (inclusive)
+  int64  valid_before = 3; // unix seconds (exclusive)
 }
 
 // Ed25519 signature plus per-pubkey replay-protection nonce and per-change

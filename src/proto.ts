@@ -89,6 +89,7 @@ export interface Operation {
 	blockMove?: BlockMove;
 }
 
+
 export interface Change {
 	id: Uint8Array;
 	objectId: string;
@@ -99,6 +100,14 @@ export interface Change {
 	author: string;
 	/** Present iff the object is chain-mode. Verified in the kernel. */
 	authorSig?: Signature;
+	/** x402 payment authorization. Unique nonce + time bounds for pull payments. */
+	x402Auth?: X402Auth;
+}
+
+export interface X402Auth {
+	nonce: Uint8Array;
+	validAfter: number;
+	validBefore: number;
 }
 
 export interface Signature {
