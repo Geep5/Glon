@@ -55,12 +55,18 @@ message Change {
   // pre-signed authorization with unique-nonce replay protection and time
   // bounds instead of (or in addition to) the normal monotonic nonce check.
   X402Auth x402_auth = 21;
+  AuthExtension auth_extension = 22;
 }
 
 message X402Auth {
   bytes  nonce       = 1;  // 32-byte unique nonce
   int64  valid_after  = 2; // unix seconds (inclusive)
   int64  valid_before = 3; // unix seconds (exclusive)
+}
+
+message AuthExtension {
+  string type = 1;
+  bytes payload = 2;
 }
 
 // Ed25519 signature plus per-pubkey replay-protection nonce and per-change
@@ -234,7 +240,8 @@ message ObjectSnapshot {
   string id       = 1;
   string type_key = 2;
   map<string, Value> fields = 3;
-  bytes  content    = 4;    // raw byte content (for file objects)
+  // Deprecated: content moved to primary block
+  bytes content = 4;
   repeated Block blocks = 5;
   bool   deleted    = 6;
   int64  created_at = 7;

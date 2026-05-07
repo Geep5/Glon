@@ -21,9 +21,12 @@ const PROTO_PATH = resolve(__dirname, "../proto/glon.proto");
 
 const root = protobuf.loadSync(PROTO_PATH);
 
+
 const ChangeType = root.lookupType("glon.Change");
 const EnvelopeType = root.lookupType("glon.Envelope");
 const ObjectSnapshotType = root.lookupType("glon.ObjectSnapshot");
+const SignatureType = root.lookupType("glon.Signature");
+const X402AuthType = root.lookupType("glon.X402Auth");
 
 // ── TypeScript interfaces ───────────────────────────────────────
 
@@ -102,12 +105,19 @@ export interface Change {
 	authorSig?: Signature;
 	/** x402 payment authorization. Unique nonce + time bounds for pull payments. */
 	x402Auth?: X402Auth;
+  /** Generic auth extension for extensible authentication. */
+  authExtension?: AuthExtension;
 }
 
 export interface X402Auth {
 	nonce: Uint8Array;
 	validAfter: number;
 	validBefore: number;
+}
+
+export interface AuthExtension {
+	type: string;
+	payload: Uint8Array;
 }
 
 export interface Signature {
@@ -121,11 +131,13 @@ export interface Signature {
 	fee: number;
 }
 
+
 export interface ObjectSnapshot {
 	id: string;
 	typeKey: string;
 	fields: Record<string, Value>;
-	content: Uint8Array;
+	/** @deprecated Content moved to primary block. Kept for backwards compat. */
+	content?: Uint8Array;
 	blocks: Block[];
 	deleted: boolean;
 	createdAt: number;
@@ -233,6 +245,29 @@ export function encodeEnvelope(e: Envelope): Uint8Array {
 export function decodeEnvelope(bytes: Uint8Array): Envelope {
 	const msg = EnvelopeType.decode(bytes);
 	return EnvelopeType.toObject(msg, DECODE_OPTS) as unknown as Envelope;
+}
+
+
+// ── Signature codec ─────────────────────────────────────────────
+
+export function encodeSignature(s: Signature): Uint8Array {
+	return SignatureType.encode(SignatureType.create(s)).finish();
+}
+
+export function decodeSignature(bytes: Uint8Array): Signature {
+	const msg = SignatureType.decode(bytes);
+	return SignatureType.toObject(msg, DECODE_OPTS) as unknown as Signature;
+}
+
+// ── X402Auth codec ──────────────────────────────────────────────
+
+export function encodeX402Auth(a: X402Auth): Uint8Array {
+	return X402AuthType.encode(X402AuthType.create(a)).finish();
+}
+
+export function decodeX402Auth(bytes: Uint8Array): X402Auth {
+	const msg = X402AuthType.decode(bytes);
+	return X402AuthType.toObject(msg, DECODE_OPTS) as unknown as X402Auth;
 }
 
 // ── Value helpers ───────────────────────────────────────────────

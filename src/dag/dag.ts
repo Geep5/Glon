@@ -18,11 +18,11 @@ export interface BlockProvenance {
 	timestamp: number;
 }
 
+
 export interface ObjectState {
 	id: string;
 	typeKey: string;
 	fields: Map<string, Value>;
-	content: Uint8Array;
 	blocks: Block[];
 	/** Tracks which Change created or last modified each block. */
 	blockProvenance: Map<string, BlockProvenance>;
@@ -60,11 +60,11 @@ export function computeState(changes: Change[]): ObjectState {
 		}
 	}
 
+
 	const state: ObjectState = {
 		id: objectId,
 		typeKey: "",
 		fields: new Map(),
-		content: new Uint8Array(0),
 		blocks: [],
 		blockProvenance: new Map(),
 		deleted: false,
@@ -72,6 +72,7 @@ export function computeState(changes: Change[]): ObjectState {
 		updatedAt: 0,
 		heads,
 	};
+
 
 	// If a snapshot exists, initialize from it and skip earlier changes.
 	let startIdx = 0;
@@ -81,12 +82,36 @@ export function computeState(changes: Change[]): ObjectState {
 		state.deleted = snap.deleted;
 		state.createdAt = snap.createdAt;
 		state.updatedAt = snap.updatedAt;
-		state.content = snap.content ?? new Uint8Array(0);
 		state.blocks = snap.blocks ? [...snap.blocks] : [];
 		if (snap.fields) {
 			for (const [k, v] of Object.entries(snap.fields)) {
 				state.fields.set(k, v);
 			}
+		}
+		// Migrate deprecated content field to primary block.
+		if (snap.content && snap.content.length > 0) {
+			const idx = state.blocks.findIndex((b) => b.id === "__content__");
+			const block: Block = {
+				id: "__content__",
+				childrenIds: [],
+				content: {
+					custom: {
+						contentType: "glon/raw",
+						data: snap.content,
+						meta: {},
+					},
+				},
+			};
+			if (idx >= 0) {
+				state.blocks[idx] = block;
+			} else {
+				state.blocks.push(block);
+			}
+			state.blockProvenance.set("__content__", {
+				changeId: new Uint8Array(0),
+				author: "",
+				timestamp: 0,
+			});
 		}
 		// Provenance isn't in the snapshot — blocks created before the
 		// snapshot lose individual provenance. That's the tradeoff:
@@ -109,8 +134,32 @@ export function computeState(changes: Change[]): ObjectState {
 				state.fields.set(op.fieldSet.key, op.fieldSet.value);
 			} else if (op.fieldDelete) {
 				state.fields.delete(op.fieldDelete.key);
+
+
 			} else if (op.contentSet) {
-				state.content = op.contentSet.content;
+				// ContentSet is deprecated: migrate to primary block.
+				const idx = state.blocks.findIndex((b) => b.id === "__content__");
+				const block: Block = {
+					id: "__content__",
+					childrenIds: [],
+					content: {
+						custom: {
+							contentType: "glon/raw",
+							data: op.contentSet.content,
+							meta: {},
+						},
+					},
+				};
+				if (idx >= 0) {
+					state.blocks[idx] = block;
+				} else {
+					state.blocks.push(block);
+				}
+				state.blockProvenance.set("__content__", {
+					changeId: change.id,
+					author: change.author,
+					timestamp: change.timestamp,
+				});
 			} else if (op.objectDelete) {
 				state.deleted = true;
 			} else if (op.blockAdd) {
@@ -168,7 +217,14 @@ export function findHeads(changes: Change[]): Uint8Array[] {
 	return heads;
 }
 
+
 // ── Snapshot ────────────────────────────────────────────────────────
+
+/** Extract primary content from a block tree (the migrated ContentSet block). */
+export function getPrimaryContent(blocks: Block[]): Uint8Array | undefined {
+	const block = blocks.find((b) => b.id === "__content__");
+	return block?.content?.custom?.data;
+}
 
 /** Convert ObjectState to ObjectSnapshot (Map → Record). */
 export function toSnapshot(state: ObjectState): ObjectSnapshot {
@@ -180,14 +236,13 @@ export function toSnapshot(state: ObjectState): ObjectSnapshot {
 		id: state.id,
 		typeKey: state.typeKey,
 		fields,
-		content: state.content,
+		// content removed — use getPrimaryContent(state.blocks) instead
 		blocks: state.blocks,
 		deleted: state.deleted,
 		createdAt: state.createdAt,
 		updatedAt: state.updatedAt,
 	};
 }
-
 // ── Topological sort ───────────────────────────────────────────────
 
 /** Kahn's BFS topological sort, tie-breaking on hex id (lexicographic). */

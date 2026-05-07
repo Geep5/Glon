@@ -127,6 +127,7 @@ function canonicalizeOperation(op: Operation): Operation {
 	return op;
 }
 
+
 function canonicalizeSnapshot(snap: ObjectSnapshot): ObjectSnapshot {
 	const sortedFields = sortKeyed(snap.fields ?? {});
 	const fields: Record<string, Value> = {};
@@ -137,7 +138,7 @@ function canonicalizeSnapshot(snap: ObjectSnapshot): ObjectSnapshot {
 		id: snap.id,
 		typeKey: snap.typeKey,
 		fields,
-		content: snap.content,
+		content: snap.content, // deprecated: migrated to primary block
 		blocks: (snap.blocks ?? []).map(canonicalizeBlock),
 		deleted: snap.deleted,
 		createdAt: snap.createdAt,
@@ -151,6 +152,7 @@ function canonicalizeSnapshot(snap: ObjectSnapshot): ObjectSnapshot {
  * order. The returned object can be passed to any standard protobuf
  * encoder and will produce byte-identical output across implementations.
  */
+
 function canonicalizeChange(change: Change): Change {
 	return {
 		id: change.id,
@@ -160,6 +162,9 @@ function canonicalizeChange(change: Change): Change {
 		timestamp: change.timestamp,
 		author: change.author,
 		authorSig: change.authorSig,
+		authExtension: change.authExtension
+			? { type: change.authExtension.type, payload: change.authExtension.payload }
+			: undefined,
 		snapshot: change.snapshot ? canonicalizeSnapshot(change.snapshot) : undefined,
 		x402Auth: change.x402Auth ? canonicalizeX402Auth(change.x402Auth) : undefined,
 	};
@@ -187,14 +192,21 @@ export function canonicalEncodeChange(change: Change): Uint8Array {
 	return proto.encodeChange(copy);
 }
 
+
 /**
- * Bytes the author signs. Both `id` AND `authorSig.signature` are zeroed
- * (the signer doesn't know the id yet, and is producing the signature).
- * `authorSig.pubkey`, `nonce`, `fee` ARE present and committed to.
+ * Bytes the author signs. `id` is zeroed (unknown at signing time).
+ * For authExtension, the payload is zeroed (the signature goes IN the payload).
+ * For backwards compat, authorSig.signature is also zeroed if present.
  */
 export function canonicalEncodeChangeForSigning(change: Change): Uint8Array {
 	const copy = canonicalizeChange(change);
 	copy.id = new Uint8Array(0);
+	if (copy.authExtension) {
+		copy.authExtension = {
+			type: copy.authExtension.type,
+			payload: new Uint8Array(0),
+		};
+	}
 	if (copy.authorSig) {
 		copy.authorSig = {
 			pubkey: copy.authorSig.pubkey,

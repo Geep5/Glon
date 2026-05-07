@@ -34,6 +34,8 @@
 //     selection logic; v1 tracks it for inspection only.
 
 import type { ProgramDef, ProgramContext, ProgramActorDef, ValidatorFn, ValidationResult } from "../runtime.js";
+
+import { decodeSignature, decodeX402Auth } from "../../proto.js";
 import type { Change } from "../../proto.js";
 import { decodeChange, encodeChange } from "../../proto.js";
 import { U64_MAX } from "../../det/math.js";
@@ -150,21 +152,36 @@ function feePolicyOf(s: PersistedState): FeePolicy {
  * does that after this returns ok.
  */
 
+
 export function consensusGate(
 	change: Change,
 	state: PersistedState,
 	nowSeconds: number = Math.floor(Date.now() / 1000),
 ): { ok: true; nextState: PersistedState; kind: FeeKind } | { ok: false; reason: string } {
-	if (!change.authorSig) {
+	// Determine auth source: new authExtension takes priority, fall back to legacy fields.
+	const hasX402 = change.authExtension?.type === "x402" || !!change.x402Auth;
+	const sig = change.authExtension?.type === "ed25519"
+		? (() => {
+				try {
+					const s = decodeSignature(change.authExtension!.payload);
+					return s;
+				} catch { return undefined; }
+			})()
+		: change.authorSig;
+
+	if (!sig) {
 		return { ok: false, reason: "consensus: change is not signed (kernel should have rejected)" };
 	}
-	const sig = change.authorSig;
 	const pubkeyHex = hexEncode(sig.pubkey);
 
 	// x402 authorization path: unique nonce + time bounds.
-	if (change.x402Auth) {
-		const auth = change.x402Auth;
-		if (!auth.nonce || auth.nonce.length === 0) {
+	if (hasX402) {
+		const auth = change.x402Auth ?? (() => {
+			try {
+				return decodeX402Auth(change.authExtension!.payload);
+			} catch { return undefined; }
+		})();
+		if (!auth || !auth.nonce || auth.nonce.length === 0) {
 			return { ok: false, reason: "consensus: x402 auth missing nonce" };
 		}
 		const nonceHex = hexEncode(auth.nonce);

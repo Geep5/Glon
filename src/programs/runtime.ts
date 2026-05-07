@@ -14,6 +14,12 @@
  */
 
 import type { Value, Change, ObjectRef } from "../proto.js";
+
+import { decodeSignature } from "../proto.js";
+
+import { canonicalEncodeChangeForSigning } from "../det/canonical.js";
+import { verify as ed25519Verify } from "../det/ed25519.js";
+
 import * as proto from "../proto.js";
 
 import type { ObjectState } from "../dag/dag.js";
@@ -454,6 +460,40 @@ export function getIndexHook(typeKey: string): IndexHookFn | undefined {
 	return indexHooks.get(typeKey);
 }
 
+
+// ── Auth verifier registry ──────────────────────────────────────
+
+/** Verifier for a specific auth extension type. Receives the Change and its
+ *  payload; returns true if the auth is cryptographically valid.
+ *  The canonical bytes (with id and payload zeroed) are computed internally. */
+export type AuthVerifierFn = (change: Change, payload: Uint8Array) => boolean;
+
+const authVerifiers = new Map<string, AuthVerifierFn>();
+
+/** Register an auth verifier for an auth extension type (e.g. "ed25519"). */
+export function registerAuthVerifier(type: string, fn: AuthVerifierFn): void {
+	authVerifiers.set(type, fn);
+}
+
+/** Get the auth verifier for a given type (if any). */
+export function getAuthVerifier(type: string): AuthVerifierFn | undefined {
+	return authVerifiers.get(type);
+}
+
+
+// Built-in Ed25519 verifier: payload is a serialized Signature message.
+// pubkey, nonce, fee are committed; signature is verified against canonical bytes.
+registerAuthVerifier("ed25519", (change, payload) => {
+	try {
+		const s = decodeSignature(payload);
+		if (!s.pubkey || s.pubkey.length !== 32) return false;
+		if (!s.signature || s.signature.length !== 64) return false;
+		const signingBytes = canonicalEncodeChangeForSigning(change);
+		return ed25519Verify(s.pubkey, signingBytes, s.signature);
+	} catch {
+		return false;
+	}
+});
 // ── Program actor instances ─────────────────────────────────────
 
 const actorInstances = new Map<string, ProgramActorInstance>();

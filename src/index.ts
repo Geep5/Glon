@@ -28,11 +28,13 @@ import {
 	createDeleteChange,
 	changeId,
 } from "./dag/change.js";
-import { computeState, findHeads, toSnapshot, type ObjectState, type BlockProvenance } from "./dag/dag.js";
+
+import { computeState, findHeads, toSnapshot, getPrimaryContent, type ObjectState, type BlockProvenance } from "./dag/dag.js";
 import { initDisk, writeChange, readChangeByHex, listChangeFilesForObject, deleteChangesForObject, diskStats } from "./disk.js";
 
 
-import { getValidator, isChainModeType, getIndexHook } from "./programs/runtime.js";
+
+import { getValidator, isChainModeType, getIndexHook, getAuthVerifier } from "./programs/runtime.js";
 import type { BatchValidationContext } from "./programs/runtime.js";
 
 import { canonicalEncodeChange, canonicalEncodeChangeForSigning } from "./det/canonical.js";
@@ -111,15 +113,17 @@ function computedToVars(computed: ObjectState, changeCount: number): ObjectVars 
 		};
 	}
 
+	const primary = getPrimaryContent(computed.blocks);
 	return {
 		typeKey: computed.typeKey,
 		fields,
-		content: Buffer.from(computed.content).toString("base64"),
+		content: primary ? Buffer.from(primary).toString("base64") : "",
 		blocks: computed.blocks,
 		blockProvenance,
 		deleted: computed.deleted,
 		createdAt: computed.createdAt,
 		updatedAt: computed.updatedAt,
+
 		headIds: computed.heads.map((h) => hexEncode(h)),
 		changeCount,
 	};
@@ -337,41 +341,47 @@ const objectActor = actor({
 				}
 			}
 
-			// ── Chain-mode signature gate ──────────────────────────────
-			// Verify Ed25519 sig before any program validator sees the change.
-			// Chain-mode objects without a valid signature are rejected here
-			// regardless of validator behaviour.
+
+			// ── Chain-mode auth gate ───────────────────────────────────
+			// Dispatch to registered auth verifiers by extension type.
+			// Falls back to legacy authorSig for backwards compat.
 			if (effectiveTypeKey && isChainModeType(effectiveTypeKey)) {
 				for (const change of decoded) {
-					const sig = change.authorSig;
-					if (!sig || !sig.pubkey || sig.pubkey.length === 0) {
+					let verified = false;
+
+					if (change.authExtension) {
+						const verifier = getAuthVerifier(change.authExtension.type);
+						if (!verifier) {
+							throw new Error(
+								`auth gate: no verifier registered for type "${change.authExtension.type}"`,
+							);
+						}
+						verified = verifier(change, change.authExtension.payload);
+					} else if (change.authorSig) {
+						// Backwards compat: legacy author_sig path
+						const sig = change.authorSig;
+						if (!sig.pubkey || sig.pubkey.length !== 32) {
+							throw new Error(`auth gate: pubkey must be 32 bytes`);
+						}
+						if (!sig.signature || sig.signature.length !== 64) {
+							throw new Error(`auth gate: signature must be 64 bytes`);
+						}
+						const signingBytes = canonicalEncodeChangeForSigning(change);
+						verified = ed25519Verify(sig.pubkey, signingBytes, sig.signature);
+					} else {
 						throw new Error(
-							`signature gate: chain-mode change for object ${change.objectId} is missing author_sig`,
+							`auth gate: chain-mode change for object ${change.objectId} is missing auth`,
 						);
 					}
-					if (sig.pubkey.length !== 32) {
-						throw new Error(
-							`signature gate: pubkey must be 32 bytes (got ${sig.pubkey.length})`,
-						);
+
+					if (!verified) {
+						throw new Error(`auth gate: invalid auth for change in ${change.objectId}`);
 					}
-					if (!sig.signature || sig.signature.length !== 64) {
-						throw new Error(
-							`signature gate: signature must be 64 bytes (got ${sig.signature?.length ?? 0})`,
-						);
-					}
-					const signingBytes = canonicalEncodeChangeForSigning(change);
-					const ok = ed25519Verify(sig.pubkey, signingBytes, sig.signature);
-					if (!ok) {
-						throw new Error(
-							`signature gate: invalid signature for change in ${change.objectId}`,
-						);
-					}
-					// Also verify the content-address: id MUST equal sha256(canonical(change with id zeroed)).
+
+					// Content-address check: id MUST equal sha256(canonical(change with id zeroed)).
 					const expectedId = sha256(canonicalEncodeChange(change));
 					if (hexEncode(expectedId) !== hexEncode(change.id)) {
-						throw new Error(
-							`signature gate: change id does not match canonical hash`,
-						);
+						throw new Error(`auth gate: change id does not match canonical hash`);
 					}
 				}
 			}
