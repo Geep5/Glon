@@ -235,45 +235,65 @@ export function extractString(v: any): string | undefined {
 		if (s === undefined) return fallback;
 		return s === "true" || s === "1";
 	}
-export function extractMapEntries(v: any): Record<string, any> | undefined {
-	if (v === null || v === undefined) return undefined;
-	if (typeof v === "object" && !Array.isArray(v)) return v;
-	if (v.mapValue?.entries) return v.mapValue.entries;
-	return undefined;
-}
-
-export function extractTools(toolsField: any): ToolSpec[] {
-	const raw = extractString(toolsField);
-	if (!raw) return [];
-	try {
-		const parsed = JSON.parse(raw) as ToolSpec[];
-		if (!Array.isArray(parsed)) return [];
-		return parsed.filter((t) => t && typeof t.name === "string" && typeof t.target_prefix === "string" && typeof t.target_action === "string");
-	} catch {
-		return [];
+	export function extractMapEntries(v: any): Record<string, any> | undefined {
+		if (v == null) return undefined;
+		if (v.mapValue?.entries) return v.mapValue.entries;
+		if (v.entries) return v.entries;
+		return undefined;
 	}
-}
 
-export function encodeToolsField(
-	tools: ToolSpec[],
-	mapVal: ProgramContext["mapVal"],
-	stringVal: ProgramContext["stringVal"],
-) {
-	return mapVal(
-		tools.map((t) =>
-			mapVal({
-				name: stringVal(t.name),
+	export function extractTools(toolsField: any): ToolSpec[] {
+		const entries = extractMapEntries(toolsField);
+		if (!entries) return [];
+		const result: ToolSpec[] = [];
+		for (const [name, raw] of Object.entries(entries)) {
+			const inner = extractMapEntries(raw);
+			if (!inner) continue;
+			const description = extractString(inner.description) ?? "";
+			const schemaStr = extractString(inner.input_schema) ?? "{}";
+			const target_prefix = extractString(inner.target_prefix) ?? "";
+			const target_action = extractString(inner.target_action) ?? "";
+			if (!target_prefix || !target_action) continue;
+			let input_schema: Record<string, unknown> = { type: "object" };
+			try {
+				const parsed = JSON.parse(schemaStr);
+				if (parsed && typeof parsed === "object") input_schema = parsed;
+			} catch { /* keep default */ }
+			let bound_args: Record<string, unknown> | undefined;
+			const boundStr = extractString(inner.bound_args);
+			if (boundStr) {
+				try {
+					const parsed = JSON.parse(boundStr);
+					if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+						bound_args = parsed;
+					}
+				} catch { /* drop malformed bound_args rather than crash the tool */ }
+			}
+			result.push({ name, description, input_schema, target_prefix, target_action, bound_args });
+		}
+		return result;
+	}
+
+	export function encodeToolsField(
+		tools: ToolSpec[],
+		mapVal: ProgramContext["mapVal"],
+		stringVal: ProgramContext["stringVal"],
+	) {
+		const entries: Record<string, ReturnType<typeof mapVal>> = {};
+		for (const t of tools) {
+			const inner: Record<string, ReturnType<typeof stringVal>> = {
 				description: stringVal(t.description),
 				input_schema: stringVal(JSON.stringify(t.input_schema)),
 				target_prefix: stringVal(t.target_prefix),
 				target_action: stringVal(t.target_action),
-				...(t.bound_args
-					? { bound_args: stringVal(JSON.stringify(t.bound_args)) }
-					: {}),
-			}),
-		),
-	);
-}
+			};
+			if (t.bound_args && Object.keys(t.bound_args).length > 0) {
+				inner.bound_args = stringVal(JSON.stringify(t.bound_args));
+			}
+			entries[t.name] = mapVal(inner);
+		}
+		return mapVal(entries);
+	}
 
 export function extractCompactionConfig(fields: Record<string, any>): CompactionConfig {
 	return {

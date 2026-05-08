@@ -24,6 +24,7 @@ import {
 	extractInt,
 	extractBool,
 	extractTools,
+	encodeToolsField,
 	extractCompactionConfig,
 	DEFAULT_MODEL,
 	DEFAULT_MAX_TOOL_ITERATIONS,
