@@ -1140,8 +1140,8 @@ interface ProgramActorState {
 
 		options: {
 			// Agent asks can involve many tool iterations + LLM round-trips.
-			// Default 60s is too short for complex tasks (e.g. holdfast setup).
-			actionTimeout: 300_000, // 5 minutes
+			// Default 60s is far too short; some tasks take 10-30 minutes.
+			actionTimeout: 1_800_000, // 30 minutes
 		},
 
 		events: {
