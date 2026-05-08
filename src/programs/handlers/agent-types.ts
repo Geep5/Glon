@@ -2,6 +2,7 @@
 //
 // Zero runtime dependencies on other agent modules.
 
+import type { AnthropicContent } from "./agent-llm.js";
 import type { ProgramContext } from "../runtime.js";
 
 // ── Constants ──────────────────────────────────────────────────────
@@ -18,20 +19,20 @@ export const DEFAULT_COMPACTION_KEEP_RECENT_TOKENS = 20000;
 export const DEFAULT_MAX_SPAWN_DEPTH = 4;
 export const DEFAULT_SPAWN_CONCURRENCY = 6;
 
-	export const SUBAGENT_ADDENDUM = `
+export const SUBAGENT_ADDENDUM = `
 
-	---
-	SUBAGENT CONTEXT
+---
+SUBAGENT CONTEXT
 
-	You are a subagent. Your parent delegated one task to you and is waiting
-	for your structured answer.
+You are a subagent. Your parent delegated one task to you and is waiting
+for your structured answer.
 
-	When you are finished, call the \`submit_result\` tool with your final
-	answer. If you don't, your last assistant message will be used as the
-	fallback result with a \`no_submit_result\` warning.
+When you are finished, call the \`submit_result\` tool with your final
+answer. If you don't, your last assistant message will be used as the
+fallback result with a \`no_submit_result\` warning.
 
-	You cannot spawn further subagents unless your template permits it.
-	`;
+You cannot spawn further subagents unless your template permits it.
+`;
 
 export const BLOCK_TOOL_USE = "tool_use";
 export const BLOCK_TOOL_RESULT = "tool_result";
@@ -65,6 +66,21 @@ export type ClassifiedItem =
 	| { kind: "tool_use"; blockId: string; toolUseId: string; name: string; input: Record<string, unknown>; timestamp: number }
 	| { kind: "tool_result"; blockId: string; toolUseId: string; content: string; isError: boolean; timestamp: number }
 	| { kind: "compaction"; blockId: string; summary: string; firstKeptBlockId: string; tokensBefore: number; turnCount: number; priorSummaryId?: string; timestamp: number };
+
+export interface Turn {
+	role: "user" | "assistant";
+	content: string | AnthropicContent[];
+	timestamp: number;
+}
+
+export interface ConversationView {
+	/** Summary to inject as a system-prompt extension, if any. */
+	systemExtension?: string;
+	/** Turns to send as the messages[] array. */
+	turns: Turn[];
+	/** Latest compaction block, if one exists (for diagnostics). */
+	latestCompaction: Extract<ClassifiedItem, { kind: "compaction" }> | null;
+}
 
 export interface AskResult {
 	finalText: string;
@@ -282,19 +298,19 @@ export function safeJsonParse(s: string): unknown {
 	try { return JSON.parse(s); } catch { return null; }
 }
 
-	export async function doRegisterTool(agentId: string, spec: ToolSpec, ctx: ProgramContext): Promise<string> {
-		const store = ctx.store as any;
-		const state = await store.get(agentId);
-		if (!state) throw new Error(`Agent not found: ${agentId}`);
-		if (state.typeKey !== "agent") throw new Error(`Object ${agentId} is not an agent (typeKey=${state.typeKey})`);
+export async function doRegisterTool(agentId: string, spec: ToolSpec, ctx: ProgramContext): Promise<string> {
+	const store = ctx.store as any;
+	const state = await store.get(agentId);
+	if (!state) throw new Error(`Agent not found: ${agentId}`);
+	if (state.typeKey !== "agent") throw new Error(`Object ${agentId} is not an agent (typeKey=${state.typeKey})`);
 
-		const existing = extractTools(state.fields?.tools);
-		const filtered = existing.filter((t) => t.name !== spec.name);
-		filtered.push(spec);
+	const existing = extractTools(state.fields?.tools);
+	const filtered = existing.filter((t) => t.name !== spec.name);
+	filtered.push(spec);
 
-		const client = ctx.client as any;
-		const actor = client.objectActor.getOrCreate([agentId]);
-		const encoded = encodeToolsField(filtered, ctx.mapVal, ctx.stringVal);
-		await actor.setField("tools", JSON.stringify(encoded));
-		return `Registered tool '${spec.name}' → ${spec.target_prefix} ${spec.target_action}`;
-	}
+	const client = ctx.client as any;
+	const actor = client.objectActor.getOrCreate([agentId]);
+	const encoded = encodeToolsField(filtered, ctx.mapVal, ctx.stringVal);
+	await actor.setField("tools", JSON.stringify(encoded));
+	return `Registered tool '${spec.name}' → ${spec.target_prefix} ${spec.target_action}`;
+}
