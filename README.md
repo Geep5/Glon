@@ -1,6 +1,8 @@
 # glon
-
 A distributed object environment where every mutation is a content-addressed protobuf message in a DAG, every object is a durable actor, and every program — including the ones running the shell — is itself an object you can replay, sync, and inspect.
+
+> **Sister repo:** [glonAstrolabe](https://github.com/Geep5/glonAstrolabe) — a live 3D dashboard that reads the DAG directly and visualizes objects, agents, coins, and changes in real time.
+
 
 There is no folder hierarchy and no central database. Objects are typed, link to each other, and live in a flat graph. State is never written; it is *computed* by replaying changes from genesis to heads.
 
@@ -28,6 +30,7 @@ Three layers, deliberately separated:
 |-------|----------|------|
 | Change DAG | `Change`, `Operation`, `ObjectCreate/Delete`, `FieldSet/Delete`, `Block*`, `AuthExtension` | Source of truth. Immutable, content-addressed. |
 | Sync | `Envelope` wrapping `HeadAdvertise`, `HeadRequest`, `ChangePush`, `ChangeRequest`, `ObjectSubscribe`, `ObjectEvent`, `AppMessage` | Pull-based DAG exchange between actors. Typed, no JSON-on-the-wire. |
+| Transport | `TransportEnvelope` wrapping `ChangeBundle`, `TextMessage`, or custom payloads | Cross-DAG delivery. Fail-fast, identity-in-signatures, transport-agnostic. |
 | Computed State | `ObjectSnapshot`, `ObjectRef`, `Block`, `Value` (recursive `ValueMap`/`ValueList`/`ObjectLink`) | Derived from replay. `ObjectSnapshot` can be embedded in a Change as a replay-skip checkpoint, never as truth. |
 
 Values are recursive and typed at the protobuf level — string/int/float/bool/bytes/list/map/`ObjectLink` — so a browser can store cookie jars as nested maps and a spreadsheet can store cell metadata as typed lists without anyone touching `glon.proto`.
@@ -46,7 +49,7 @@ There are roughly four families of programs in this repo:
 
 **Object plumbing.** `crud` (create/list/get/set/delete), `inspect` (DAG history, change details, sync state), `graph` (link traversal, BFS), `ipc` (inter-object messaging), `gc` (retention policies), `sync` (mDNS + HTTP P2P sync — service name `_glon._tcp.local`), `help`.
 
-**Generic apps.** `ttt` (tic-tac-toe where every move is a content-addressed change), `comment` (threaded discussions), `chat` (thin alias on top of `comment`, with legacy block fallback for the pre-migration history), `todo`, `remind` (scheduled actions), `peer` (people and agents — display name, kind, trust level, contact handles).
+**Generic apps.** `ttt` (tic-tac-toe where every move is a content-addressed change), `comment` (threaded discussions), `chat` (thin alias on top of `comment`, with legacy block fallback for the pre-migration history), `todo`, `remind` (scheduled actions), `peer` (people and agents — display name, kind, trust level, contact handles, identity pubkey, endpoints, preferred transport).
 
 **Agent stack.** This is the bulk of the code:
 
@@ -58,13 +61,20 @@ There are roughly four families of programs in this repo:
 
 **I/O bridges.** `discord` (Gateway WS for presence + 3-second REST poll for DMs, routes inbound to `/holdfast.ingest`), `google` (cheatsheet for the `gws` CLI), `browser` (cheatsheet for a local Skyvern instance on :8000), `web` (curl/jq/pandoc recipes), `shell` (persistent bash sessions an agent can drive), `anytype` (local Anytype REST API).
 
+**Transport layer.** Cross-DAG communication is transport-agnostic. Any program that implements `send` and `inbox_drain` typed actions can move `TransportEnvelope` bytes:
+
+- `transport-file` — writes raw protobuf envelopes to `.glonenv` files. Address format: `file:///path/to/inbox`. Used for local testing.
+- `transport-discord` — sends payloads as Discord DMs via the existing `/discord` program. Address format: `discord://<user_id>`.
+- `transport-http` — POSTs JSON envelopes to a remote endpoint. Address format: `https://host:port/path`.
+- `transport-router` — polls every registered transport's `inbox_drain`, dispatches by `content_type` through a content-handler registry (`registerContentHandler` in `runtime.ts`). Built-in handlers: `glon/change-bundle` (imports each Change via `objectActor.pushChanges`), `glon/text` (logs to stdout).
+
 **Chain layer.** A small Chia-style proof-of-spacetime blockchain runs on top of the same kernel:
 
 - `wallet` — local Ed25519 keys, never on the DAG. Receives an unsigned `Change`, fills in the signature payload, returns it content-addressed.
 - `consensus` — validator gate for chain-mode types. Per-pubkey monotonic nonce, asymmetric fee floors (deploy 100×, mint 10×, other 1×), dispatches type-specific semantic checks to the owning program through its declared typed actions.
-- `coin` — UTXO-based fungible tokens. `chain.token` holds metadata; `chain.coin.bucket` objects hold up to 1000 coins each as `BlockAdd` ops. Atomic swaps via `chain.coin.offer` objects with two-pass replay so `settle` can land before its `escrow`/`pay`. Registers an `IndexHookFn` for `chain.coin.bucket` so the kernel maintains the SQL coin index without importing anything from this file.
+- `coin` — UTXO-based fungible tokens. `chain.token` holds metadata; `chain.coin.bucket` objects hold up to 1000 coins each as `BlockAdd` ops. Atomic swaps via `chain.coin.offer` objects with two-pass replay so `settle` can land before its `escrow`/`pay`. Registers an `IndexHookFn` for `chain.coin.bucket` so the kernel maintains the SQL coin index without importing anything from this file. Cross-DAG sends package spend+create changes into a `ChangeBundle` dispatched through the transport layer.
 - `coin-x402` — pure helpers for x402 payment authorization (canonical encoding, signature verification). Used by `coin.ts` for offer settlement; could be picked up by other programs that want the same payment shape.
-- `anchor` — global ordering and Merkle state commitment over chain-mode head ids. Longest-chain fork choice with timestamp tiebreak. Inflation rewards in FIG (5 FIG base, halving every 1000 anchors) paid to anchor creators.
+- `anchor` — global ordering and Merkle state commitment over chain-mode head ids. Longest-chain fork choice with timestamp tiebreak. Inflation rewards in FIG (5 FIG base, halving every 1000 anchors) paid to anchor creators. Each anchor change carries `state_root` (Merkle root of chain head ids), `prev_anchor_id` (parent anchor for linear ordering), and optional `pospace_proof` (hex proof bytes for future PoSpace integration).
 - `plot` — real Proof of Space via shelling out to `chiapos` (Chia's plotter), default `k=25` (~600 MB) for testing, `k=32` (~101 GB) for mainnet-equivalent.
 - `timelord` — real Proof of Time via `chiavdf` (Wesolowski VDFs, class groups of unknown order, 1024-bit discriminant), default 5M iterations.
 
@@ -76,7 +86,7 @@ The chain layer is genuinely separate from the object/agent kernel — it just r
 - **Runtime.** Node 20+ via `tsx` (no build step in dev). Uses `node:sqlite` for the store index and `node:dgram` for mDNS.
 - **Actors.** `rivetkit` 2.x. `objectActor` and `storeActor` are defined in `src/index.ts`; `programActor` is dynamically materialized per program by `runtime.ts`.
 - **Wire format.** `protobufjs`. Schema in `proto/glon.proto`. Canonical encoding for signing lives in `src/det/canonical.ts`.
-- **Crypto.** SHA-256 for content addressing (`src/crypto.ts`); Ed25519 for chain signatures (`src/det/ed25519.ts`); `randomBytes` for nonces.
+- **Crypto.** SHA-256 for content addressing (`src/crypto.ts`); Ed25519 for chain signatures (`src/det/ed25519.ts`); `randomBytes` for nonces. Transport envelopes carry a `sender_pubkey` hint, but trust is in the Ed25519 signatures on each individual Change.
 - **Determinism.** `src/det/` carries the bits the chain layer needs to be reproducible across machines: canonical proto encoding, signing, big-int math (`U64_MAX`, `U128_MAX`, bounded add, checked sub).
 - **Bundler.** `esbuild`, used at runtime to compile programs out of the DAG.
 - **Optional native binaries.** `chiapos` and `chiavdf` under `~/.glon/bin/` if you want real PoSpace/PoT. Optional Skyvern at `127.0.0.1:8000` if agents need a real browser.
@@ -144,10 +154,10 @@ src/
     runtime.ts                module bundler, actor lifecycle, dispatch table,
                               registries (validator, indexHook, authVerifier)
     shared.ts                 ANSI styling + typed field extractors
-    handlers/                 one file per program (~30, see Application Layer above)
+    handlers/                 one file per program (~35, see Application Layer above)
 scripts/                      operational tools (daemon, dispatch, dumps, repairs)
-test/                         unit tests for kernel, agents, chain, programs
-docs/                         design notes for coin offers + the trading-agent system
+test/                         unit tests for kernel, agents, chain, programs, transports
+docs/                         design notes (coin offers, transports, trading system)
 ```
 
 ## License
