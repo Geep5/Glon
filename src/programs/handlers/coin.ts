@@ -1811,6 +1811,95 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 					return { offer_id: offerId };
 				},
 			},
+			mint: {
+				description: "Mint new coins (owner only). Creates a coin in the owner's bucket.",
+				inputSchema: {
+					type: "object",
+					required: ["token_id", "amount"],
+					properties: {
+						token_id: { type: "string" },
+						amount: { type: "string" },
+						key_name: { type: "string" },
+					},
+				},
+				handler: async (ctx: ProgramContext, input: {
+					token_id: string;
+					amount: string;
+					key_name?: string;
+				}): Promise<{ coin_id: string; bucket_id: string }> => {
+					const { dispatchProgram, store, resolveId, objectActor, randomUUID } = ctx;
+					const storeAny = store as any;
+					const keyName = input.key_name ?? "default";
+
+					const tokenId = (await resolveId(input.token_id)) ?? input.token_id;
+					const meta = await loadTokenMeta(tokenId, ctx);
+					if (meta.mintRenounced) throw new Error("Mint has been renounced");
+
+					const keyInfo: any = await dispatchProgram("/wallet", "show", [keyName]);
+					if (!keyInfo) throw new Error(`Wallet key "${keyName}" not found`);
+					const senderPubkey = keyInfo.pubkey as string;
+					if (senderPubkey !== meta.ownerPubkey) throw new Error("Only owner can mint");
+
+					// Find or create bucket
+					let bucketId: string | null = null;
+					const refs = await storeAny.list(BUCKET_TYPE_KEY);
+					for (const ref of refs) {
+						const b = await storeAny.get(ref.id);
+						if (b?.fields?.token_id?.linkValue?.targetId === tokenId) {
+							const bState = replayBucket(b.blocks ?? []);
+							let unspentCount = 0;
+							for (const c of bState.coins.values()) if (!c.spent) unspentCount++;
+							if (unspentCount < MAX_COINS_PER_BUCKET) {
+								bucketId = ref.id;
+								break;
+							}
+						}
+					}
+
+					if (!bucketId) {
+						bucketId = randomUUID().replace(/-/g, "").slice(0, 24);
+						const genesisChange = buildBucketGenesisChange({
+							bucketId,
+							timestamp: Date.now(),
+							author: "coin-mint",
+							tokenId,
+						});
+						const genesisB64 = Buffer.from(encodeChange(genesisChange)).toString("base64");
+						const nonce: number = await dispatchProgram("/consensus", "getNonce", [senderPubkey]) as number;
+						const { changeB64: signedGenesisB64 } = await dispatchProgram("/wallet", "signChange", [{
+							name: keyName,
+							changeB64: genesisB64,
+							nonce: nonce + 1,
+							fee: 1,
+						}]) as { changeB64: string };
+						const genesisActor = objectActor(bucketId, { createWithInput: { id: bucketId } });
+						await genesisActor.pushChanges(signedGenesisB64);
+					}
+
+					const coinId = randomUUID().replace(/-/g, "").slice(0, 16);
+					const bucketActor = objectActor(bucketId);
+					const heads = await bucketActor.getHeads() as string[];
+					const createChange = buildCoinOpChange({
+						bucketId,
+						parentIds: heads.map(hexDecode),
+						timestamp: Date.now(),
+						author: "coin-mint",
+						op: { kind: "create", coinId, ownerPubkey: senderPubkey, amount: input.amount },
+						blockId: randomUUID().replace(/-/g, "").slice(0, 16),
+					});
+					const createB64 = Buffer.from(encodeChange(createChange)).toString("base64");
+					const nonce: number = await dispatchProgram("/consensus", "getNonce", [senderPubkey]) as number;
+					const { changeB64: signedCreateB64 } = await dispatchProgram("/wallet", "signChange", [{
+						name: keyName,
+						changeB64: createB64,
+						nonce: nonce + 1,
+						fee: 1,
+					}]) as { changeB64: string };
+					await bucketActor.pushChanges(signedCreateB64);
+
+					return { coin_id: coinId, bucket_id: bucketId };
+				},
+			},
 			coinBalance: {
 				description: "Single pubkey balance for a token from SQLite index",
 				inputSchema: {
