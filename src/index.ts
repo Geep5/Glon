@@ -1223,6 +1223,8 @@ export const app = setup({
 	// Program manifests (base64 source) routinely exceed the default message
 	// cap; bump to 10MB so large programs like /agent + compaction fit.
 	maxIncomingMessageSize: 10_000_000,
+	// Agent responses (tool results, status dumps) can also be very large.
+	maxOutgoingMessageSize: 10_000_000,
 });
 
 	async function startServer(): Promise<void> {
