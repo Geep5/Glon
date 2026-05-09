@@ -351,7 +351,9 @@ function anthropicMessagesToOpenAI(
 			const openAiMsg: any = { role: "assistant" };
 			if (textParts.length > 0) openAiMsg.content = textParts.join("");
 			if (toolCalls.length > 0) openAiMsg.tool_calls = toolCalls;
-			if ((msg as any).reasoningContent) openAiMsg.reasoning_content = (msg as any).reasoningContent;
+			// Moonshot requires reasoning_content on all assistant messages when
+			// thinking is enabled for the model (even if empty).
+			openAiMsg.reasoning_content = (msg as any).reasoningContent ?? "";
 			out.push(openAiMsg);
 		} else {
 			out.push(...toolResults);
