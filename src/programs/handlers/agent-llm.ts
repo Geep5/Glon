@@ -484,6 +484,10 @@ export async function callKimi(
 	const content: AnthropicContent[] = [];
 	if (message.content) {
 		content.push({ type: "text", text: message.content });
+	} else if (message.reasoning_content) {
+		// Some models (Kimi with thinking) return reasoning but no content.
+		// Fall back to reasoning so callers don't get empty responses.
+		content.push({ type: "text", text: message.reasoning_content });
 	}
 	for (const tc of message.tool_calls ?? []) {
 		if (tc.type === "function") {
