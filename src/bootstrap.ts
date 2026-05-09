@@ -127,21 +127,41 @@ const ENDPOINT = resolveEndpoint();
 		return commands;
 	}
 
-	/** Discover additional modules by scanning relative imports. */
+	/** Discover additional modules by scanning relative imports recursively. */
 	function discoverModules(root: string, entryFile: string, content: string): Record<string, string> {
 		const modules: Record<string, string> = {
 			[entryFile]: `src/programs/handlers/${entryFile}`,
 		};
 		const importRegex = /from\s+["']\.\/([^"']+)["']/g;
-		let match: RegExpExecArray | null;
-		while ((match = importRegex.exec(content)) !== null) {
-			const imported = match[1];
-			const importedBase = imported.endsWith(".js")
-				? imported.replace(/\.js$/, ".ts")
-				: imported + ".ts";
-			const importedPath = `src/programs/handlers/${importedBase}`;
-			if (existsSync(resolve(root, importedPath)) && !modules[importedBase]) {
-				modules[importedBase] = importedPath;
+		const queue: string[] = [entryFile];
+		const processed = new Set<string>();
+
+		while (queue.length > 0) {
+			const current = queue.shift()!;
+			if (processed.has(current)) continue;
+			processed.add(current);
+
+			const currentPath = `src/programs/handlers/${current}`;
+			let currentContent: string;
+			try {
+				currentContent = readFileSync(resolve(root, currentPath), "utf-8");
+			} catch {
+				continue;
+			}
+
+			let match: RegExpExecArray | null;
+			importRegex.lastIndex = 0;
+			while ((match = importRegex.exec(currentContent)) !== null) {
+				const imported = match[1];
+				const importedBase = imported.endsWith(".js")
+					? imported.replace(/\.js$/, ".ts")
+					: imported + ".ts";
+				if (modules[importedBase]) continue;
+				const importedPath = `src/programs/handlers/${importedBase}`;
+				if (existsSync(resolve(root, importedPath))) {
+					modules[importedBase] = importedPath;
+					queue.push(importedBase);
+				}
 			}
 		}
 		return modules;
@@ -423,7 +443,12 @@ function canonicalFields(value: unknown): string {
 		process.exit(0);
 	}
 
-main().catch((err) => {
-	console.error("Bootstrap failed:", err);
-	process.exit(1);
-});
+
+// Only auto-run when this file is the entry point, not when imported as a module.
+const isEntryPoint = process.argv[1] && new URL(process.argv[1], "file://").href === new URL(import.meta.url, "file://").href;
+if (isEntryPoint) {
+	main().catch((err) => {
+		console.error("Bootstrap failed:", err);
+		process.exit(1);
+	});
+}

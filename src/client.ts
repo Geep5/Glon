@@ -107,7 +107,6 @@ async function main() {
 				try {
 					await startProgramActor(prog, (state) => buildContext({ state, programId: prog.id }), client);
 				} catch (err) {
-				} catch (err) {
 					const msg = err instanceof Error ? err.message : String(err);
 					console.log(red(`Failed to start ${prog.prefix}: ${msg}`));
 				}

@@ -27,6 +27,10 @@ export interface CoinOp {
 	amount?: string;
 	tokenId?: string;
 	outputs?: string; // JSON array for offer_settle
+	// Anchor fields — every coin op is an anchor
+	state_root?: string;      // hex-encoded 32-byte SHA-256
+	prev_anchor_id?: string;  // hex-encoded 32-byte change id (empty for genesis-following)
+	pospace_proof?: string;   // hex-encoded proof bytes (optional)
 }
 
 export interface OfferTerms {
@@ -65,6 +69,10 @@ export function decodeCoinOp(block: Block): CoinOp | null {
 	if (kind === "offer_settle") {
 		op.outputs = meta.outputs;
 	}
+	// Anchor fields
+	if (meta.state_root !== undefined) op.state_root = meta.state_root;
+	if (meta.prev_anchor_id !== undefined) op.prev_anchor_id = meta.prev_anchor_id;
+	if (meta.pospace_proof !== undefined) op.pospace_proof = meta.pospace_proof;
 	return op;
 }
 
@@ -74,6 +82,9 @@ export function encodeCoinOp(op: CoinOp): Record<string, string> {
 	if (op.amount !== undefined) out.amount = op.amount;
 	if (op.tokenId !== undefined) out.token_id = op.tokenId;
 	if (op.outputs !== undefined) out.outputs = op.outputs;
+	if (op.state_root !== undefined) out.state_root = op.state_root;
+	if (op.prev_anchor_id !== undefined) out.prev_anchor_id = op.prev_anchor_id;
+	if (op.pospace_proof !== undefined) out.pospace_proof = op.pospace_proof;
 	return out;
 }
 
@@ -105,4 +116,37 @@ export function extractBool(v: any): boolean {
 	if (typeof v === "boolean") return v;
 	if (v.boolValue !== undefined) return !!v.boolValue;
 	return false;
+}
+
+// ── Anchor helpers ─────────────────────────────────────────────────
+
+import { sha256, hexEncode } from "../../crypto.js";
+
+/** Compute SHA-256 state root over a bucket's canonical state. */
+export function computeStateRoot(bucketState: BucketState): Uint8Array {
+	const entries = Array.from(bucketState.coins.entries()).sort(([a], [b]) => a.localeCompare(b));
+	const canonical = JSON.stringify({
+		tokenId: bucketState.tokenId,
+		coins: entries.map(([id, c]) => ({ id, owner: c.owner, amount: c.amount, spent: c.spent })),
+	});
+	return sha256(new TextEncoder().encode(canonical));
+}
+
+/** Find the most recent coin-op block's change id to chain prev_anchor_id to.
+ *  Returns "" if this is the first coin op (no prior coin-op blocks).
+ */
+export function findPrevAnchorId(
+	blocks: Block[],
+	blockProvenance: Map<string, { changeId: Uint8Array; timestamp: number }>,
+): string {
+	let latest: { changeId: Uint8Array; timestamp: number } | null = null;
+	for (const block of blocks) {
+		if (block.content?.custom?.contentType !== OP_CONTENT_TYPE) continue;
+		const prov = blockProvenance.get(block.id);
+		if (!prov) continue;
+		if (!latest || prov.timestamp > latest.timestamp) {
+			latest = prov;
+		}
+	}
+	return latest ? hexEncode(latest.changeId) : "";
 }

@@ -407,7 +407,7 @@ async function compileModuleProgram(ms: ModuleSet, name: string): Promise<Progra
 			"det/ed25519.js": detEd25519,
 			"det/index.js": det,
 			"shared.js": sharedMod,
-			"runtime.js": { registerIndexHook, getIndexHook, registerAuthVerifier, getAuthVerifier, getValidator, isChainModeType },
+			"runtime.js": { registerIndexHook, getIndexHook, registerAuthVerifier, getAuthVerifier, getValidator, isChainModeType, registerContentHandler, getContentHandler },
 		};
 		const factory = new Function(bundled);
 		// Node built-ins go through the real require, scoped to node: prefix only
@@ -571,6 +571,27 @@ registerAuthVerifier("ed25519", (change, payload) => {
 		return false;
 	}
 });
+
+
+// ── Content handler registry ────────────────────────────────────
+
+/** Handler for incoming transport blobs by content_type.
+ *  Receives the decoded TransportEnvelope + parsed payload.
+ *  Returns true if handled, false to fall through. */
+export type ContentHandlerFn = (envelope: { contentType: string; payload: Uint8Array; senderPubkey: Uint8Array; metadata: Record<string, string> }, ctx: ProgramContext) => Promise<boolean>;
+
+const contentHandlers = new Map<string, ContentHandlerFn>();
+
+/** Register a handler for a content_type string (e.g. "glon/change-bundle"). */
+export function registerContentHandler(contentType: string, fn: ContentHandlerFn): void {
+	contentHandlers.set(contentType, fn);
+}
+
+/** Get the handler for a content type (if any). */
+export function getContentHandler(contentType: string): ContentHandlerFn | undefined {
+	return contentHandlers.get(contentType);
+}
+
 // ── Program actor instances ─────────────────────────────────────
 
 const actorInstances = new Map<string, ProgramActorInstance>();

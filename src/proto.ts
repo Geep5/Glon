@@ -336,3 +336,67 @@ export function displayValue(v: Value): string {
 	if (raw instanceof Uint8Array) return `<${raw.byteLength} bytes>`;
 	return String(raw);
 }
+
+// ── Transport types ──────────────────────────────────────────────
+
+const TransportEnvelopeType = root.lookupType("glon.TransportEnvelope");
+const ChangeBundleType = root.lookupType("glon.ChangeBundle");
+const TextMessageType = root.lookupType("glon.TextMessage");
+
+export interface TransportEnvelope {
+	contentType: string;
+	payload: Uint8Array;
+	senderPubkey: Uint8Array;
+	metadata: Record<string, string>;
+}
+
+export interface ChangeBundle {
+	changes: Uint8Array[];
+}
+
+export interface TextMessage {
+	text: string;
+}
+
+export function encodeTransportEnvelope(e: TransportEnvelope): Uint8Array {
+	return TransportEnvelopeType.encode(TransportEnvelopeType.create({
+		contentType: e.contentType,
+		payload: e.payload,
+		senderPubkey: e.senderPubkey,
+		metadata: e.metadata,
+	})).finish();
+}
+
+export function decodeTransportEnvelope(bytes: Uint8Array): TransportEnvelope {
+	const d = TransportEnvelopeType.decode(bytes) as any;
+	return {
+		contentType: String(d.contentType ?? ""),
+		payload: d.payload ? new Uint8Array(d.payload) : new Uint8Array(0),
+		senderPubkey: d.senderPubkey ? new Uint8Array(d.senderPubkey) : new Uint8Array(0),
+		metadata: d.metadata ? Object.fromEntries(Object.entries(d.metadata)) : {},
+	};
+}
+
+export function encodeChangeBundle(b: ChangeBundle): Uint8Array {
+	return ChangeBundleType.encode(ChangeBundleType.create({
+		changes: b.changes,
+	})).finish();
+}
+
+export function decodeChangeBundle(bytes: Uint8Array): ChangeBundle {
+	const d = ChangeBundleType.decode(bytes) as any;
+	return {
+		changes: (d.changes ?? []).map((c: any) => new Uint8Array(c)),
+	};
+}
+
+export function encodeTextMessage(m: TextMessage): Uint8Array {
+	return TextMessageType.encode(TextMessageType.create({
+		text: m.text,
+	})).finish();
+}
+
+export function decodeTextMessage(bytes: Uint8Array): TextMessage {
+	const d = TextMessageType.decode(bytes) as any;
+	return { text: String(d.text ?? "") };
+}

@@ -5,7 +5,7 @@
 //   - Fork choice: longest chain (highest height), ties broken by timestamp.
 //   - State commitment: binary Merkle tree over (objectId + headId) pairs.
 //   - PoST: VDF proof (chiavdf) + optional plot proof (chiapos) for anchor creation.
-//   - Inflation rewards: new FIG tokens minted to anchor creators.
+	//   - Inflation rewards: new FIGGIES tokens minted to anchor creators.
 //
 // v1 (real PoST):
 //   - VDF proof required for anchor creation (via --vdf flag or auto-compute).
@@ -18,7 +18,13 @@ import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { dim, bold, cyan, red, green } from "../shared.js";
-
+import {
+	buildCoinOpChange,
+	encodeCoinOp,
+} from "./coin-bucket.js";
+import { encodeChange } from "../../proto.js";
+import { randomUUID } from "node:crypto";
+import type { CoinOp } from "./coin-types.js";
 
 // ── Constants ────────────────────────────────────────────────────
 
@@ -31,14 +37,16 @@ const AUTO_ANCHOR_MS = 60_000;
 /** Chain-mode types that anchors commit to. */
 const TRACKED_TYPES = ["chain.coin.bucket"];
 
-/** Inflation: base reward in smallest units (1 FIG = 1_000_000 units). */
-const BASE_REWARD_UNITS = 5_000_000; // 5 FIG
+	/** Inflation: base reward in smallest units (1 Figgie = 1 unit). */
+	const BASE_REWARD_UNITS = 1;
+	const REWARD_SYMBOL = "FIGGIES";
+	const REWARD_TOKEN_ID = "b1aa1f2da78048a6a2051db9";
+	const REWARD_BUCKET_ID = "cb3ef6bd1ab04a77bcf0cf78";
 
-/** Halve reward every N anchors. */
-const HALVING_INTERVAL = 1_000;
-
-/** Minimum reward after halvings (1 unit, effectively zero). */
-const MIN_REWARD = 1;
+	/** Halve reward every N anchors. */
+	const HALVING_INTERVAL = 1_000;
+	/** Minimum reward after halvings (1 unit, effectively zero). */
+	const MIN_REWARD = 1;
 
 // ── VDF binary paths ─────────────────────────────────────────────
 
@@ -197,6 +205,44 @@ async function buildAnchor(
     };
 
 	const id = (await store.create(ANCHOR_TYPE_KEY, JSON.stringify(fields))) as string;
+
+	// ── Mint Figgies reward to miner ──────────────────────────────
+	if (opts.rewardPubkey && reward > 0) {
+		try {
+			const bucketActor = ctx.objectActor(REWARD_BUCKET_ID);
+			const heads = await bucketActor.getHeads();
+			const parentId = heads[0];
+
+			const coinOp: CoinOp = {
+				kind: "create",
+				coinId: randomUUID().replace(/-/g, "").slice(0, 16),
+				ownerPubkey: opts.rewardPubkey,
+				amount: String(reward),
+			};
+
+			const mintChange = buildCoinOpChange({
+				bucketId: REWARD_BUCKET_ID,
+				parentIds: [hexDecode(parentId)],
+				timestamp: Date.now(),
+				author: "anchor-reward",
+				op: coinOp,
+				blockId: randomUUID().replace(/-/g, "").slice(0, 16),
+			});
+
+			const mintB64 = Buffer.from(encodeChange(mintChange)).toString("base64");
+			const { changeB64: signedMintB64 } = await ctx.dispatchProgram("/wallet", "signChange", [{
+				name: "default",
+				changeB64: mintB64,
+				nonce: 1,
+				fee: 1,
+			}]) as { changeB64: string };
+
+			await bucketActor.pushChanges(signedMintB64);
+		} catch (err: any) {
+			console.warn(`[anchor] reward mint failed: ${err?.message ?? err}`);
+		}
+	}
+
 	return { id, root, commits, reward };
 }
 
@@ -306,7 +352,7 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 				print(dim("  height:  ") + String(height));
 				print(dim("  root:    ") + root.slice(0, 24) + "…");
 				print(dim("  commits: ") + commits.length + " object head(s)");
-				print(dim("  reward:  ") + (reward / 1_000_000).toFixed(6) + " FIG");
+				print(dim("  reward:  ") + reward + " " + REWARD_SYMBOL);
 				if (vdfProof) print(dim("  vdf:     ") + "verified");
 				if (plotProof) print(dim("  plot:    ") + `quality=${plotQuality ?? 0}`);
 				if (previousId) print(dim("  prev:    ") + previousId);
@@ -349,7 +395,7 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 			const rewardAmount = String(fields.reward_amount?.stringValue ?? fields.reward_amount ?? "0");
 			if (vdfOutput) print(dim("  VDF proof:     ") + "included");
 			if (plotQuality > 0) print(dim("  plot quality:  ") + plotQuality);
-			print(dim("  next reward:   ") + (computeReward(latest.height + 1) / 1_000_000).toFixed(6) + " FIG");
+			print(dim("  next reward:   ") + computeReward(latest.height + 1) + " " + REWARD_SYMBOL);
 
 			let totalObjects = 0;
 			for (const typeKey of TRACKED_TYPES) {
@@ -388,7 +434,7 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 			print(dim("  previous: ") + (previous || "(genesis)"));
 			print(dim("  time:     ") + new Date(timestamp).toLocaleString());
 			print(dim("  commits:  ") + commitCount);
-			print(dim("  reward:   ") + (Number(rewardAmount) / 1_000_000).toFixed(6) + " FIG");
+			print(dim("  reward:   ") + rewardAmount + " " + REWARD_SYMBOL);
 			if (rewardPubkey) print(dim("  reward to:") + rewardPubkey.slice(0, 24) + "…");
 			if (vdfOutput) print(dim("  VDF:      ") + "included");
 			if (plotQuality > 0) print(dim("  quality:  ") + plotQuality);
@@ -447,7 +493,7 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 				`    ${cyan("anchor info")} ${dim("<id>")}         full anchor details + Merkle verify`,
 				`    ${cyan("anchor verify")} ${dim("<id>")}        verify Merkle root + VDF proof`,
 				dim(`  Auto-anchors every ${AUTO_ANCHOR_MS / 1000}s.`),
-				dim(`  Inflation: ${BASE_REWARD_UNITS / 1_000_000} FIG/base, halving every ${HALVING_INTERVAL} anchors.`),
+			dim(`  Inflation: ${BASE_REWARD_UNITS} ${REWARD_SYMBOL}/base, halving every ${HALVING_INTERVAL} anchors.`),
 			].join("\n"));
 		}
 	}

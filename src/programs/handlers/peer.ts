@@ -25,19 +25,24 @@ import { dim, bold, cyan, red, green, yellow, magenta } from "../shared.js";
 
 // ── Types ────────────────────────────────────────────────────────
 
-export interface PeerRecord {
-	id: string;
-	display_name: string;
-	kind: string;
-	trust_level: string;
-	discord_id?: string;
-	email?: string;
-	notes?: string;
-}
+	export interface PeerRecord {
+		id: string;
+		display_name: string;
+		kind: string;
+		trust_level: string;
+		identity_pubkey?: string;
+		endpoints?: string;
+		preferred_transport?: string;
+		key_verified_at?: string;
+		attestations?: string;
+		discord_id?: string;
+		email?: string;
+		notes?: string;
+	}
 
 // Recognised field keys for peer objects. Any other field is ignored by
 // the read path but preserved on disk.
-const PEER_FIELDS = ["display_name", "kind", "trust_level", "discord_id", "email", "notes"] as const;
+	const PEER_FIELDS = ["display_name", "kind", "trust_level", "identity_pubkey", "endpoints", "preferred_transport", "key_verified_at", "attestations", "discord_id", "email", "notes"] as const;
 
 // ── Helpers ──────────────────────────────────────────────────────
 
@@ -48,17 +53,22 @@ function extractString(v: any): string | undefined {
 	return undefined;
 }
 
-function recordFromState(id: string, fields: Record<string, any>): PeerRecord {
-	return {
-		id,
-		display_name: extractString(fields?.display_name) ?? "",
-		kind: extractString(fields?.kind) ?? "human",
-		trust_level: extractString(fields?.trust_level) ?? "stranger",
-		discord_id: extractString(fields?.discord_id),
-		email: extractString(fields?.email),
-		notes: extractString(fields?.notes),
-	};
-}
+	function recordFromState(id: string, fields: Record<string, any>): PeerRecord {
+		return {
+			id,
+			display_name: extractString(fields?.display_name) ?? "",
+			kind: extractString(fields?.kind) ?? "human",
+			trust_level: extractString(fields?.trust_level) ?? "stranger",
+			identity_pubkey: extractString(fields?.identity_pubkey),
+			endpoints: extractString(fields?.endpoints),
+			preferred_transport: extractString(fields?.preferred_transport),
+			key_verified_at: extractString(fields?.key_verified_at),
+			attestations: extractString(fields?.attestations),
+			discord_id: extractString(fields?.discord_id),
+			email: extractString(fields?.email),
+			notes: extractString(fields?.notes),
+		};
+	}
 
 function trustColor(level: string): (s: string) => string {
 	switch (level) {

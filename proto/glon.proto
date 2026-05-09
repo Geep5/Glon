@@ -339,3 +339,31 @@ message ValueMap {
 message ValueList {
   repeated Value items = 1;
 }
+
+
+// ── Transport Layer ──────────────────────────────────────────────
+//
+// Transport-agnostic envelope for moving opaque bytes between
+// Glon instances. Transports carry Envelope bytes; the router
+// dispatches by content_type. No gossip, no consensus — just
+// signed payloads moved over whatever pipe is available.
+
+message TransportEnvelope {
+  string content_type = 1;        // e.g. "glon/change-bundle", "glon/text"
+  bytes payload = 2;              // content-type-specific bytes
+  bytes sender_pubkey = 3;        // optional convenience for receiver lookup
+  map<string, string> metadata = 4;
+}
+
+// A bundle of Changes for import. No id, no hash — the Changes
+// inside are individually content-addressed. The bundle is a
+// transient wrapper that ceases to exist after dispatch.
+message ChangeBundle {
+  repeated bytes changes = 1;     // each is a serialized Change proto
+}
+
+// A lightweight text message for agent-to-agent chat.
+// Carried in TransportEnvelope with content_type="glon/text".
+message TextMessage {
+  string text = 1;
+}
