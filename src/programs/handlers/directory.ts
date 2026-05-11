@@ -709,6 +709,16 @@ const actorDef: ProgramActorDef = {
 			},
 		},
 		tick: { description: "Force the watcher tick.", inputSchema: { type: "object", properties: {} }, handler: async (ctx) => { await doTick(ctx); return { ok: true }; } },
+		handleAnnounce: {
+			description: "Process an incoming peer announce envelope.",
+			inputSchema: { type: "object", required: ["envelope_b64"], properties: { envelope_b64: { type: "string" }, content_type: { type: "string" }, from: { type: "string" } } },
+			handler: async (ctx, input: any) => {
+				const payload = Buffer.from(input.envelope_b64, "base64");
+				const envelope = { payload, metadata: {} };
+				const blobMeta = { fromEndpoint: input.from };
+				return await handleAnnounce(ctx, envelope, blobMeta);
+			},
+		},
 	},
 };
 
