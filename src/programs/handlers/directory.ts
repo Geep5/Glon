@@ -500,6 +500,22 @@ async function doTick(ctx: ProgramContext) {
 	const state = ctx.state;
 	const now = Date.now();
 
+	// Ensure we're joined to the directory topic. Idempotent in
+	// /transport-hyperswarm. Self-heals when the directory's onCreate
+	// raced ahead of /transport-hyperswarm's load (the bootstrap loads
+	// programs alphabetically, so /directory starts before /transport-*).
+	if (!state._directoryTopicJoined) {
+		const topicHex = directoryTopic().toString("hex");
+		try {
+			await ctx.dispatchProgram("/transport-hyperswarm", "joinTopic", [{ topic: topicHex }]);
+			state._directoryTopicJoined = true;
+			ctx.print?.(dim(`[directory] joined topic ${topicHex.slice(0, 16)}...`));
+		} catch (err: any) {
+			// Will retry on the next tick.
+			ctx.print?.(dim(`[directory] joinTopic retry pending: ${err?.message ?? String(err)}`));
+		}
+	}
+
 	// Announce ourselves.
 	const lastAnnounce = state._lastAnnounceAt ?? 0;
 	if (now - lastAnnounce >= announceIntervalS() * 1000) {
@@ -640,12 +656,16 @@ const actorDef: ProgramActorDef = {
 			return;
 		}
 		// Join the directory topic so we get other peers' announces.
+		// If /transport-hyperswarm hasn't loaded yet (bootstrap loads
+		// alphabetically so /directory starts first), the onTick watcher
+		// retries every 30s.
 		const topicHex = directoryTopic().toString("hex");
 		try {
 			await ctx.dispatchProgram("/transport-hyperswarm", "joinTopic", [{ topic: topicHex }]);
+			ctx.state!._directoryTopicJoined = true;
 			ctx.print?.(dim(`[directory] joined topic ${topicHex.slice(0, 16)}...`));
 		} catch (err: any) {
-			ctx.print?.(red(`[directory] failed to join topic: ${err?.message ?? String(err)}`));
+			ctx.print?.(yellow(`[directory] joinTopic deferred to tick: ${err?.message ?? String(err)}`));
 		}
 	},
 	tickMs: TICK_MS,
