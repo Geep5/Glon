@@ -188,6 +188,40 @@ const actorDef: ProgramActorDef = {
 			handler: async () => statusSnapshot(),
 		},
 	},
+	// Plain actions bridge — dispatchProgram / dispatchActorAction only
+	// look at `actions`, not `typedActions`.
+	actions: {
+		send: async (ctx, input) => {
+			const ta = actorDef.typedActions?.send;
+			if (!ta) throw new Error("send typedAction missing");
+			return await ta.handler(ctx.state, input as SendInput, ctx);
+		},
+		broadcast: async (ctx, input) => {
+			const ta = actorDef.typedActions?.broadcast;
+			if (!ta) throw new Error("broadcast typedAction missing");
+			return await ta.handler(ctx.state, input as BroadcastInput, ctx);
+		},
+		joinTopic: async (ctx, input) => {
+			const ta = actorDef.typedActions?.joinTopic;
+			if (!ta) throw new Error("joinTopic typedAction missing");
+			return await ta.handler(ctx.state, input as JoinTopicInput, ctx);
+		},
+		leaveTopic: async (ctx, input) => {
+			const ta = actorDef.typedActions?.leaveTopic;
+			if (!ta) throw new Error("leaveTopic typedAction missing");
+			return await ta.handler(ctx.state, input as JoinTopicInput, ctx);
+		},
+		inbox_drain: async (ctx, _input) => {
+			const ta = actorDef.typedActions?.inbox_drain;
+			if (!ta) throw new Error("inbox_drain typedAction missing");
+			return await ta.handler(ctx.state, ctx);
+		},
+		status: async (ctx, _input) => {
+			const ta = actorDef.typedActions?.status;
+			if (!ta) throw new Error("status typedAction missing");
+			return await ta.handler(ctx.state, ctx);
+		},
+	},
 };
 
 const program: ProgramDef = { handler, actor: actorDef };
