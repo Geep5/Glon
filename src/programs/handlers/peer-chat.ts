@@ -125,33 +125,37 @@ async function resolveSelfIdentity(ctx: ProgramContext): Promise<string> {
 	} catch { return ""; }
 }
 
-/** Find a peered /peer record by identity_pubkey, peer_id, or display_name. Refuses non-peered. */
-async function resolvePeerForChat(
-	ctx: ProgramContext,
-	ref: { peer_id?: string; identity_pubkey?: string; display_name?: string },
-): Promise<{ peer_id: string; identity_pubkey: string; hyperswarm_pubkey: string; display_name: string }> {
-	const all = await ctx.dispatchProgram("/peer", "list", [{}]) as Array<any>;
-	const peers = Array.isArray(all) ? all : [];
-	let match: any | undefined;
-	if (ref.peer_id) match = peers.find((p) => p.id === ref.peer_id);
-	if (!match && ref.identity_pubkey) match = peers.find((p) => (p.identity_pubkey ?? "").toLowerCase() === ref.identity_pubkey!.toLowerCase());
-	if (!match && ref.display_name) {
-		const lower = ref.display_name.toLowerCase();
-		match = peers.find((p) => (p.display_name ?? "").toLowerCase() === lower);
+	/** Find a peered /peer record by identity_pubkey, peer_id, or display_name. Refuses non-peered. */
+	async function resolvePeerForChat(
+		ctx: ProgramContext,
+		ref: { peer_id?: string; identity_pubkey?: string; display_name?: string },
+	): Promise<{ peer_id: string; identity_pubkey: string; hyperswarm_pubkey: string; display_name: string }> {
+		const all = await ctx.dispatchProgram("/peer", "list", [{}]) as Array<any>;
+		const peers = Array.isArray(all) ? all : [];
+
+		// Collect candidates that match any provided ref field, then prefer peered.
+		const candidates = peers.filter((p) => {
+			if (ref.peer_id && p.id === ref.peer_id) return true;
+			if (ref.identity_pubkey && (p.identity_pubkey ?? "").toLowerCase() === ref.identity_pubkey.toLowerCase()) return true;
+			if (ref.display_name && (p.display_name ?? "").toLowerCase() === ref.display_name.toLowerCase()) return true;
+			return false;
+		});
+
+		const match = candidates.find((p) => isPeered(p.trust_level)) ?? candidates[0];
+
+		if (!match) throw new Error(`peer-chat: no peer matches ${JSON.stringify(ref)}. Have you peered with them? Try /directory list.`);
+		if (!isPeered(match.trust_level)) {
+			throw new Error(`peer-chat: peer "${match.display_name}" is at trust=${match.trust_level}; need a peered trust level. Run /directory peer ${(match.identity_pubkey ?? "").slice(0, 16)} first.`);
+		}
+		if (!match.identity_pubkey) throw new Error(`peer-chat: peer "${match.display_name}" has no identity_pubkey on record (can't address)`);
+		if (!match.hyperswarm_pubkey) throw new Error(`peer-chat: peer "${match.display_name}" has no hyperswarm_pubkey yet — wait for their next announce.`);
+		return {
+			peer_id: match.id,
+			identity_pubkey: match.identity_pubkey,
+			hyperswarm_pubkey: match.hyperswarm_pubkey,
+			display_name: match.display_name ?? match.id,
+		};
 	}
-	if (!match) throw new Error(`peer-chat: no peer matches ${JSON.stringify(ref)}. Have you peered with them? Try /directory list.`);
-	if (!isPeered(match.trust_level)) {
-		throw new Error(`peer-chat: peer "${match.display_name}" is at trust=${match.trust_level}; need a peered trust level. Run /directory peer ${(match.identity_pubkey ?? "").slice(0, 16)} first.`);
-	}
-	if (!match.identity_pubkey) throw new Error(`peer-chat: peer "${match.display_name}" has no identity_pubkey on record (can't address)`);
-	if (!match.hyperswarm_pubkey) throw new Error(`peer-chat: peer "${match.display_name}" has no hyperswarm_pubkey yet — wait for their next announce.`);
-	return {
-		peer_id: match.id,
-		identity_pubkey: match.identity_pubkey,
-		hyperswarm_pubkey: match.hyperswarm_pubkey,
-		display_name: match.display_name ?? match.id,
-	};
-}
 
 /** Push a new message into a conversation; create the conversation if it doesn't exist. */
 function appendMessage(state: Record<string, any>, peer: {
