@@ -36,10 +36,15 @@ export function getGlonRoot(): string {
 	return GLON_ROOT;
 }
 
+let hasMigrated = false;
+
 /** Ensure the storage directories exist, then migrate any flat-layout files. */
 export function initDisk(): void {
 	mkdirSync(CHANGES_DIR, { recursive: true });
-	migrateFlatToNested();
+	if (!hasMigrated) {
+		hasMigrated = true;
+		migrateFlatToNested();
+	}
 }
 
 // ── Migration ─────────────────────────────────────────────────────
