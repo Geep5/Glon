@@ -533,44 +533,48 @@ async function requestPeering(ctx: ProgramContext, input: { hyperswarm_pubkey?: 
 	return { request_id };
 }
 
-async function acceptRequest(ctx: ProgramContext, requestId: string): Promise<{ ok: true }> {
-	const state = ctx.state;
-	const req = (state.requests as Record<string, PendingRequest> | undefined)?.[requestId];
-	if (!req) throw new Error(`unknown request: ${requestId}`);
-	if (req.direction !== "incoming") throw new Error("acceptRequest: not an incoming request");
-	if (req.status !== "waiting") throw new Error(`request is in state ${req.status}`);
+	async function acceptRequest(ctx: ProgramContext, requestId: string): Promise<{ ok: true }> {
+		const state = ctx.state;
+		const req = (state.requests as Record<string, PendingRequest> | undefined)?.[requestId];
+		if (!req) throw new Error(`unknown request: ${requestId}`);
+		if (req.direction !== "incoming") throw new Error("acceptRequest: not an incoming request");
+		if (req.status === "accepted") return { ok: true };
+		if (req.status === "declined") throw new Error("request was already declined");
+		if (req.status !== "waiting" && req.status !== "timed_out") {
+			throw new Error(`request is in unexpected state ${req.status}`);
+		}
 
-	const { identity_pubkey: myId } = await resolveSelfIdentity(ctx);
-	const body = {
-		request_id: requestId,
-		identity_pubkey: myId,
-		hyperswarm_pubkey: swarmIsReady() ? getHyperswarmPublicKeyHex() : "",
-	};
-	const payload_b64 = Buffer.from(JSON.stringify(body)).toString("base64");
-	await ctx.dispatchProgram("/transport-hyperswarm", "send", [{
-		endpoint: `swarm://${req.peer_hyperswarm_pubkey}`,
-		payload_b64,
-		content_type: PEER_ACCEPT_CONTENT_TYPE,
-		metadata: { request_id: requestId },
-	}]);
+		const { identity_pubkey: myId } = await resolveSelfIdentity(ctx);
+		const body = {
+			request_id: requestId,
+			identity_pubkey: myId,
+			hyperswarm_pubkey: swarmIsReady() ? getHyperswarmPublicKeyHex() : "",
+		};
+		const payload_b64 = Buffer.from(JSON.stringify(body)).toString("base64");
+		await ctx.dispatchProgram("/transport-hyperswarm", "send", [{
+			endpoint: `swarm://${req.peer_hyperswarm_pubkey}`,
+			payload_b64,
+			content_type: PEER_ACCEPT_CONTENT_TYPE,
+			metadata: { request_id: requestId },
+		}]);
 
-	req.status = "accepted";
-	state.requests[requestId] = req;
-	const existing = (state.discovered as Record<string, DiscoveredPeer> | undefined)?.[req.peer_identity_pubkey];
-	await upsertPeer(ctx, {
-		identity_pubkey: req.peer_identity_pubkey,
-		hyperswarm_pubkey: req.peer_hyperswarm_pubkey,
-		agent_name: req.peer_agent_name,
-		trust_level: "trusted",
-		existing_peer_object_id: existing?.peer_object_id,
-	});
-	// Persist BEFORE notifying — losing the "accepted" status would leave
-	// us showing a stale "waiting" pill while the counterparty thinks
-	// we've already trusted them.
-	await persistIfChanged(state, ctx);
-	await notifyUser(ctx, `Peered with ${req.peer_agent_name}. You can now trade.`);
-	return { ok: true };
-}
+		req.status = "accepted";
+		state.requests[requestId] = req;
+		const existing = (state.discovered as Record<string, DiscoveredPeer> | undefined)?.[req.peer_identity_pubkey];
+		await upsertPeer(ctx, {
+			identity_pubkey: req.peer_identity_pubkey,
+			hyperswarm_pubkey: req.peer_hyperswarm_pubkey,
+			agent_name: req.peer_agent_name,
+			trust_level: "trusted",
+			existing_peer_object_id: existing?.peer_object_id,
+		});
+		// Persist BEFORE notifying — losing the "accepted" status would leave
+		// us showing a stale "waiting" pill while the counterparty thinks
+		// we've already trusted them.
+		await persistIfChanged(state, ctx);
+		await notifyUser(ctx, `Peered with ${req.peer_agent_name}. You can now trade.`);
+		return { ok: true };
+	}
 
 async function declineRequest(ctx: ProgramContext, requestId: string, reason: "declined" | "approval_timeout" = "declined"): Promise<{ ok: true }> {
 	const state = ctx.state;
