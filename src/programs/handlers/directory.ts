@@ -235,12 +235,25 @@ async function resolveSelfIdentity(ctx: ProgramContext): Promise<{ identity_pubk
 		const info = await ctx.dispatchProgram("/wallet", "show", ["default"]) as { pubkey?: string } | null;
 		identity_pubkey = info?.pubkey ?? "";
 	} catch { /* no wallet, no key */ }
-	// Agent name pulled from the local /agent record if present.
+	// Glon's "agent_name" on the wire is the human-meaningful label other
+	// peers see in their Network panel. We name it after this daemon's
+	// FIRST agent (id-sorted, oldest UUIDv4 first — deterministic across
+	// restarts as long as the agent isn't deleted). Previous code called
+	// "/agent list" which doesn't exist, silently caught the error, and
+	// fell back to the hardcoded "glon" — which is why every glon on the
+	// network looked identical.
+	//
+	// Falls back to "glon" only if there are literally no agent objects in
+	// the DAG yet. UIs append a short identity_pubkey hash anyway so two
+	// peers with the same agent name remain distinguishable.
 	let agent_name = "glon";
 	try {
-		const agents = await ctx.dispatchProgram("/agent", "list", []) as Array<{ name?: string }> | undefined;
-		if (Array.isArray(agents) && agents[0]?.name) agent_name = String(agents[0].name);
-	} catch { /* fine */ }
+		const result = await ctx.dispatchProgram("/crud", "list", ["agent"]) as { objects?: Array<{ id: string; typeKey?: string; name?: string; deleted?: boolean }> } | null;
+		const agents = (result?.objects ?? [])
+			.filter((o) => o?.typeKey === "agent" && !o.deleted && typeof o.name === "string" && o.name.length > 0)
+			.sort((a, b) => String(a.id).localeCompare(String(b.id)));
+		if (agents.length > 0 && agents[0].name) agent_name = agents[0].name as string;
+	} catch { /* no /crud, or empty DAG — keep fallback */ }
 	return { identity_pubkey, agent_name };
 }
 
