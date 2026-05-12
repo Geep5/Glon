@@ -164,25 +164,34 @@ async function upsertPeer(ctx: ProgramContext, opts: {
 	existing_peer_object_id?: string;
 }): Promise<string | null> {
 	try {
-		// We index peers locally by identity_pubkey since that's the stable
-		// chain identity; hyperswarm_pubkey is a (potentially rotating)
-		// network handle.
+		// Index by identity_pubkey — the stable chain identity. Even if the
+		// caller doesn't remember an existing peer_object_id (e.g. because
+		// state.discovered hadn't been populated yet on a fresh restart),
+		// /peer findOrCreate dedupes by the external key so we never create
+		// a second row for the same identity.
 		let peerId: string | null = opts.existing_peer_object_id ?? null;
+		let createdNow = false;
 		if (!peerId) {
-			const created = await ctx.dispatchProgram("/peer", "add", [{
-				display_name: opts.agent_name,
-				kind: "agent",
-				trust_level: opts.trust_level,
-				identity_pubkey: opts.identity_pubkey,
-			}]) as { id?: string } | null;
-			peerId = created?.id ?? null;
+			const found = await ctx.dispatchProgram("/peer", "findOrCreate", [{
+				external_key: "identity_pubkey",
+				external_value: opts.identity_pubkey,
+				defaults: {
+					display_name: opts.agent_name,
+					kind: "agent",
+					trust_level: opts.trust_level,
+				},
+			}]) as { id?: string; created?: boolean } | null;
+			peerId = found?.id ?? null;
+			createdNow = !!found?.created;
 		}
 		if (peerId) {
 			await ctx.dispatchProgram("/peer", "setField", [peerId, "hyperswarm_pubkey", opts.hyperswarm_pubkey]);
 			await ctx.dispatchProgram("/peer", "setField", [peerId, "last_seen", String(Date.now())]);
-			if (opts.existing_peer_object_id) {
-				// Bump trust if going from discovered → trusted.
-				await ctx.dispatchProgram("/peer", "setTrust", [peerId, opts.trust_level]);
+			// Promote-only: only call setTrust when we're upgrading to
+			// "trusted". Never write "discovered" over an existing record —
+			// that would silently downgrade trusted peers on every announce.
+			if (!createdNow && opts.trust_level === "trusted") {
+				await ctx.dispatchProgram("/peer", "setTrust", [peerId, "trusted"]);
 			}
 		}
 		return peerId;
@@ -768,6 +777,57 @@ const actorDef: ProgramActorDef = {
 				const envelope = { payload, metadata: {} };
 				const blobMeta = { fromEndpoint: input.from };
 				return await handlePeerDecline(ctx, envelope, blobMeta);
+			},
+		},
+		cleanupPeerDuplicates: {
+			description: "Consolidate duplicate /peer rows that share an identity_pubkey. Keeps one survivor per identity (preferring trusted > family > friend > discovered > stranger; ties broken by id alpha order) and soft-deletes the rest. Optionally pass {dryRun:true} to see what WOULD be removed without changing anything.",
+			inputSchema: { type: "object", properties: { dryRun: { type: "boolean" } } },
+			handler: async (ctx, input: { dryRun?: boolean } = {}) => {
+				const dryRun = !!input?.dryRun;
+				const all = await ctx.dispatchProgram("/peer", "list", [{}]) as any[];
+				// Group by identity_pubkey; ignore peers that lack one (humans
+				// added by hand may not have an identity yet).
+				const byIdentity = new Map<string, any[]>();
+				for (const p of all ?? []) {
+					const id = p?.identity_pubkey;
+					if (!id) continue;
+					const arr = byIdentity.get(id) ?? [];
+					arr.push(p);
+					byIdentity.set(id, arr);
+				}
+				const TRUST_RANK: Record<string, number> = { self: 100, family: 80, friend: 60, trusted: 50, discovered: 30, stranger: 10 };
+				const summary: Array<{ identity_pubkey: string; kept: string; kept_trust: string; removed: string[] }> = [];
+				let removedCount = 0;
+				for (const [idKey, group] of byIdentity) {
+					if (group.length <= 1) continue;
+					// Pick survivor: highest trust rank, then lex-smallest id.
+					group.sort((a, b) => {
+						const ra = TRUST_RANK[a.trust_level] ?? 0;
+						const rb = TRUST_RANK[b.trust_level] ?? 0;
+						if (ra !== rb) return rb - ra;
+						return String(a.id).localeCompare(String(b.id));
+					});
+					const survivor = group[0];
+					const losers = group.slice(1);
+					summary.push({
+						identity_pubkey: idKey,
+						kept: survivor.id,
+						kept_trust: survivor.trust_level,
+						removed: losers.map((l) => l.id),
+					});
+					if (!dryRun) {
+						for (const l of losers) {
+							try { await ctx.dispatchProgram("/peer", "remove", [{ peer_id: l.id }]); removedCount++; }
+							catch (err: any) { ctx.print?.(dim(`  [directory] cleanup remove failed for ${l.id}: ${err?.message ?? String(err)}`)); }
+						}
+					}
+				}
+				return {
+					dryRun,
+					duplicate_groups: summary.length,
+					removed: dryRun ? summary.reduce((n, g) => n + g.removed.length, 0) : removedCount,
+					groups: summary,
+				};
 			},
 		},
 	},
