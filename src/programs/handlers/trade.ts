@@ -26,6 +26,7 @@
 
 import type { ProgramDef, ProgramContext, ProgramActorDef } from "../runtime.js";
 import { registerContentHandler } from "../runtime.js";
+import { isPeered } from "./peer.js";
 import { dim, bold, cyan, green, red, yellow } from "../shared.js";
 import { encodeTransportEnvelope, decodeTransportEnvelope, encodeChangeBundle, decodeChangeBundle, encodeChange, decodeChange } from "../../proto.js";
 import { hexEncode, hexDecode } from "../../crypto.js";
@@ -693,7 +694,10 @@ async function resolvePeer(ctx: ProgramContext, ref: string): Promise<ResolvedPe
 		|| (p.display_name ?? "").toLowerCase() === lower
 	);
 	if (!match) throw new Error(`peer not found: "${ref}". Try /directory list and /directory peer first.`);
-	if (match.trust_level !== "trusted") throw new Error(`peer "${match.display_name ?? ref}" is not trusted yet. Run \`/directory peer ${match.identity_pubkey?.slice(0, 16) ?? ref}\` and wait for them to accept.`);
+	// Use isPeered() (not strict equality) so manually-promoted peers at
+	// "friend" / "family" / "self" still pass — trust RAISES capabilities,
+	// it must never silently revoke them.
+	if (!isPeered(match.trust_level)) throw new Error(`peer "${match.display_name ?? ref}" is not trusted yet (level=${match.trust_level}). Run \`/directory peer ${match.identity_pubkey?.slice(0, 16) ?? ref}\` and wait for them to accept.`);
 	if (!match.hyperswarm_pubkey) throw new Error(`peer "${match.display_name ?? ref}" has no hyperswarm_pubkey — they may need to announce on the directory again.`);
 	return {
 		peer_id: match.id,
@@ -784,7 +788,7 @@ async function handleIncomingOffer(ctx: ProgramContext, envelope: { contentType:
 	try {
 		const all = await ctx.dispatchProgram("/peer", "list", []) as Array<any>;
 		const match = all.find((p) => (p.hyperswarm_pubkey ?? "").toLowerCase() === senderHyperswarmPubkey);
-		if (match && match.trust_level === "trusted") {
+		if (match && isPeered(match.trust_level)) {
 			peer = {
 				peer_id: match.id,
 				identity_pubkey: match.identity_pubkey ?? "",

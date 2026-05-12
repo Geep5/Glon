@@ -24,7 +24,7 @@
 // hold, so the worst case is a "phished peer-with" that goes nowhere.
 
 import type { ProgramDef, ProgramContext, ProgramActorDef } from "../runtime.js";
-import { registerContentHandler } from "../runtime.js";
+import { registerActorContentHandler } from "../runtime.js";
 import { dim, bold, cyan, green, red, yellow } from "../shared.js";
 import {
 	isReady as swarmIsReady,
@@ -203,7 +203,22 @@ async function upsertPeer(ctx: ProgramContext, opts: {
 
 // ── Announce loop ────────────────────────────────────────────────
 
+/**
+ * On-wire shape of a peer-announce envelope payload.
+ *
+ * Forward-compat rules:
+ *   - protocol_version is set by every sender, read by every receiver.
+ *     v1 receivers MUST accept higher versions as long as the required
+ *     v1 fields are present (additive evolution).
+ *   - Receivers MUST tolerate unknown fields — JSON.parse drops them in,
+ *     don't strip them on re-encode if you ever do.
+ *   - To make a BREAKING change (e.g. signed announces, schema diff),
+ *     bump protocol_version and ship parallel handling for the duration
+ *     of the migration. NEVER reuse an old field name with new semantics.
+ */
+const ANNOUNCE_PROTOCOL_VERSION = 1;
 interface PeerAnnounceBody {
+	protocol_version?: number;          // optional only for back-compat reads of pre-v1 announces.
 	identity_pubkey: string;
 	hyperswarm_pubkey: string;
 	agent_name: string;
@@ -234,6 +249,7 @@ async function broadcastAnnounce(ctx: ProgramContext): Promise<{ sent: number; s
 	const hyperswarm_pubkey = getHyperswarmPublicKeyHex();
 	const { identity_pubkey, agent_name } = await resolveSelfIdentity(ctx);
 	const body: PeerAnnounceBody = {
+		protocol_version: ANNOUNCE_PROTOCOL_VERSION,
 		identity_pubkey,
 		hyperswarm_pubkey,
 		agent_name,
@@ -265,6 +281,16 @@ async function handleAnnounce(ctx: ProgramContext, envelope: { payload: Uint8Arr
 	if (!body.hyperswarm_pubkey) return false;
 	// Ignore our own announces.
 	if (swarmIsReady() && body.hyperswarm_pubkey === getHyperswarmPublicKeyHex()) return true;
+	// Forward-compat: accept higher protocol_versions as long as the
+	// required v1 fields parsed. Log once per session so we notice if a
+	// peer is on a newer schema and we should consider upgrading.
+	if (typeof body.protocol_version === "number" && body.protocol_version > ANNOUNCE_PROTOCOL_VERSION) {
+		const state = ctx.state;
+		if (!state._sawHigherProtocolVersion) {
+			ctx.print?.(dim(`[directory] peer announced protocol_version=${body.protocol_version} (we're on ${ANNOUNCE_PROTOCOL_VERSION}). Parsing as v1.`));
+			state._sawHigherProtocolVersion = body.protocol_version;
+		}
+	}
 
 	const idKey = body.identity_pubkey || body.hyperswarm_pubkey; // key by identity if known, else hyperswarm
 	const state = ctx.state;
@@ -834,27 +860,20 @@ const actorDef: ProgramActorDef = {
 };
 
 // ── Content handler registrations ───────────────────────────────
+//
+// All four envelopes route through /directory's actor (see the typed
+// actions handleAnnounce / handlePeerRequest / handlePeerAccept /
+// handlePeerDecline above). registerActorContentHandler is the only
+// safe shape for handlers that mutate persisted state — it guarantees
+// the action runs with /directory's `ctx.state` and `ctx.programId`
+// instead of /transport-router's. Don't switch back to a raw
+// registerContentHandler here without re-reading the regression in
+// commit 5215330.
 
-registerContentHandler(PEER_ANNOUNCE_CONTENT_TYPE, async (envelope, ctx, blobMeta) => {
-	try { return await ctx.dispatchProgram("/directory", "handleAnnounce", [{ envelope_b64: Buffer.from(envelope.payload).toString("base64"), content_type: envelope.contentType, from: blobMeta?.fromEndpoint }]) as any; }
-	catch { return await handleAnnounce(ctx, envelope, blobMeta ?? {}); }
-});
-// All four content handlers route through /directory's actor via
-// dispatchProgram so the mutations land on /directory's state (not
-// the calling /transport-router's). Direct in-process invocation is a
-// last-resort fallback if the actor isn't running.
-registerContentHandler(PEER_REQUEST_CONTENT_TYPE, async (envelope, ctx, blobMeta) => {
-	try { return await ctx.dispatchProgram("/directory", "handlePeerRequest", [{ envelope_b64: Buffer.from(envelope.payload).toString("base64"), content_type: envelope.contentType, from: blobMeta?.fromEndpoint }]) as any; }
-	catch { return await handlePeerRequest(ctx, envelope, blobMeta ?? {}); }
-});
-registerContentHandler(PEER_ACCEPT_CONTENT_TYPE, async (envelope, ctx, blobMeta) => {
-	try { return await ctx.dispatchProgram("/directory", "handlePeerAccept", [{ envelope_b64: Buffer.from(envelope.payload).toString("base64"), content_type: envelope.contentType, from: blobMeta?.fromEndpoint }]) as any; }
-	catch { return await handlePeerAccept(ctx, envelope, blobMeta ?? {}); }
-});
-registerContentHandler(PEER_DECLINE_CONTENT_TYPE, async (envelope, ctx, blobMeta) => {
-	try { return await ctx.dispatchProgram("/directory", "handlePeerDecline", [{ envelope_b64: Buffer.from(envelope.payload).toString("base64"), content_type: envelope.contentType, from: blobMeta?.fromEndpoint }]) as any; }
-	catch { return await handlePeerDecline(ctx, envelope, blobMeta ?? {}); }
-});
+registerActorContentHandler(PEER_ANNOUNCE_CONTENT_TYPE, "/directory", "handleAnnounce");
+registerActorContentHandler(PEER_REQUEST_CONTENT_TYPE,  "/directory", "handlePeerRequest");
+registerActorContentHandler(PEER_ACCEPT_CONTENT_TYPE,   "/directory", "handlePeerAccept");
+registerActorContentHandler(PEER_DECLINE_CONTENT_TYPE,  "/directory", "handlePeerDecline");
 
 const program: ProgramDef = { handler, actor: actorDef };
 export default program;

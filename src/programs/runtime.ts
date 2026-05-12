@@ -410,7 +410,7 @@ async function compileModuleProgram(ms: ModuleSet, name: string): Promise<Progra
 			"det/ed25519.js": detEd25519,
 			"det/index.js": det,
 			"shared.js": sharedMod,
-			"runtime.js": { registerIndexHook, getIndexHook, registerAuthVerifier, getAuthVerifier, getValidator, isChainModeType, registerContentHandler, getContentHandler },
+			"runtime.js": { registerIndexHook, getIndexHook, registerAuthVerifier, getAuthVerifier, getValidator, isChainModeType, registerContentHandler, registerActorContentHandler, getContentHandler },
 			// swarm-host's hyperswarm instance is owned by the daemon; bundled
 			// programs reach it through this external instead of importing the
 			// hyperswarm npm package (which has native deps that can't bundle).
@@ -602,9 +602,83 @@ export type ContentHandlerFn = (
 
 const contentHandlers = new Map<string, ContentHandlerFn>();
 
-/** Register a handler for a content_type string (e.g. "glon/change-bundle"). */
+/**
+ * Register a handler for a content_type string (e.g. "glon/change-bundle").
+ *
+ * ⚠️  GOTCHA — the handler is invoked from `/transport-router`'s tick with
+ *     `/transport-router`'s `ctx`. Any `ctx.state` mutation lands on the
+ *     router's state, and `persistIfChanged`-style writes go to the router's
+ *     actor — NOT the program you think you're writing for. We hit this with
+ *     /directory's peer-request handlers (commit 5215330) and lost incoming
+ *     requests until envelopes were re-routed through /directory's actor.
+ *
+ * If your handler MUTATES PERSISTED STATE, prefer `registerActorContentHandler`
+ * below — it dispatches into your program's actor for you. Use the raw
+ * `registerContentHandler` only for stateless processing (e.g. logging,
+ * routing-by-metadata to another program).
+ */
 export function registerContentHandler(contentType: string, fn: ContentHandlerFn): void {
 	contentHandlers.set(contentType, fn);
+}
+
+/**
+ * Register a content handler that ROUTES THROUGH an actor program's typed
+ * action — the only safe shape for handlers that mutate persisted state.
+ *
+ * On every incoming envelope of `contentType`, the router will call
+ * `ctx.dispatchProgram(programPrefix, action, [{ envelope_b64, content_type, from }])`
+ * which executes the action with the OWNING program's `ctx.state` and
+ * `ctx.programId`, so `persistIfChanged` writes land on the right actor.
+ *
+ * Requirements on the program side:
+ *   - Define a typed action with this input shape:
+ *       { envelope_b64: string; content_type?: string; from?: string }
+ *   - In the action body, base64-decode envelope_b64, parse JSON, then
+ *     update state and call your own persist helper.
+ *
+ * Example (in your program's actorDef.typedActions):
+ *
+ *     handleChat: {
+ *       inputSchema: { type: "object", required: ["envelope_b64"], properties: {
+ *         envelope_b64: { type: "string" },
+ *         content_type: { type: "string" },
+ *         from: { type: "string" },
+ *       }},
+ *       handler: async (ctx, input) => {
+ *         const body = JSON.parse(Buffer.from(input.envelope_b64, "base64").toString("utf8"));
+ *         ctx.state.messages = ctx.state.messages ?? [];
+ *         ctx.state.messages.push({ ...body, from: input.from });
+ *         await persistIfChanged(ctx.state, ctx);
+ *         return true;
+ *       },
+ *     },
+ *
+ * And the registration is one line:
+ *
+ *     registerActorContentHandler("glon/peer-chat", "/peer-chat", "handleChat");
+ */
+export function registerActorContentHandler(
+	contentType: string,
+	programPrefix: string,
+	action: string,
+): void {
+	contentHandlers.set(contentType, async (envelope, ctx, blobMeta) => {
+		try {
+			await ctx.dispatchProgram(programPrefix, action, [{
+				envelope_b64: Buffer.from(envelope.payload).toString("base64"),
+				content_type: envelope.contentType,
+				from: blobMeta?.fromEndpoint,
+			}]);
+			return true;
+		} catch (err: any) {
+			// Program not running, action missing, schema validation, etc.
+			// Drop the envelope rather than invoking anything with the wrong
+			// ctx — that's the exact failure mode this helper exists to
+			// prevent.
+			ctx.print?.(`[content-router] dispatch ${programPrefix}.${action} failed: ${err?.message ?? String(err)}`);
+			return false;
+		}
+	});
 }
 
 /** Get the handler for a content type (if any). */

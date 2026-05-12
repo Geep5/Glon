@@ -42,6 +42,25 @@ import { dim, bold, cyan, red, green, yellow, magenta } from "../shared.js";
 		last_seen?: string;
 	}
 
+/**
+ * Trust hierarchy (highest → lowest):
+ *   self    — this daemon's own identity
+ *   family  — human-marked highest-trust peer
+ *   friend  — human-marked second-highest
+ *   trusted — peered via /directory handshake (the default after peer-accept)
+ *   discovered — seen on the swarm but no handshake yet
+ *   stranger — default for /peer add with no trust set
+ *
+ * `isPeered()` is the gate every peer-to-peer feature should use (chat,
+ * trade, capability discovery). Strict equality on "trusted" is wrong —
+ * a peer manually upgraded to "family" should not lose access. Trust
+ * RAISES, never lowers, capabilities.
+ */
+export const PEER_TRUSTED_LEVELS: ReadonlySet<string> = new Set(["trusted", "friend", "family", "self"]);
+export function isPeered(trust_level: string | undefined | null): boolean {
+	return !!trust_level && PEER_TRUSTED_LEVELS.has(trust_level);
+}
+
 // Recognised field keys for peer objects. Any other field is ignored by
 // the read path but preserved on disk.
 //   hyperswarm_pubkey — current Noise pubkey learned via /directory announce.
