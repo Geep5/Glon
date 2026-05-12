@@ -17,6 +17,7 @@
 
 import type { ProgramDef, ProgramContext, ProgramActorDef } from "../runtime.js";
 import { registerActorContentHandler } from "../runtime.js";
+import { dim, bold, cyan, green, red, yellow } from "../shared.js";
 import { randomUUID } from "node:crypto";
 
 const PEER_TRUSTED_LEVELS = new Set(["trusted", "friend", "family", "self"]);
