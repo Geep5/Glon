@@ -284,6 +284,7 @@ async function handleAnnounce(ctx: ProgramContext, envelope: { payload: Uint8Arr
 		});
 		if (peerId) merged.peer_object_id = peerId;
 	}
+	await persistIfChanged(state, ctx);
 	return true;
 }
 
@@ -319,6 +320,10 @@ async function handlePeerRequest(ctx: ProgramContext, envelope: { payload: Uint8
 	state.requests[body.request_id] = req;
 
 	const minutes = Math.round(peerRequestApprovalTimeoutS() / 60);
+	// Persist BEFORE notifying — if the daemon crashes between the two,
+	// at least we'll surface the request on next startup. The /user-chat
+	// notify may also block; we don't want to lose the request behind it.
+	await persistIfChanged(state, ctx);
 	await notifyUser(
 		ctx,
 		[
@@ -361,6 +366,7 @@ async function handlePeerAccept(ctx: ProgramContext, envelope: { payload: Uint8A
 		existing_peer_object_id: existing?.peer_object_id,
 	});
 
+	await persistIfChanged(state, ctx);
 	await notifyUser(ctx, `${req.peer_agent_name} accepted your peer request. You can now trade.`);
 	return true;
 }
@@ -379,6 +385,7 @@ async function handlePeerDecline(ctx: ProgramContext, envelope: { payload: Uint8
 	req.status = "declined";
 	req.decline_reason = body.reason ?? "declined";
 	state.requests[req.request_id] = req;
+	await persistIfChanged(state, ctx);
 	const reasonText = req.decline_reason === "approval_timeout" ? " (no response in time)" : "";
 	await notifyUser(ctx, `${req.peer_agent_name} declined your peer request${reasonText}.`);
 	return true;
@@ -430,6 +437,10 @@ async function requestPeering(ctx: ProgramContext, input: { hyperswarm_pubkey?: 
 		approval_deadline: Date.now() + peerRequestApprovalTimeoutS() * 1000,
 		status: "waiting",
 	};
+	// Persist immediately — if the daemon restarts before doTick runs, the
+	// pending outgoing request would otherwise be lost (and the receiver's
+	// acceptance, when it arrives, would reference an unknown request_id).
+	await persistIfChanged(state, ctx);
 	return { request_id };
 }
 
@@ -464,6 +475,10 @@ async function acceptRequest(ctx: ProgramContext, requestId: string): Promise<{ 
 		trust_level: "trusted",
 		existing_peer_object_id: existing?.peer_object_id,
 	});
+	// Persist BEFORE notifying — losing the "accepted" status would leave
+	// us showing a stale "waiting" pill while the counterparty thinks
+	// we've already trusted them.
+	await persistIfChanged(state, ctx);
 	await notifyUser(ctx, `Peered with ${req.peer_agent_name}. You can now trade.`);
 	return { ok: true };
 }
@@ -490,6 +505,7 @@ async function declineRequest(ctx: ProgramContext, requestId: string, reason: "d
 	req.status = "declined";
 	req.decline_reason = reason;
 	state.requests[requestId] = req;
+	await persistIfChanged(state, ctx);
 	return { ok: true };
 }
 
