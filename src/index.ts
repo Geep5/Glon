@@ -1265,57 +1265,10 @@ export const app = setup({
 		// Load programs into the server process so RivetKit program actors can dispatch.
 		// The CLI (client.ts) also loads them, but the server needs its own copy of the
 		// actorInstances map since program actors run in this process.
+		// Skip program loading on main server — programs run in daemon only.
+		// This prevents duplicate actor instances and CPU load on the host.
 		setTimeout(async () => {
-			try {
-				const endpoint = `http://127.0.0.1:${MANAGER_PORT}`;
-				const client = createClient<typeof app>(endpoint);
-				const store = client.storeActor.getOrCreate(["root"]);
-				const { loadPrograms, startProgramActor } = await import("./programs/runtime.js");
-				const programs = await loadPrograms(store, client);
-				if (programs.length > 0) {
-					console.log(`[server] Loaded ${programs.length} programs.`);
-					for (const prog of programs) {
-						try {
-							const makeCtx = (state: Record<string, any>) => ({
-								client,
-								store,
-								resolveId: async (prefix: string) => {
-									const resolved = await store.resolvePrefix(prefix);
-									return resolved || null;
-								},
-								stringVal, intVal, floatVal, boolVal, mapVal, listVal, linkVal, displayValue,
-								listChangeFiles: () => [],
-								readChangeByHex: () => null,
-								hexEncode,
-								print: (msg: string) => console.log(msg),
-								style,
-								randomUUID: () => generateObjectId(),
-								state,
-								emit: () => {},
-								programId: prog.id,
-								objectActor: (id: string, opts?: any) => client.objectActor.getOrCreate([id], opts),
-								dispatchProgram: async (prefix: string, actionName: string, actionArgs: unknown[]) => {
-									const { getProgramActorByPrefix, dispatchActorAction: dispatch2 } = await import("./programs/runtime.js");
-									const inst = getProgramActorByPrefix(prefix);
-									if (!inst) throw new Error(`Program not running: ${prefix}`);
-									return await dispatch2(inst.programId, actionName, actionArgs, (s) => ({ ...makeCtx(s), programId: inst.programId }));
-								},
-								dispatchTypedAction: async (prefix: string, actionName: string, input: unknown) => {
-									const { getProgramActorByPrefix, dispatchActorAction: dispatch2 } = await import("./programs/runtime.js");
-									const inst = getProgramActorByPrefix(prefix);
-									if (!inst) throw new Error(`Program not running: ${prefix}`);
-									return await dispatch2(inst.programId, actionName, [input], (s) => ({ ...makeCtx(s), programId: inst.programId }));
-								},
-							});
-							await startProgramActor(prog, makeCtx, client);
-						} catch (err: any) {
-							console.warn(`[server] Failed to start ${prog.prefix}: ${err.message}`);
-						}
-					}
-				}
-			} catch (err: any) {
-				console.warn("[server] Program load failed:", err.message);
-			}
+			console.log("[server] Program loading skipped — programs run in daemon.");
 		}, 2000);
 	}
 
