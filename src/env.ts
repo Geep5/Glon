@@ -18,7 +18,8 @@
  */
 
 import { readFileSync, existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { resolve, join } from "node:path";
+import { homedir } from "node:os";
 
 function parse(source: string): Record<string, string> {
 	const out: Record<string, string> = {};
@@ -60,3 +61,9 @@ export function loadEnv(path: string = resolve(process.cwd(), ".env")): void {
 }
 
 loadEnv();
+// Also load ~/.glon/secrets.env if present. This lives outside any
+// repo (and is mode 600 by convention) so it's a safer place for API
+// keys / wallet keys than a project-local .env that might accidentally
+// get committed. Local .env values still win (loaded first; loadEnv
+// doesn't overwrite existing keys).
+loadEnv(join(homedir(), ".glon", "secrets.env"));
