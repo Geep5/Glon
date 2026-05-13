@@ -39,11 +39,16 @@ interface DuelParticipant {
 	alpaca_symbol: string;          // e.g. "BTC/USD"
 	hyperliquid_coin: string;       // e.g. "BTC"
 	start_price_usd: number;
-	prediction: string;             // free-form agent reply
-	parsed_call?: "yours" | "theirs" | "tie" | "unknown";
-	parsed_confidence?: "low" | "medium" | "high" | "unknown";
 	final_price_usd?: number;
-	pct_return?: number;            // (final - start) / start
+	pct_return?: number;            // (final - start) / start, set at resolve
+}
+
+interface JudgeReply {
+	agent_id: string;
+	agent_name: string;             // name of the AGENT, not the asset
+	reasoning: string;               // free-form reply
+	parsed_vote?: string;            // an asset name ("BTC" / "ETH") or "tie" or "unknown"
+	parsed_confidence?: "low" | "medium" | "high" | "unknown";
 }
 
 interface Duel {
@@ -53,6 +58,15 @@ interface Duel {
 	status: "waiting" | "resolved" | "errored";
 	a: DuelParticipant;
 	b: DuelParticipant;
+	// Both agents vote NEUTRALLY (no bias toward their own asset). The
+	// agent_id in each judge entry identifies WHICH agent cast the vote;
+	// the .parsed_vote field is the ASSET NAME they voted for.
+	judges: JudgeReply[];
+	// Predicted winner from agreement: a or b if both judges voted the
+	// same asset, "tie" otherwise (including any disagreement or any
+	// judge voting "tie"). Computed at start time.
+	predicted_winner?: "a" | "b" | "tie";
+	// Factual winner set at /duel resolve based on actual 24h % return.
 	winner?: "a" | "b" | "tie";
 	error?: string;
 }
@@ -132,46 +146,79 @@ async function fetchPrice(ctx: ProgramContext, symbol: string): Promise<number> 
 	return r.price_usd;
 }
 
-/** Parse the last few lines of an agent reply for PREDICTION / CONFIDENCE
- *  markers. Tolerant — accepts either "yours/theirs/tie" or the asset
- *  name itself. */
-function parsePrediction(reply: string, yoursName: string, theirsName: string): { call: "yours"|"theirs"|"tie"|"unknown"; confidence: "low"|"medium"|"high"|"unknown" } {
+/** Parse VOTE + CONFIDENCE tail lines from a neutral-judge reply.
+ *  Tolerant — accepts the asset name in any casing, "tie", "even",
+ *  "flat", or "a"/"b" (legacy). Returns { vote: assetName | "tie" |
+ *  "unknown" }. */
+function parseJudgeVote(reply: string, assetA: string, assetB: string): { vote: string; confidence: "low"|"medium"|"high"|"unknown" } {
 	const lines = reply.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-	let call: "yours"|"theirs"|"tie"|"unknown" = "unknown";
+	const A = assetA.toLowerCase();
+	const B = assetB.toLowerCase();
+	let vote = "unknown";
 	let confidence: "low"|"medium"|"high"|"unknown" = "unknown";
-	const Y = yoursName.toLowerCase();
-	const T = theirsName.toLowerCase();
-	for (const line of lines.slice(-6)) {
-		const m1 = /^PREDICTION:\s*(.+)$/i.exec(line);
+	for (const line of lines.slice(-8)) {
+		const m1 = /^VOTE:\s*(.+)$/i.exec(line);
 		if (m1) {
 			const v = m1[1].trim().toLowerCase();
-			if (v === "yours" || v === Y) call = "yours";
-			else if (v === "theirs" || v === T) call = "theirs";
-			else if (v.startsWith("tie") || v === "even" || v === "flat") call = "tie";
+			if (v === A || v === "a") vote = assetA;
+			else if (v === B || v === "b") vote = assetB;
+			else if (v.startsWith("tie") || v === "even" || v === "flat") vote = "tie";
 		}
 		const m2 = /^CONFIDENCE:\s*(low|medium|high)/i.exec(line);
 		if (m2) confidence = m2[1].toLowerCase() as "low"|"medium"|"high";
 	}
-	return { call, confidence };
+	return { vote, confidence };
 }
 
-function buildDuelPrompt(p: { yours: { name: string; symbol: string; price: number }; theirs: { name: string; symbol: string; price: number }; horizon_h: number }): string {
-	return `You are in a ${p.horizon_h}-hour prediction duel.
+/** Pre-fetch all market data both judges will need. Hits Alpaca for
+ *  bars and Hyperliquid for mid + L2 book in parallel. Anything that
+ *  errors becomes a `null` so the prompt can still render. */
+async function gatherEvidence(ctx: ProgramContext, symbol: string, coin: string) {
+	const [barsRaw, midRaw, bookRaw] = await Promise.all([
+		ctx.dispatchProgram("/alpaca", "getBars", [{ symbol, timeframe: "1Hour", limit: 6 }]).catch(() => null) as Promise<any>,
+		ctx.dispatchProgram("/hyperliquid", "getPrice", [{ coin }]).catch(() => null) as Promise<any>,
+		ctx.dispatchProgram("/hyperliquid", "getOrderbook", [{ coin, depth: 5 }]).catch(() => null) as Promise<any>,
+	]);
+	const bars = (barsRaw as any)?.bars?.[symbol];
+	const hl_mid = (midRaw as any)?.mid_price;
+	const book = bookRaw as { bids?: Array<{ price: number; size: number }>; asks?: Array<{ price: number; size: number }> } | null;
+	return {
+		bars: Array.isArray(bars) ? bars.slice(-6).map((b: any) => ({ t: b.t, o: b.o, h: b.h, l: b.l, c: b.c, v: b.v })) : null,
+		hl_mid: typeof hl_mid === "number" ? hl_mid : null,
+		book_bids: book?.bids?.slice(0, 5) ?? null,
+		book_asks: book?.asks?.slice(0, 5) ?? null,
+	};
+}
 
-Your asset:      ${p.yours.name} (${p.yours.symbol})
-Opponent's asset: ${p.theirs.name} (${p.theirs.symbol})
+/** Neutral-judge prompt: BOTH agents get the SAME prompt, with the
+ *  same market evidence for both assets. They must vote impartially
+ *  (the prompt is explicit about ignoring any in-character bias they
+ *  might have toward their associated asset). */
+function buildJudgePrompt(p: {
+	a: { name: string; symbol: string; start_price: number; evidence: Awaited<ReturnType<typeof gatherEvidence>> };
+	b: { name: string; symbol: string; start_price: number; evidence: Awaited<ReturnType<typeof gatherEvidence>> };
+	horizon_h: number;
+}): string {
+	const dump = (e: Awaited<ReturnType<typeof gatherEvidence>>) => JSON.stringify(e, null, 2);
+	return `You are a NEUTRAL JUDGE.
 
-Starting prices (just fetched):
-  ${p.yours.name}:  $${p.yours.price.toFixed(2)}
-  ${p.theirs.name}: $${p.theirs.price.toFixed(2)}
+Two assets are being compared. Vote for whichever you think will deliver the higher PERCENT return over the next ${p.horizon_h} hours.
 
-Question: which asset will deliver the higher PERCENT return over the next ${p.horizon_h} hours?
+IMPORTANT — vote impartially. Do NOT favour an asset because of any persona, scope, or focus area you may have. Both assets are candidates. You are looking at the same evidence and making one call. Vote "tie" if you genuinely think they'll be within ~0.5% of each other.
 
-Make your case. Use your market-data tools to gather supporting evidence (recent bars, orderbook, Hyperliquid perp data, any signal you trust). Be specific and cite numbers — start prices, recent bars, your reasoning. Be honest about uncertainty.
+ASSET A: ${p.a.name}  (${p.a.symbol})
+  Starting price (Alpaca):   $${p.a.start_price.toFixed(2)}
+  Evidence:
+${dump(p.a.evidence)}
 
-End your reply with EXACTLY these two lines, on their own, as the last two lines of your message:
+ASSET B: ${p.b.name}  (${p.b.symbol})
+  Starting price (Alpaca):   $${p.b.start_price.toFixed(2)}
+  Evidence:
+${dump(p.b.evidence)}
 
-PREDICTION: <yours|theirs|tie>
+Briefly state your reasoning, then end your reply with EXACTLY these two lines (case-insensitive, but the literal labels), as the LAST two lines of your message:
+
+VOTE: <${p.a.name}|${p.b.name}|tie>
 CONFIDENCE: <low|medium|high>`;
 }
 
@@ -186,34 +233,48 @@ async function doStart(ctx: ProgramContext, input: StartInput): Promise<Duel> {
 
 	const aAsset = await deriveAssetForAgent(ctx, input.agent_a_id);
 	const bAsset = await deriveAssetForAgent(ctx, input.agent_b_id);
-	const [aPrice, bPrice] = await Promise.all([
+
+	// Snapshot both assets in parallel: starting price + evidence
+	// (recent bars + Hyperliquid mid + L2 book). The same evidence
+	// dump is shown to both judges below.
+	const [aPrice, bPrice, aEvidence, bEvidence] = await Promise.all([
 		fetchPrice(ctx, aAsset.alpaca_symbol),
 		fetchPrice(ctx, bAsset.alpaca_symbol),
+		gatherEvidence(ctx, aAsset.alpaca_symbol, aAsset.hyperliquid_coin),
+		gatherEvidence(ctx, bAsset.alpaca_symbol, bAsset.hyperliquid_coin),
 	]);
 
 	const startedAt = Date.now();
 	const horizonH = Math.round(horizon / 3_600_000);
-	const promptA = buildDuelPrompt({
-		yours:  { name: aAsset.name, symbol: aAsset.alpaca_symbol, price: aPrice },
-		theirs: { name: bAsset.name, symbol: bAsset.alpaca_symbol, price: bPrice },
-		horizon_h: horizonH,
-	});
-	const promptB = buildDuelPrompt({
-		yours:  { name: bAsset.name, symbol: bAsset.alpaca_symbol, price: bPrice },
-		theirs: { name: aAsset.name, symbol: aAsset.alpaca_symbol, price: aPrice },
+	// SAME prompt for both judges — they each receive identical
+	// evidence and must vote impartially.
+	const prompt = buildJudgePrompt({
+		a: { name: aAsset.name, symbol: aAsset.alpaca_symbol, start_price: aPrice, evidence: aEvidence },
+		b: { name: bAsset.name, symbol: bAsset.alpaca_symbol, start_price: bPrice, evidence: bEvidence },
 		horizon_h: horizonH,
 	});
 
-	// Run both agents in parallel. Each invocation runs the agent's full
-	// LLM loop including tool calls; this can take a while.
+	// Run both agents in parallel.
 	const [aReply, bReply] = await Promise.all([
-		ctx.dispatchProgram("/agent", "ask", [input.agent_a_id, promptA, { followUp: "none" }]) as Promise<{ finalText?: string }>,
-		ctx.dispatchProgram("/agent", "ask", [input.agent_b_id, promptB, { followUp: "none" }]) as Promise<{ finalText?: string }>,
+		ctx.dispatchProgram("/agent", "ask", [input.agent_a_id, prompt, { followUp: "none" }]) as Promise<{ finalText?: string }>,
+		ctx.dispatchProgram("/agent", "ask", [input.agent_b_id, prompt, { followUp: "none" }]) as Promise<{ finalText?: string }>,
 	]);
 	const aText = aReply?.finalText ?? "";
 	const bText = bReply?.finalText ?? "";
-	const aParsed = parsePrediction(aText, aAsset.name, bAsset.name);
-	const bParsed = parsePrediction(bText, bAsset.name, aAsset.name);
+	const aParsed = parseJudgeVote(aText, aAsset.name, bAsset.name);
+	const bParsed = parseJudgeVote(bText, aAsset.name, bAsset.name);
+
+	// Consensus rule:
+	//   - both judges vote same asset → that asset wins (a or b)
+	//   - both vote tie → tie
+	//   - any disagreement (one votes A, other votes B; or one votes
+	//     tie, the other an asset; or any unknown) → tie
+	let predicted: "a" | "b" | "tie" = "tie";
+	if (aParsed.vote === bParsed.vote && aParsed.vote !== "unknown") {
+		if (aParsed.vote === aAsset.name)      predicted = "a";
+		else if (aParsed.vote === bAsset.name) predicted = "b";
+		else                                    predicted = "tie";
+	}
 
 	const duel: Duel = {
 		id: randomUUID().replace(/-/g, "").slice(0, 16),
@@ -226,9 +287,6 @@ async function doStart(ctx: ProgramContext, input: StartInput): Promise<Duel> {
 			alpaca_symbol: aAsset.alpaca_symbol,
 			hyperliquid_coin: aAsset.hyperliquid_coin,
 			start_price_usd: aPrice,
-			prediction: aText,
-			parsed_call: aParsed.call,
-			parsed_confidence: aParsed.confidence,
 		},
 		b: {
 			agent_id: input.agent_b_id,
@@ -236,10 +294,12 @@ async function doStart(ctx: ProgramContext, input: StartInput): Promise<Duel> {
 			alpaca_symbol: bAsset.alpaca_symbol,
 			hyperliquid_coin: bAsset.hyperliquid_coin,
 			start_price_usd: bPrice,
-			prediction: bText,
-			parsed_call: bParsed.call,
-			parsed_confidence: bParsed.confidence,
 		},
+		judges: [
+			{ agent_id: input.agent_a_id, agent_name: aAsset.name, reasoning: aText, parsed_vote: aParsed.vote, parsed_confidence: aParsed.confidence },
+			{ agent_id: input.agent_b_id, agent_name: bAsset.name, reasoning: bText, parsed_vote: bParsed.vote, parsed_confidence: bParsed.confidence },
+		],
+		predicted_winner: predicted,
 	};
 
 	const state = ctx.state;
