@@ -188,6 +188,70 @@ export function verifyMerkleRoot(rootHex: string, commits: AnchorCommit[]): bool
 
 // ── Anchor construction ──────────────────────────────────────────
 
+/** Mine a new anchor IF chain state has changed since the last anchor.
+ *  Skips silently when the current heads digest matches what's already
+ *  captured in the latest anchor — that means no transactions have
+ *  happened, so there's nothing new to commit and no reward should be
+ *  minted. Called from `onTick` (watchdog every AUTO_ANCHOR_MS) and
+ *  exposed as the `mineIfDirty` action for coin/trade code to call
+ *  right after a commit for immediate anchoring. */
+async function mineIfDirty(ctx: ProgramContext): Promise<{ mined: boolean; reason?: string; anchorId?: string; height?: number; commitCount?: number }> {
+	if (ctx.state?.miningDisabled) return { mined: false, reason: "mining_disabled" };
+	const store = ctx.store as any;
+	const currentCommits = await gatherCurrentCommits(store);
+	const currentDigest = commitsDigest(currentCommits);
+	const latest = await findLatestAnchor(store);
+	let lastDigest = "";
+	if (latest?.commitsJson) {
+		try {
+			const parsed = JSON.parse(latest.commitsJson) as AnchorCommit[];
+			if (Array.isArray(parsed)) lastDigest = commitsDigest(parsed);
+		} catch { /* malformed — treat as dirty */ }
+	}
+	if (currentDigest === lastDigest && latest) {
+		// Nothing's changed since the last anchor — happy idle path.
+		return { mined: false, reason: "clean", anchorId: latest.id, height: latest.height };
+	}
+	const height = latest ? latest.height + 1 : 0;
+	const previousId = latest ? latest.id : "";
+	const { id, root, commits } = await buildAnchor(ctx, previousId, height);
+	ctx.state!.lastAnchorId = id;
+	ctx.state!.lastAnchorHeight = height;
+	ctx.emit("anchor_created", { id, height, root, commitCount: commits.length });
+	return { mined: true, anchorId: id, height, commitCount: commits.length };
+}
+
+/** Collect the current (objectId, headId) pairs for every tracked
+ *  chain-mode object. Used both by buildAnchor (to seed the anchor's
+ *  commits field) and by the dirty-check path (to compare against the
+ *  last mined anchor's commits and skip mining when nothing changed). */
+async function gatherCurrentCommits(store: any): Promise<AnchorCommit[]> {
+	const commits: AnchorCommit[] = [];
+	for (const typeKey of TRACKED_TYPES) {
+		const refs = (await store.list(typeKey)) as Array<{ id: string }>;
+		for (const ref of refs) {
+			const obj = await store.get(ref.id);
+			if (!obj || obj.deleted) continue;
+			const heads: string[] = obj.headIds ?? [];
+			for (const headId of heads) {
+				commits.push({ objectId: ref.id, headId });
+			}
+		}
+	}
+	return commits;
+}
+
+/** Order-stable digest of an AnchorCommit[] — used to detect whether
+ *  the current chain state differs from what the last anchor captured.
+ *  Sorting by (objectId,headId) makes the digest deterministic
+ *  regardless of store iteration order. */
+function commitsDigest(commits: AnchorCommit[]): string {
+	return commits
+		.map((c) => `${c.objectId}:${c.headId}`)
+		.sort()
+		.join("\n");
+}
+
 async function buildAnchor(
 	ctx: ProgramContext,
 	previousAnchorId: string,
@@ -207,19 +271,7 @@ async function buildAnchor(
 		throw new Error("Invalid VDF proof");
 	}
 
-	// Collect heads from all tracked chain-mode types.
-	const commits: AnchorCommit[] = [];
-	for (const typeKey of TRACKED_TYPES) {
-		const refs = (await store.list(typeKey)) as Array<{ id: string }>;
-		for (const ref of refs) {
-			const obj = await store.get(ref.id);
-			if (!obj || obj.deleted) continue;
-			const heads: string[] = obj.headIds ?? [];
-			for (const headId of heads) {
-				commits.push({ objectId: ref.id, headId });
-			}
-		}
-	}
+	const commits = await gatherCurrentCommits(store);
 
 	const leaves = commits.map((c) => leafHash(c.objectId, c.headId));
 	const root = hexEncode(merkleRoot(leaves));
@@ -285,10 +337,10 @@ async function buildAnchor(
 
 // ── Anchor queries ───────────────────────────────────────────────
 
-async function findLatestAnchor(store: any): Promise<{ id: string; height: number; root: string; previous: string; timestamp: number } | null> {
+async function findLatestAnchor(store: any): Promise<{ id: string; height: number; root: string; previous: string; timestamp: number; commitsJson: string } | null> {
 	const refs = (await store.list(ANCHOR_TYPE_KEY)) as Array<{ id: string }>;
 	if (refs.length === 0) return null;
-	let best: { id: string; height: number; root: string; previous: string; timestamp: number } | null = null;
+	let best: { id: string; height: number; root: string; previous: string; timestamp: number; commitsJson: string } | null = null;
 	for (const ref of refs) {
 		const obj = await store.get(ref.id);
 		if (!obj || obj.deleted) continue;
@@ -297,8 +349,9 @@ async function findLatestAnchor(store: any): Promise<{ id: string; height: numbe
 		const timestamp = Number(fields.timestamp?.intValue ?? fields.timestamp ?? 0);
 		const root = String(fields.merkle_root?.stringValue ?? fields.merkle_root ?? "");
 		const previous = String(fields.previous_anchor?.stringValue ?? fields.previous_anchor ?? "");
+		const commitsJson = String(fields.commits_json?.stringValue ?? fields.commits_json ?? "");
 		if (!best || height > best.height || (height === best.height && timestamp < best.timestamp)) {
-			best = { id: ref.id, height, root, previous, timestamp };
+			best = { id: ref.id, height, root, previous, timestamp, commitsJson };
 		}
 	}
 	return best;
@@ -573,6 +626,14 @@ const actorDef: ProgramActorDef = {
 			};
 		},
 
+		/** Mine a new anchor IFF chain state has changed since the last one.
+		 *  Idempotent — repeated calls with no intervening transaction
+		 *  are no-ops. Coin / trade programs SHOULD invoke this after a
+		 *  commit so the new state is anchored immediately rather than
+		 *  waiting up to AUTO_ANCHOR_MS for the watchdog tick.
+		 *  Returns { mined, reason?, anchorId?, height?, commitCount? }. */
+		mineIfDirty: async (ctx: ProgramContext) => mineIfDirty(ctx),
+
 		/** Read the current toggle state plus the latest mined anchor. */
 		getStatus: async (ctx: ProgramContext) => {
 			return {
@@ -658,17 +719,14 @@ const actorDef: ProgramActorDef = {
 	onTick: async (ctx: ProgramContext) => {
 		// Skip mining if disabled by setEnabled or the GLON_ANCHOR_DISABLED env.
 		if (ctx.state?.miningDisabled) return;
-		const store = ctx.store as any;
-		const latest = await findLatestAnchor(store);
-		const height = latest ? latest.height + 1 : 0;
-		const previousId = latest ? latest.id : "";
-		const { id, root, commits } = await buildAnchor(ctx, previousId, height);
-		const s = loadState(ctx.state ?? {});
-		s.lastAnchorId = id;
-		s.lastAnchorHeight = height;
-		ctx.state!.lastAnchorId = id;
-		ctx.state!.lastAnchorHeight = height;
-		ctx.emit("anchor_created", { id, height, root, commitCount: commits.length });
+		// Dirty check: only mine when chain state has changed since the
+		// last anchor. Without this the tick would mint a fresh anchor
+		// (and FIGGIE reward) every minute regardless of activity.
+		// Coin/trade code paths can invoke the `mineIfDirty` action
+		// directly after a commit for low-latency anchoring; the tick
+		// then becomes a watchdog for changes that happen outside the
+		// monitored programs (or rare misses).
+		await mineIfDirty(ctx);
 	},
 
 	tickMs: AUTO_ANCHOR_MS,
