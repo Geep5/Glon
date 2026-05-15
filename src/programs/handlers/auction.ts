@@ -211,6 +211,21 @@ async function doList(): Promise<Array<{ id: string; seller_pubkey: string; give
 		.map((r) => r.value);
 }
 
+async function doGetBids(auctionId: string): Promise<Array<{
+	auction_id: string;
+	bidder_pubkey: string;
+	offer: AuctionAsset[];
+	created_at: number;
+}>> {
+	requireAutobase();
+	const prefix = `auction/${auctionId}/bids/`;
+	const rows = await viewList<any>(prefix);
+	// Sort by created_at descending so newest bids surface first.
+	return rows
+		.map((r) => r.value)
+		.sort((a, b) => (b.created_at ?? 0) - (a.created_at ?? 0));
+}
+
 // ── Auto peer.join over Hyperswarm ───────────────────────────────
 
 /** Build a signed peer.join op announcing this node's writer key and chain key. */
@@ -546,6 +561,7 @@ const actorDef: ProgramActorDef = {
 		status: async (_ctx: ProgramContext) => statusSnapshot(),
 		list: async (_ctx: ProgramContext) => doList(),
 		get: async (_ctx: ProgramContext, auctionId: string) => viewGet(`auction/${auctionId}`),
+		getBids: async (_ctx: ProgramContext, auctionId: string) => doGetBids(auctionId),
 		post: async (ctx: ProgramContext, input: { give: AuctionAsset[]; want: AuctionAsset[]; keyName: string; recipient?: string; expiryMs?: number }) => doPost(ctx, input),
 		gift: async (ctx: ProgramContext, input: { amount: string; token: string; recipient: string; keyName: string }) =>
 			doPost(ctx, { give: [{ token: input.token, amount: input.amount }], want: [], keyName: input.keyName, recipient: input.recipient }),
