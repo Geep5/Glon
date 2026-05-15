@@ -125,6 +125,20 @@ export interface AuctionSettleOp {
 	kind: "auction.settle";
 	auction_id: string;
 	winner_pubkey: string;          // seller declares the winner
+	/**
+	 * `created_at` of the winning bid. Required for **open auctions**
+	 * (auctions with empty `want`) — the apply function uses this to look
+	 * up the specific bid record at `auction/<id>/bids/<winner>/<this>`
+	 * and charges the winner the contents of THAT bid's offer.
+	 *
+	 * For fixed-price auctions (non-empty `want`), if omitted, the apply
+	 * function charges the winner the auction's posted `want` instead.
+	 * Pass it anyway if the seller is accepting a bid that doesn't match
+	 * the original asking price (e.g. accepting a counter-offer).
+	 *
+	 * For gifts (recipient_pubkey set + empty want), this is ignored.
+	 */
+	winning_bid_at?: number;
 	signature: string;              // sig by seller
 	created_at: number;
 }
@@ -554,26 +568,55 @@ export async function apply(nodes: Array<{ value: Buffer | string; from?: { key:
 				if (!auctionRaw) break;
 				const auction = JSON.parse(typeof auctionRaw.value === "string" ? auctionRaw.value : auctionRaw.value.toString("utf-8"));
 				if (auction.status !== "open") break;
-				// Two flavors:
-				//   - has want[] (a real trade): winner pays `want` to seller, gets `give`
-				//   - empty want[] (a gift):     winner just receives `give` (no payment)
-				const isGift = !auction.want || auction.want.length === 0;
-				// Check winner has the `want` balance (if any).
-				if (!isGift) {
-					for (const w of auction.want) {
-						if (w.token && w.amount) {
-							const balKey = `balance/${w.token}/${op.winner_pubkey}`;
-							const balRaw = await view.get(balKey);
-							const bal = balRaw ? BigInt(typeof balRaw.value === "string" ? balRaw.value : balRaw.value.toString("utf-8")) : 0n;
-							if (bal < BigInt(w.amount)) {
-								auction.status = "invalid_winner_insufficient_balance";
-								await view.put(`auction/${op.auction_id}`, JSON.stringify(auction));
-								return; // bail — no transfers
-							}
+
+				// Determine settle mode:
+				//   - gift: recipient_pubkey set + want is empty → no payment expected
+				//   - open: want is empty, no recipient → winner pays per THEIR bid's offer
+				//   - fixed: want is non-empty → winner pays per auction.want (or per
+				//     their bid if seller accepts a different offer via winning_bid_at)
+				const wantEmpty = !auction.want || auction.want.length === 0;
+				const isGift = wantEmpty && !!auction.recipient_pubkey;
+				const isOpen = wantEmpty && !auction.recipient_pubkey;
+
+				// Resolve the payment basket the winner owes.
+				let payment: Array<{ token?: string; amount?: string; object_id?: string }> = [];
+				if (isGift) {
+					payment = [];
+				} else if (op.winning_bid_at) {
+					// Seller specified a particular winning bid. Look it up.
+					const bidRaw = await view.get(`auction/${op.auction_id}/bids/${op.winner_pubkey}/${op.winning_bid_at}`);
+					if (!bidRaw) {
+						auction.status = "invalid_no_such_bid";
+						await view.put(`auction/${op.auction_id}`, JSON.stringify(auction));
+						return;
+					}
+					const bid = JSON.parse(typeof bidRaw.value === "string" ? bidRaw.value : bidRaw.value.toString("utf-8"));
+					payment = bid.offer ?? [];
+				} else if (isOpen) {
+					// Open auction needs an explicit winning_bid_at; no bid → no settle.
+					auction.status = "invalid_open_settle_needs_bid";
+					await view.put(`auction/${op.auction_id}`, JSON.stringify(auction));
+					return;
+				} else {
+					// Fixed-price: use auction.want as the payment.
+					payment = auction.want;
+				}
+
+				// Verify the winner has every fungible token they owe.
+				for (const w of payment) {
+					if (w.token && w.amount) {
+						const balKey = `balance/${w.token}/${op.winner_pubkey}`;
+						const balRaw = await view.get(balKey);
+						const bal = balRaw ? BigInt(typeof balRaw.value === "string" ? balRaw.value : balRaw.value.toString("utf-8")) : 0n;
+						if (bal < BigInt(w.amount)) {
+							auction.status = "invalid_winner_insufficient_balance";
+							await view.put(`auction/${op.auction_id}`, JSON.stringify(auction));
+							return;
 						}
 					}
 				}
-				// Settle: transfer `give` to winner, `want` from winner to seller.
+
+				// Transfer give[] → winner.
 				for (const asset of auction.give) {
 					if (asset.object_id) {
 						await view.put(`coin/${asset.object_id}`, JSON.stringify({ owner: op.winner_pubkey }));
@@ -584,24 +627,26 @@ export async function apply(nodes: Array<{ value: Buffer | string; from?: { key:
 						await view.put(winKey, (winBal + BigInt(asset.amount)).toString());
 					}
 				}
-				if (!isGift) {
-					for (const w of auction.want) {
-						if (w.token && w.amount) {
-							const winKey = `balance/${w.token}/${op.winner_pubkey}`;
-							const winRaw = await view.get(winKey);
-							const winBal = BigInt(typeof winRaw!.value === "string" ? winRaw!.value : winRaw!.value.toString("utf-8"));
-							const newWinBal = winBal - BigInt(w.amount);
-							if (newWinBal === 0n) await view.del(winKey); else await view.put(winKey, newWinBal.toString());
-							const sellerKey = `balance/${w.token}/${auction.seller_pubkey}`;
-							const sellerRaw = await view.get(sellerKey);
-							const sellerBal = sellerRaw ? BigInt(typeof sellerRaw.value === "string" ? sellerRaw.value : sellerRaw.value.toString("utf-8")) : 0n;
-							await view.put(sellerKey, (sellerBal + BigInt(w.amount)).toString());
-						}
+
+				// Transfer payment[] → seller.
+				for (const w of payment) {
+					if (w.token && w.amount) {
+						const winKey = `balance/${w.token}/${op.winner_pubkey}`;
+						const winRaw = await view.get(winKey);
+						const winBal = BigInt(typeof winRaw!.value === "string" ? winRaw!.value : winRaw!.value.toString("utf-8"));
+						const newWinBal = winBal - BigInt(w.amount);
+						if (newWinBal === 0n) await view.del(winKey); else await view.put(winKey, newWinBal.toString());
+						const sellerKey = `balance/${w.token}/${auction.seller_pubkey}`;
+						const sellerRaw = await view.get(sellerKey);
+						const sellerBal = sellerRaw ? BigInt(typeof sellerRaw.value === "string" ? sellerRaw.value : sellerRaw.value.toString("utf-8")) : 0n;
+						await view.put(sellerKey, (sellerBal + BigInt(w.amount)).toString());
 					}
 				}
+
 				auction.status = "settled";
 				auction.winner_pubkey = op.winner_pubkey;
 				auction.settled_at = op.created_at;
+				auction.settled_payment = payment;
 				await view.put(`auction/${op.auction_id}`, JSON.stringify(auction));
 				break;
 			}

@@ -172,12 +172,17 @@ async function doSettle(ctx: ProgramContext, args: {
 	auctionId: string;
 	winner: string;
 	keyName: string;
+	/** For open auctions (no posted want), required: pick which of the
+	 *  winner's bids to honor. For fixed-price auctions, optional override
+	 *  if the seller accepts a counter-offer. */
+	winningBidAt?: number;
 }): Promise<void> {
 	requireAutobase();
 	const opNoSig: Omit<AuctionSettleOp, "signature"> = {
 		kind: "auction.settle",
 		auction_id: args.auctionId,
 		winner_pubkey: args.winner,
+		winning_bid_at: args.winningBidAt,
 		created_at: Date.now(),
 	};
 	const signature = await signOp(ctx, args.keyName, opNoSig);
@@ -329,8 +334,10 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 		}
 
 		case "post": {
-			// Syntax: auction post <giveSpec> for <wantSpec> [with <key>] [to <pubkey>] [--expires=<duration>]
-			// Strip the --expires flag from args first so positional parsing stays simple.
+			// Syntax: auction post <give> [for <want>] [with <key>] [to <pubkey>] [--expires=<duration>]
+			//   no `for`           → open auction (bidders propose anything)
+			//   `to <pubkey>` only → gift (no payment expected from recipient)
+			//   `for <want>`       → fixed-price (winner pays this)
 			let expiryMs: number | undefined;
 			const filteredArgs: string[] = [];
 			for (const a of args) {
@@ -343,10 +350,24 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 				}
 			}
 			const forIdx = filteredArgs.indexOf("for");
-			if (forIdx < 1) { print(red("Usage: auction post <give> for <want> [with <key>] [to <pubkey>] [--expires=<duration>]")); break; }
-			const giveSpec = filteredArgs.slice(0, forIdx).join(" ");
-			let rest = filteredArgs.slice(forIdx + 1);
+			// Split on the "for" keyword if present; otherwise everything up to a
+			// trailing "with"/"to" is the give spec.
+			let giveSpec: string;
 			let wantParts: string[] = [];
+			let rest: string[];
+			if (forIdx >= 1) {
+				giveSpec = filteredArgs.slice(0, forIdx).join(" ");
+				rest = filteredArgs.slice(forIdx + 1);
+			} else {
+				// No "for" — find first "with"/"to" or end of args.
+				let endIdx = filteredArgs.length;
+				for (let i = 0; i < filteredArgs.length; i++) {
+					if (filteredArgs[i] === "with" || filteredArgs[i] === "to") { endIdx = i; break; }
+				}
+				giveSpec = filteredArgs.slice(0, endIdx).join(" ");
+				rest = filteredArgs.slice(endIdx);
+			}
+			if (!giveSpec) { print(red("Usage: auction post <give> [for <want>] [with <key>] [to <pubkey>] [--expires=<duration>]")); break; }
 			let keyName = "default";
 			let recipient: string | undefined;
 			while (rest.length) {
@@ -354,16 +375,19 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 				if (rest[0] === "to" && rest.length >= 2) { recipient = rest[1]; rest = rest.slice(2); continue; }
 				wantParts.push(rest[0]); rest = rest.slice(1);
 			}
-			if (wantParts.length === 0) { print(red("Usage: auction post <give> for <want> [with <key>] [to <pubkey>] [--expires=<duration>]")); break; }
 			try {
+				const want = wantParts.length > 0 ? [parseAsset(wantParts.join(" "))] : [];
 				const r = await doPost(ctx, {
 					give: [parseAsset(giveSpec)],
-					want: [parseAsset(wantParts.join(" "))],
+					want,
 					keyName,
 					recipient,
 					expiryMs,
 				});
-				print(green("Auction posted"));
+				const mode = want.length === 0
+					? (recipient ? "gift" : "open auction (any bid welcome)")
+					: "fixed-price auction";
+				print(green(`Posted ${mode}`));
 				print(dim("  id:      ") + r.auctionId);
 				if (expiryMs) print(dim("  expires: ") + new Date(expiryMs).toISOString());
 			} catch (err: any) {
@@ -429,13 +453,23 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 		}
 
 		case "settle": {
-			// Syntax: auction settle <auctionId> <winnerPubkey> [with <key>]
-			if (args.length < 2) { print(red("Usage: auction settle <auctionId> <winnerPubkey> [with <key>]")); break; }
-			const auctionId = args[0];
-			const winner = args[1];
-			const keyName = args[3] && args[2] === "with" ? args[3] : "default";
+			// Syntax: auction settle <auctionId> <winnerPubkey> [--bid-at=<ms>] [with <key>]
+			let winningBidAt: number | undefined;
+			const positional: string[] = [];
+			let keyName = "default";
+			for (let i = 0; i < args.length; i++) {
+				const a = args[i];
+				if (a.startsWith("--bid-at=")) {
+					winningBidAt = parseInt(a.split("=")[1], 10);
+				} else if (a === "with" && args[i + 1]) {
+					keyName = args[i + 1]; i++;
+				} else {
+					positional.push(a);
+				}
+			}
+			if (positional.length < 2) { print(red("Usage: auction settle <auctionId> <winnerPubkey> [--bid-at=<ms>] [with <key>]")); break; }
 			try {
-				await doSettle(ctx, { auctionId, winner, keyName });
+				await doSettle(ctx, { auctionId: positional[0], winner: positional[1], winningBidAt, keyName });
 				print(green("Settled"));
 			} catch (err: any) {
 				print(red("  Error: ") + (err?.message ?? String(err)));
@@ -480,10 +514,12 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 				`    ${cyan("auction status")}                              ledger health snapshot`,
 				`    ${cyan("auction join")}                                broadcast a join request (run on first start)`,
 				`    ${cyan("auction list")}                                local view of all auctions`,
-				`    ${cyan("auction post")} ${dim("<give> for <want> [to <pubkey>] [--expires=1h]")}  post (default expiry 24h)`,
-				`    ${cyan("auction gift")} ${dim("<amount> <token> to <pubkey> [--expires=1h]")}     send tokens to someone`,
-				`    ${cyan("auction bid")} ${dim("<auctionId> <amount> <token>")}      bid on an open auction`,
-				`    ${cyan("auction settle")} ${dim("<auctionId> <winnerPubkey>")}     seller picks a winner`,
+				`    ${cyan("auction post")} ${dim("<give> [for <want>] [to <pubkey>] [--expires=1h]")}  post (default expiry 24h)`,
+				dim(`        omit "for"  → open auction; bidders propose any tokens / basket`),
+				dim(`        add "to X"  → directed (gift if no "for"; private sale otherwise)`),
+				`    ${cyan("auction gift")} ${dim("<amount> <token> to <pubkey> [--expires=1h]")}     shortcut: directed, no payment`,
+				`    ${cyan("auction bid")} ${dim("<auctionId> <amount> <token>")}      bid on an auction`,
+				`    ${cyan("auction settle")} ${dim("<id> <winner> [--bid-at=<ms>]")}   seller picks a winner (--bid-at required for open auctions)`,
 				`    ${cyan("auction cancel")} ${dim("<auctionId>")}                    seller cancels an open auction`,
 				dim(`  Ledger: ~/.glon/autobase  (permissionless CRDT over Hyperswarm)`),
 				dim(`  Bring up the daemon with GLON_SWARM=1 GLON_AUCTION=1.`),
@@ -514,7 +550,7 @@ const actorDef: ProgramActorDef = {
 		gift: async (ctx: ProgramContext, input: { amount: string; token: string; recipient: string; keyName: string }) =>
 			doPost(ctx, { give: [{ token: input.token, amount: input.amount }], want: [], keyName: input.keyName, recipient: input.recipient }),
 		bid: async (ctx: ProgramContext, input: { auctionId: string; offer: AuctionAsset[]; keyName: string }) => doBid(ctx, input),
-		settle: async (ctx: ProgramContext, input: { auctionId: string; winner: string; keyName: string }) => doSettle(ctx, input),
+		settle: async (ctx: ProgramContext, input: { auctionId: string; winner: string; keyName: string; winningBidAt?: number }) => doSettle(ctx, input),
 		cancel: async (ctx: ProgramContext, input: { auctionId: string; keyName: string }) => doCancel(ctx, input),
 		announceJoin: async (ctx: ProgramContext) => broadcastJoinAnnounce(ctx),
 		handleJoinAnnounce,
