@@ -1,9 +1,10 @@
-// /auction — decentralized auction house over a permissionless autobase.
+// /auction — decentralized auction house over a permissionless raw multi-writer CRDT.
 //
 // Posts auctions / bids / settlements / cancellations to the local
 // writer hypercore. The apply function (in src/ledger-host.ts)
 // linearizes them with everyone else's ops and enforces conservation in
-// the hyperbee view.
+// the hyperbee view. Every node is a writer from day one; peers discover
+// each other automatically via Hyperswarm topic announcements.
 //
 // Three top-level commands at MVP:
 //   auction list                                     — list open auctions
@@ -13,10 +14,9 @@
 // "Send Alice 10 FIG" = gift command = an auction with recipient + zero want.
 //
 // Identity binding: every op is signed by the seller's chain Ed25519 key
-// from /wallet. The autobase writer pubkey is generated locally by the
-// hypercore; the apply function will eventually verify the chain
-// signature inside the op against the registered binding. For v1 we
-// trust the writer-key/chain-key claim — Phase 3 tightens this.
+// from /wallet. The writer pubkey is generated locally by the hypercore;
+// the apply function verifies the chain signature inside the op against
+// the registered binding.
 
 import type { ProgramDef, ProgramContext, ProgramActorDef } from "../runtime.js";
 import { registerActorContentHandler } from "../runtime.js";
@@ -223,11 +223,8 @@ async function doGetBids(auctionId: string): Promise<Array<{
 		.sort((a, b) => (b.created_at ?? 0) - (a.created_at ?? 0));
 }
 
-// peer.join admission flow was deleted with the raw-ledger cutover
-// (Phase 3). The raw ledger has no writer set — every node owns its own
-// writer hypercore and writes immediately. The constants below are kept
-// briefly for the help text but the broadcast / handler / actor action
-// are gone.
+// Raw ledger requires no peer.join admission. Every node is a writer
+// from genesis; peers discover each other via Hyperswarm topic.
 
 // ── CLI handler ──────────────────────────────────────────────────
 
