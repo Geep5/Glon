@@ -133,9 +133,9 @@ async function resolveId(raw: string): Promise<string | null> {
 				await corestore.ready();
 
 				// Bootstrap precedence:
-				//   1. GLON_AUTOBASE_BOOTSTRAP env (hex pubkey) — joiner pointing at a known network
+				//   1. GLON_AUTOBASE_BOOTSTRAP env (hex pubkey) — explicit override
 				//   2. ~/.glon/autobase/bootstrap.key — previously joined / created network
-				//   3. none — generate a fresh autobase (this node becomes its own founder)
+				//   3. Hardcoded default — fresh installs join the shared glon network
 				let bootstrap: Buffer | null = null;
 				const envBootstrap = process.env.GLON_AUTOBASE_BOOTSTRAP;
 				if (envBootstrap && /^[0-9a-fA-F]{64}$/.test(envBootstrap)) {

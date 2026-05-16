@@ -209,6 +209,15 @@ function bootstrapKeyFile(): string {
 	return join(corestoreDir(), "bootstrap.key");
 }
 
+/** Default bootstrap key for the glon auction-house autobase network.
+ *  Fresh installs join this network automatically. Users can override via
+ *  GLON_AUTOBASE_BOOTSTRAP env or by wiping ~/.glon/autobase/bootstrap.key.
+ */
+const DEFAULT_BOOTSTRAP_KEY = Buffer.from(
+	"61b596909db2e6e0fa87645d79a0764d5ee4cd6a40c4458ba60cc6e86635a86e",
+	"hex",
+);
+
 function readPersistedBootstrap(): Buffer | null {
 	const p = bootstrapKeyFile();
 	if (!existsSync(p)) return null;
@@ -781,9 +790,12 @@ export async function apply(nodes: Array<{ value: Buffer | string; from?: { key:
 
 // ── Bootstrap-key helpers exposed to the daemon ──────────────────
 
-/** Read the persisted bootstrap key (hex string) or null. */
+/** Read the persisted bootstrap key. Falls back to the hardcoded default
+ *  so fresh installs join the shared glon auction-house network. */
 export function loadPersistedBootstrap(): Buffer | null {
-	return readPersistedBootstrap();
+	const persisted = readPersistedBootstrap();
+	if (persisted) return persisted;
+	return DEFAULT_BOOTSTRAP_KEY;
 }
 
 /** Persist a bootstrap key (called by daemon after first-time init). */
