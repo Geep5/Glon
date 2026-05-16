@@ -142,10 +142,95 @@ async function resolveId(raw: string): Promise<string | null> {
 					await ledger.initRawLedger({ corestore, localCore });
 					console.log(`[daemon] raw ledger online — writer pubkey: ${localCore.key.toString("hex").slice(0, 16)}...`);
 					console.log(`[daemon] raw ledger storage: ${ledger.getRawCorestoreDir()}`);
+
+					// ── Replication swarm (Phase 2) ──────────────────
+					// Dedicated Hyperswarm for corestore replication. Joins a
+					// shared "network topic" — every glon-AH node with the
+					// same topic finds each other via the DHT. On every
+					// connection we hand the stream to corestore so it
+					// replicates whichever hypercores both sides have in
+					// common (mine + any peer writers we've added).
+					//
+					// Discovery problem: how does Alice learn that Bob's
+					// writer hypercore exists in the first place? Solution
+					// below — they announce their writer pubkeys to each
+					// other over the existing swarm-host transport.
+					try {
+						const { default: Hyperswarm } = await import("hyperswarm");
+						const { createHash } = await import("node:crypto");
+						const networkTopicLabel = process.env.GLON_LEDGER_TOPIC ?? "glon-ah-mainnet-v1";
+						const networkTopic = createHash("sha256").update(networkTopicLabel).digest();
+						const replSwarm = new Hyperswarm();
+						replSwarm.on("connection", (conn: any) => {
+							corestore.replicate(conn);
+						});
+						replSwarm.join(networkTopic, { server: true, client: true });
+						console.log(`[daemon] raw ledger replication swarm joined topic "${networkTopicLabel}" (${networkTopic.toString("hex").slice(0, 16)}...)`);
+						(globalThis as any).__glonRawLedgerSwarm = replSwarm;
+
+						// ── Announce flow (peer-writer discovery) ───
+						// Goes over swarm-host (the raw-framing transport).
+						// We broadcast our writer pubkey on the same topic;
+						// peers receive via content-handler and call
+						// ledger.addKnownWriter, which makes corestore start
+						// replicating their writer hypercore. Need
+						// GLON_SWARM=1 for swarm-host to be alive.
+						if (process.env.GLON_SWARM === "1") {
+							const swarmHost = await import("../src/swarm-host.js");
+							const runtime = await import("../src/programs/runtime.js");
+							const ANNOUNCE_CONTENT_TYPE = "glon/raw-ledger-announce";
+							const announceTopic = swarmHost.topicFor("glon-raw-ledger-announce-v1");
+
+							await swarmHost.joinTopic(announceTopic);
+							console.log(`[daemon] raw ledger announce topic joined (${announceTopic.toString("hex").slice(0, 16)}...)`);
+
+							const ourWriterHex = localCore.key.toString("hex");
+
+							// Receive announces from peers, addKnownWriter on each.
+							runtime.registerContentHandler(ANNOUNCE_CONTENT_TYPE, async (envelope: any) => {
+								try {
+									const body = JSON.parse(new TextDecoder().decode(envelope.payload));
+									const pk = (body?.writer_pubkey ?? "").toString().toLowerCase();
+									if (!/^[0-9a-fA-F]{64}$/.test(pk)) return false;
+									if (pk === ourWriterHex) return true; // ignore our own
+									await ledger.addKnownWriter(pk);
+									console.log(`[daemon] raw ledger discovered peer writer ${pk.slice(0, 16)}…`);
+									return true;
+								} catch (err: any) {
+									console.log(`[daemon] raw ledger announce handler error: ${err?.message ?? err}`);
+									return false;
+								}
+							});
+
+							// Broadcast our writer pubkey every 15s. Cheap
+							// keep-alive; new peers joining the topic learn
+							// about us on their first poll cycle.
+							const sendAnnounce = async () => {
+								try {
+									const { encodeTransportEnvelope } = await import("../src/proto.js");
+									const payload = new TextEncoder().encode(JSON.stringify({ writer_pubkey: ourWriterHex }));
+									const envelope = encodeTransportEnvelope({
+										contentType: ANNOUNCE_CONTENT_TYPE,
+										payload,
+										senderPubkey: new Uint8Array(0),
+										metadata: {},
+									});
+									swarmHost.broadcastOnTopic(announceTopic, Buffer.from(envelope));
+								} catch (err: any) {
+									console.log(`[daemon] raw ledger announce broadcast failed: ${err?.message ?? err}`);
+								}
+							};
+							setTimeout(sendAnnounce, 500); // first announce shortly after boot
+							setInterval(sendAnnounce, 15_000);
+						} else {
+							console.log(`[daemon] raw ledger: GLON_SWARM=1 not set; running without peer-writer announces (replication only works for already-known peers)`);
+						}
+					} catch (err: any) {
+						console.log(`[daemon] raw ledger swarm wiring failed: ${err?.message ?? err}`);
+					}
 				} catch (err: any) {
 					console.log(`[daemon] raw ledger bring-up failed: ${err?.message ?? err} (continuing without auction house)`);
 				}
-				// Network/replication (swarm wiring) lands in Phase 2.
 			} else try {
 				// ── Autobase backend (legacy default) ────────────
 				const { default: Corestore } = await import("corestore");
