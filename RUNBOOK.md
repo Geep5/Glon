@@ -26,7 +26,7 @@ cd Graice
 npx tsx scripts/daemon.ts
 # With p2p networking:
 GLON_SWARM=1 npx tsx scripts/daemon.ts
-# Full auction-house mode (p2p + autobase ledger):
+# Full auction-house mode (p2p + raw multi-writer ledger):
 GLON_SWARM=1 GLON_AUCTION=1 npx tsx scripts/daemon.ts
 
 # 3. Start Astrolabe (in a third terminal)
@@ -41,9 +41,8 @@ Open `http://127.0.0.1:4173`.
 ```bash
 cd Graice
 npm install
-# Required deps for the auction house: autobase, corestore, hyperbee,
-# hypercore, b4a, hyperswarm, random-access-memory. All installed by
-# the base npm install.
+# Required deps for the auction house: corestore, hyperbee, hypercore,
+# b4a, hyperswarm. All installed by the base npm install.
 
 cd glonAstrolabe
 npm install
@@ -155,12 +154,15 @@ If `topics_joined` is 0, run the manual join command above.
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `GLON_SWARM` | unset | Set to `1` to enable Hyperswarm p2p |
-| `GLON_AUCTION` | unset | Set to `1` to bring up the autobase auction-house ledger |
-| `GLON_AUTOBASE_BOOTSTRAP` | unset | 64-hex pubkey to join an existing network (instead of generating a fresh one) |
-| `GLON_AUTOBASE_DIR` | `~/.glon/autobase` | Where the corestore lives on disk |
+| `GLON_AUCTION` | unset | Set to `1` to bring up the auction-house ledger |
+| `GLON_LEDGER_BACKEND` | `raw` | Ledger backend: `raw` (default, permissionless) or `autobase` (legacy opt-in) |
+| `GLON_LEDGER_TOPIC` | `glon-ah-mainnet-v1` | Network topic label for Hyperswarm discovery (hashed to swarm topic) |
+| `GLON_LEDGER_DIR` | `~/.glon/ledger` | Where the corestore lives on disk |
+| `GLON_AUTOBASE_BOOTSTRAP` | unset | _(Legacy, autobase only)_ 64-hex pubkey to join an existing autobase network |
+| `GLON_AUTOBASE_DIR` | `~/.glon/autobase` | _(Legacy, autobase only)_ corestore path for autobase backend |
 | `GLON_AUCTION_SKIP_VERIFY` | unset | Set to `1` to bypass op signature checks (dev migration only — never in production) |
 | `GLON_HOST_PORT` | 6420 | Main server port |
-| `GLON_DISPATCH_PORT` | 6430 | Daemon dispatch port |
+| `GLON_DAEMON_PORT` | 6430 | Daemon dispatch port |
 | `GLON_DATA` | `~/.glon` | Data directory |
 
 ## Auction Modes
@@ -182,13 +184,16 @@ Key invariants:
 
 ## Holistic Two-Daemon Auction House Test
 
-This walks two glon nodes (running on the same machine for simplicity) through deploy → gift → bid → settle, exercising the full auction-house stack with **real balance tracking** on the autobase.
+This walks two glon nodes (running on the same machine for simplicity) through deploy → gift → bid → settle, exercising the full auction-house stack on the **raw multi-writer ledger**. There is no whitelist — every node is a writer. Both nodes announce their writer keys over the Hyperswarm topic and discover each other automatically.
 
-### Terminal 1 — node A (founder)
+Both terminals must set **the same `GLON_LEDGER_TOPIC`** to form one network. The default topic is `glon-ah-mainnet-v1`. For an isolated test, use any label you like.
+
+### Terminal 1 — node A
 
 ```bash
 GLON_DATA=/tmp/glon-A \
-GLON_AUTOBASE_DIR=/tmp/glon-A/autobase \
+GLON_LEDGER_DIR=/tmp/glon-A/ledger \
+GLON_LEDGER_TOPIC=glon-ah-runbook-test \
 GLON_SWARM=1 GLON_AUCTION=1 \
 npx tsx scripts/daemon.ts
 ```
@@ -197,17 +202,17 @@ Then in the glon CLI:
 
 ```
 /wallet new alice
-/auction status                                  # copy the "bootstrap key"
+/auction status                                  # ledger health snapshot
 /coin deploy Figgies FIG 1000 --key=alice        # deploy 1000 FIG, alice gets the supply
 /coin balance <token_id> <alice pubkey>          # should print 1000
 ```
 
-### Terminal 2 — node B (joiner), pointed at A's autobase via env
+### Terminal 2 — node B
 
 ```bash
 GLON_DATA=/tmp/glon-B \
-GLON_AUTOBASE_DIR=/tmp/glon-B/autobase \
-GLON_AUTOBASE_BOOTSTRAP=<paste-A's-bootstrap-key> \
+GLON_LEDGER_DIR=/tmp/glon-B/ledger \
+GLON_LEDGER_TOPIC=glon-ah-runbook-test \
 GLON_SWARM=1 GLON_AUCTION=1 \
 npx tsx scripts/daemon.ts
 ```
@@ -216,11 +221,11 @@ Then in B's CLI:
 
 ```
 /wallet new bob
-/auction join                                    # broadcasts a join request to the network
-                                                 # wait ~15s for A's daemon to relay
-/auction status                                  # should now show writable: yes
-/coin list                                       # should show Figgies (replicated from A)
+/auction status                                  # every node is a writer — writable always
+/coin list                                       # should show Figgies (replicated from A within ~2s)
 ```
+
+No `/auction join` step, no bootstrap key to copy — peers on the same topic discover each other automatically via Hyperswarm announcement. Ops fan out within a couple of seconds.
 
 ### Alice gifts Bob some FIG (single op, atomic transfer)
 

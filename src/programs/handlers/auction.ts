@@ -40,15 +40,8 @@ import {
 	type AuctionSettleOp,
 	type AuctionCancelOp,
 	type AuctionAsset,
-	type JoinOp,
 } from "../../ledger-host.js";
 import { randomUUID } from "node:crypto";
-
-// ── Auto-join over Hyperswarm directory topic ────────────────────
-
-export const AUCTION_JOIN_CONTENT_TYPE = "glon/auction-join";
-const JOIN_BROADCAST_INTERVAL_MS = 15_000;
-const JOIN_TOPIC_LABEL = "glon-auction-join-v1";
 
 // ── Helpers ──────────────────────────────────────────────────────
 
@@ -230,81 +223,11 @@ async function doGetBids(auctionId: string): Promise<Array<{
 		.sort((a, b) => (b.created_at ?? 0) - (a.created_at ?? 0));
 }
 
-// ── Auto peer.join over Hyperswarm ───────────────────────────────
-
-/** Build a signed peer.join op announcing this node's writer key and chain key. */
-async function buildJoinAnnouncement(ctx: ProgramContext, keyName: string): Promise<JoinOp & { signature: string }> {
-	if (!autobaseReady()) throw new Error("auction: autobase not ready");
-	const writerKey = getWriterPubkeyHex();
-	const keyInfo = await ctx.dispatchProgram("/wallet", "show", [keyName]) as { pubkey: string } | null;
-	if (!keyInfo) throw new Error(`auction: wallet key "${keyName}" not found`);
-
-	const opNoSig = {
-		kind: "peer.join" as const,
-		writer_pubkey: writerKey,
-		chain_pubkey: keyInfo.pubkey,
-		created_at: Date.now(),
-	};
-	const signature = await signOp(ctx, keyName, opNoSig);
-	return { ...opNoSig, signature };
-}
-
-/** Broadcast a peer.join announcement on the auction-join topic.
- *  Called periodically while we're not yet a writer. Stops once we are. */
-async function broadcastJoinAnnounce(ctx: ProgramContext): Promise<{ broadcast: boolean; reason?: string }> {
-	if (!autobaseReady()) return { broadcast: false, reason: "autobase not ready" };
-	if (isWritable()) return { broadcast: false, reason: "already a writer" };
-
-	if (!swarmIsReady()) return { broadcast: false, reason: "swarm not ready" };
-
-	let announcement: JoinOp & { signature: string };
-	try {
-		announcement = await buildJoinAnnouncement(ctx, "default");
-	} catch (err: any) {
-		return { broadcast: false, reason: err?.message ?? "no wallet key 'default' yet" };
-	}
-
-	const topicHex = swarmTopicFor(JOIN_TOPIC_LABEL).toString("hex");
-	const payload_b64 = Buffer.from(JSON.stringify(announcement)).toString("base64");
-	try {
-		await ctx.dispatchProgram("/transport-hyperswarm", "broadcast", [{
-			topic: topicHex,
-			payload_b64,
-			content_type: AUCTION_JOIN_CONTENT_TYPE,
-			metadata: {},
-		}]);
-		return { broadcast: true };
-	} catch (err: any) {
-		return { broadcast: false, reason: err?.message ?? "broadcast failed" };
-	}
-}
-
-/** Content handler: an existing writer relays the incoming peer.join into the autobase.
- *  Sig verification happens inside apply, so this is best-effort. */
-async function handleJoinAnnounce(_ctx: ProgramContext, envelope: { payload: Uint8Array; metadata: Record<string, string> }, _blob: unknown): Promise<boolean> {
-	if (!autobaseReady() || !isWritable()) return false;
-	let signedOp: JoinOp & { signature: string };
-	try { signedOp = JSON.parse(new TextDecoder().decode(envelope.payload)); }
-	catch { return false; }
-	if (signedOp.kind !== "peer.join") return false;
-	if (!signedOp.writer_pubkey || !signedOp.chain_pubkey || !signedOp.signature) return false;
-
-	// Skip if the peer is already a writer (their writer key shows up in
-	// our peer/<chain>/writer hyperbee record).
-	const existing = await viewGet<{ writer_pubkey: string }>(`peer/${signedOp.chain_pubkey}/writer`);
-	if (existing) return true;
-
-	try {
-		await appendOp(signedOp);
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-// One-time content handler registration. registerActorContentHandler dispatches
-// incoming envelopes to the named actor action.
-registerActorContentHandler(AUCTION_JOIN_CONTENT_TYPE, "/auction", "handleJoinAnnounce");
+// peer.join admission flow was deleted with the raw-ledger cutover
+// (Phase 3). The raw ledger has no writer set — every node owns its own
+// writer hypercore and writes immediately. The constants below are kept
+// briefly for the help text but the broadcast / handler / actor action
+// are gone.
 
 // ── CLI handler ──────────────────────────────────────────────────
 
@@ -324,9 +247,11 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 				break;
 			}
 			const s = statusSnapshot();
-			print(bold("  Auction") + dim(" — permissionless autobase ledger"));
-			print(dim("    bootstrap key: ") + s.bootstrap_key.slice(0, 32) + "...");
+			const modeLabel = s.backend === "raw" ? "raw multi-writer CRDT" : "autobase (legacy)";
+			print(bold("  Auction") + dim(` — permissionless auction house (${modeLabel})`));
+			if (s.bootstrap_key) print(dim("    bootstrap key: ") + s.bootstrap_key.slice(0, 32) + "...");
 			print(dim("    writer pubkey: ") + s.writer_pubkey.slice(0, 32) + "...");
+			if (s.known_writers !== undefined) print(dim("    known writers: ") + String(s.known_writers));
 			print(dim("    system length: ") + String(s.system_length));
 			print(dim("    view length:   ") + String(s.view_length));
 			break;
@@ -495,24 +420,6 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 			break;
 		}
 
-		case "join": {
-			// Useful when running a second daemon: shows your writer key
-			// and broadcasts an announce immediately so a founder online
-			// right now can relay it.
-			if (!autobaseReady()) { print(red("  Autobase not initialised.")); break; }
-			print(bold("  Auction join") + dim(" — request admission to the network"));
-			print(dim("    bootstrap key: ") + statusSnapshot().bootstrap_key);
-			print(dim("    writer pubkey: ") + getWriterPubkeyHex());
-			print(dim("    writable now:  ") + (isWritable() ? green("yes") : yellow("no — waiting for relay")));
-			if (!isWritable()) {
-				const r = await broadcastJoinAnnounce(ctx);
-				print(r.broadcast
-					? dim("    → join announcement broadcast on the network")
-					: yellow(`    → broadcast skipped: ${r.reason ?? "unknown"}`));
-			}
-			break;
-		}
-
 		case "cancel": {
 			if (args.length < 1) { print(red("Usage: auction cancel <auctionId> [with <key>]")); break; }
 			const auctionId = args[0];
@@ -530,7 +437,6 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 			print([
 				bold("  Auction") + dim(" — permissionless P2P auction house"),
 				`    ${cyan("auction status")}                              ledger health snapshot`,
-				`    ${cyan("auction join")}                                broadcast a join request (run on first start)`,
 				`    ${cyan("auction list")}                                local view of all auctions`,
 				`    ${cyan("auction post")} ${dim("<give> [for <want>] [to <pubkey>] [--expires=1h]")}  post (default expiry 24h)`,
 				dim(`        omit "for"  → open auction; bidders propose any tokens / basket`),
@@ -539,9 +445,9 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 				`    ${cyan("auction bid")} ${dim("<auctionId> <amount> <token>")}      bid on an auction`,
 				`    ${cyan("auction settle")} ${dim("<id> <winner> [--bid-at=<ms>]")}   seller picks a winner (--bid-at required for open auctions)`,
 				`    ${cyan("auction cancel")} ${dim("<auctionId>")}                    seller cancels an open auction`,
-				dim(`  Ledger: ~/.glon/autobase  (permissionless CRDT over Hyperswarm)`),
+				dim(`  Ledger: ~/.glon/ledger  (permissionless CRDT over Hyperswarm)`),
 				dim(`  Bring up the daemon with GLON_SWARM=1 GLON_AUCTION=1.`),
-				dim(`  To join a specific network: set GLON_AUTOBASE_BOOTSTRAP=<hex-pubkey>.`),
+				dim(`  To join a specific network: set GLON_LEDGER_TOPIC=<label>.`),
 			].join("\n"));
 		}
 	}
@@ -551,15 +457,6 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 
 const actorDef: ProgramActorDef = {
 	createState: () => ({}),
-	tickMs: JOIN_BROADCAST_INTERVAL_MS,
-	onTick: async (ctx: ProgramContext) => {
-		// While we're not a writer, periodically rebroadcast a peer.join
-		// so existing writers learn about us and relay the op into the
-		// autobase. Stops broadcasting once writable.
-		if (!autobaseReady() || isWritable()) return;
-		const r = await broadcastJoinAnnounce(ctx);
-		if (r.broadcast) ctx.print?.(dim(`[auction] join announce sent`));
-	},
 	actions: {
 		status: async (_ctx: ProgramContext) => statusSnapshot(),
 		list: async (_ctx: ProgramContext) => doList(),
@@ -571,8 +468,6 @@ const actorDef: ProgramActorDef = {
 		bid: async (ctx: ProgramContext, input: { auctionId: string; offer: AuctionAsset[]; keyName: string }) => doBid(ctx, input),
 		settle: async (ctx: ProgramContext, input: { auctionId: string; winner: string; keyName: string; winningBidAt?: number }) => doSettle(ctx, input),
 		cancel: async (ctx: ProgramContext, input: { auctionId: string; keyName: string }) => doCancel(ctx, input),
-		announceJoin: async (ctx: ProgramContext) => broadcastJoinAnnounce(ctx),
-		handleJoinAnnounce,
 	},
 };
 

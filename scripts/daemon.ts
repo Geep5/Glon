@@ -120,12 +120,21 @@ async function resolveId(raw: string): Promise<string | null> {
 		}
 
 		// ── Ledger bring-up ──────────────────────────────────────
-		// Opt-in via GLON_AUCTION=1. Backend is the autobase (default)
-		// OR the raw multi-writer CRDT (if GLON_RAW_LEDGER=1). Raw mode
-		// has no writer set / no admission and isWritable() is always
-		// true; autobase mode keeps the legacy admission flow.
+		// Opt-in via GLON_AUCTION=1. Backend is the raw multi-writer
+		// CRDT by default (no writer set, no admission, isWritable()
+		// always true). The autobase backend is preserved as legacy
+		// opt-in via GLON_LEDGER_BACKEND=autobase for users with
+		// existing autobase data.
+		if (process.env.GLON_AUTOBASE_BOOTSTRAP) {
+			console.log(`[daemon] DEPRECATED: GLON_AUTOBASE_BOOTSTRAP is ignored under the raw ledger (no bootstrap keys exist). Set GLON_LEDGER_BACKEND=autobase if you want legacy autobase mode.`);
+		}
+		if (process.env.GLON_RAW_LEDGER === "1") {
+			console.log(`[daemon] note: GLON_RAW_LEDGER=1 is now the default and no longer required; you can drop it from your env.`);
+		}
+
+		const backendChoice = (process.env.GLON_LEDGER_BACKEND ?? "raw").toLowerCase();
 		if (process.env.GLON_AUCTION === "1") {
-			if (process.env.GLON_RAW_LEDGER === "1") {
+			if (backendChoice !== "autobase") {
 				// ── Raw multi-writer backend ─────────────────────
 				try {
 					const { default: Corestore } = await import("corestore");
