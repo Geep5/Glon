@@ -29,32 +29,56 @@ function isPeered(trust_level: string | undefined | null): boolean {
 export const PEER_CHAT_CONTENT_TYPE = "glon/peer-chat";
 
 const PERSISTED_STATE_FIELD = "persisted_state";
-const MAX_MESSAGES_PER_CONVERSATION = 2000;  // hard cap on in-memory growth
-const MAX_BODY_LEN = 8000;                   // ~8KB per message; refuse larger
+const MAX_MESSAGES_PER_CONVERSATION = 2000;
+const MAX_BODY_LEN = 8000;
+
+// Loop-prevention backstops. Both are below the semantic done-tool layer
+// — they only trigger when agents fail to call peer_conversation_done.
+const HOP_CAP_PER_CONVERSATION = 20;
+const NEW_CONVO_WINDOW_MS = 5 * 60 * 1000;
+const MAX_NEW_CONVOS_PER_PEER_PER_WINDOW = 3;
+
+// Bump when the on-disk schema changes incompatibly; load() throws old data
+// away and starts fresh. Acceptable since peer-chat history isn't precious.
+const STATE_VERSION = 2;
 
 // ── Types ────────────────────────────────────────────────────────
 
 export interface PeerMessage {
 	msg_id: string;
+	conversation_id: string;
 	direction: "in" | "out";
-	kind: string;                 // "text" in v1; opaque to receivers for forward-compat
+	kind: string;                 // "text" today; future: agent-request/response
 	in_reply_to: string | null;
-	body: unknown;                // string for kind:"text"; opaque for future kinds
+	body: unknown;
 	sent_at: number;
 }
 
+export type ConversationStatus = "active" | "done" | "auto-expired";
+
 export interface Conversation {
+	id: string;                            // conversation_id
 	peer_identity_pubkey: string;
 	peer_hyperswarm_pubkey: string;
 	peer_display_name: string;
 	peer_object_id?: string;
+	goal: string;                          // human-readable purpose
+	status: ConversationStatus;
+	started_at: number;
+	started_by_agent_id?: string;          // local sender id, or undefined for cross-machine
+	owner_agent_id?: string;               // which local agent's perspective this conv is (local-route only)
+	mirror_conversation_id?: string;       // links the other side's mirror for local convos
+	ended_at?: number;
+	ended_reason?: string;
+	ended_by_agent_id?: string;
 	messages: PeerMessage[];
 	last_message_at: number;
 	unread_count: number;
 }
 
 interface PersistedChatState {
-	conversations: Record<string, Conversation>;   // keyed by peer_identity_pubkey
+	version: number;
+	conversations: Record<string, Conversation>;   // keyed by conversation_id
 }
 
 /**
@@ -84,7 +108,7 @@ interface BlobMeta {
 // ── Persistence (same pattern as /directory) ────────────────────
 
 function snapshotState(state: Record<string, any>): string {
-	return JSON.stringify({ conversations: state.conversations ?? {} });
+	return JSON.stringify({ version: STATE_VERSION, conversations: state.conversations ?? {} });
 }
 
 async function restoreState(state: Record<string, any>, ctx: ProgramContext) {
@@ -95,6 +119,15 @@ async function restoreState(state: Record<string, any>, ctx: ProgramContext) {
 		const raw = typeof field === "string" ? field : field?.stringValue;
 		if (!raw) return;
 		const parsed = JSON.parse(raw) as PersistedChatState;
+		// Schema migration: previous version was keyed by peer_identity_pubkey
+		// and had no goal/status. Reset rather than translate — peer-chat
+		// history isn't precious, and clean state avoids ambiguity.
+		if (parsed.version !== STATE_VERSION) {
+			ctx.print?.(dim(`  [peer-chat] resetting state (version ${parsed.version ?? "1"} → ${STATE_VERSION})`));
+			state.conversations = {};
+			state._lastPersistedSnapshot = snapshotState(state);
+			return;
+		}
 		if (parsed.conversations) state.conversations = parsed.conversations;
 		state._lastPersistedSnapshot = snapshotState(state);
 	} catch (err: any) {
@@ -184,51 +217,209 @@ async function resolveSelfIdentity(ctx: ProgramContext): Promise<string> {
 		return null;
 	}
 
-/** Push a new message into a conversation; create the conversation if it doesn't exist. */
-function appendMessage(state: Record<string, any>, peer: {
-	identity_pubkey: string; hyperswarm_pubkey: string; display_name: string; peer_object_id?: string;
-}, msg: PeerMessage): void {
-	state.conversations = state.conversations ?? {};
-	const key = peer.identity_pubkey.toLowerCase();
-	let conv = state.conversations[key] as Conversation | undefined;
-	if (!conv) {
-		conv = {
-			peer_identity_pubkey: peer.identity_pubkey,
-			peer_hyperswarm_pubkey: peer.hyperswarm_pubkey,
-			peer_display_name: peer.display_name,
-			peer_object_id: peer.peer_object_id,
-			messages: [],
-			last_message_at: 0,
-			unread_count: 0,
-		};
-	}
-	// Dedupe by msg_id — re-deliveries are possible (network retries, etc.).
+/** Generate a short opaque conversation id. */
+function newConversationId(): string {
+	return `c_${randomUUID().replace(/-/g, "").slice(0, 12)}`;
+}
+
+/** Push a new message into an existing conversation. */
+function appendMessageToConversation(state: Record<string, any>, conv: Conversation, msg: PeerMessage): void {
 	if (conv.messages.some((m) => m.msg_id === msg.msg_id)) return;
 	conv.messages.push(msg);
-	// Cap message buffer so a long-running pair doesn't bloat persisted state.
 	if (conv.messages.length > MAX_MESSAGES_PER_CONVERSATION) {
 		conv.messages = conv.messages.slice(-MAX_MESSAGES_PER_CONVERSATION);
 	}
 	conv.last_message_at = msg.sent_at;
-	// Refresh cached peer metadata (hyperswarm key may have rotated; display name may have changed)
-	conv.peer_hyperswarm_pubkey = peer.hyperswarm_pubkey;
-	conv.peer_display_name = peer.display_name;
-	if (peer.peer_object_id) conv.peer_object_id = peer.peer_object_id;
 	if (msg.direction === "in") conv.unread_count += 1;
-	state.conversations[key] = conv;
+
+	// Backstop: if the conversation has run past the hop cap with neither
+	// side calling done, auto-expire it. Future sends fail with a clear
+	// error; the human user can start a fresh goal-driven convo.
+	if (conv.status === "active" && conv.messages.length >= HOP_CAP_PER_CONVERSATION) {
+		conv.status = "auto-expired";
+		conv.ended_at = msg.sent_at;
+		conv.ended_reason = `auto-expired after ${HOP_CAP_PER_CONVERSATION} hops without explicit done`;
+	}
+	state.conversations[conv.id] = conv;
 }
 
-// ── Outbound: send ───────────────────────────────────────────────
+/** Find an existing conversation by id. */
+function getConversation(state: Record<string, any>, conversation_id: string): Conversation | null {
+	const conversations = (state.conversations ?? {}) as Record<string, Conversation>;
+	return conversations[conversation_id] ?? null;
+}
 
-interface SendInput {
+/** Count recent active+done convos started by from_agent_id toward this peer
+ *  (within the rate-limit window). Used to refuse runaway new-convo loops. */
+function countRecentConvos(state: Record<string, any>, peerIdentity: string, fromAgentId: string | undefined, now: number): number {
+	const conversations = (state.conversations ?? {}) as Record<string, Conversation>;
+	const wantPeer = peerIdentity.toLowerCase();
+	let n = 0;
+	for (const c of Object.values(conversations)) {
+		if ((c.peer_identity_pubkey ?? "").toLowerCase() !== wantPeer) continue;
+		if (fromAgentId && c.started_by_agent_id !== fromAgentId) continue;
+		if (now - c.started_at <= NEW_CONVO_WINDOW_MS) n++;
+	}
+	return n;
+}
+
+// ── startConversation ─────────────────────────────────────────────
+
+interface StartConversationInput {
 	peer_id?: string;
 	identity_pubkey?: string;
 	display_name?: string;
+	goal: string;
+	text: string;
+	from_agent_id?: string;   // bound by tool
+}
+
+interface StartConversationResult {
+	conversation_id: string;
+	mirror_conversation_id?: string;
+	msg_id: string;
+}
+
+async function doStartConversation(ctx: ProgramContext, input: StartConversationInput): Promise<StartConversationResult> {
+	if (typeof input?.goal !== "string" || input.goal.trim().length === 0) {
+		throw new Error("peer-chat startConversation: `goal` is required and must be a non-empty string");
+	}
+	if (input.goal.length > 280) {
+		throw new Error(`peer-chat startConversation: goal too long (${input.goal.length} > 280)`);
+	}
+	if (typeof input?.text !== "string" || input.text.length === 0) {
+		throw new Error("peer-chat startConversation: `text` is required (the opening message)");
+	}
+	if (input.text.length > MAX_BODY_LEN) {
+		throw new Error(`peer-chat startConversation: text too long (${input.text.length} > ${MAX_BODY_LEN})`);
+	}
+
+	const peer = await resolvePeerForChat(ctx, input);
+	const state = ctx.state;
+	state.conversations = state.conversations ?? {};
+	const now = Date.now();
+
+	// Rate-limit: refuse runaway "start a new convo every reply" loops.
+	const recent = countRecentConvos(state, peer.identity_pubkey, input.from_agent_id, now);
+	if (recent >= MAX_NEW_CONVOS_PER_PEER_PER_WINDOW) {
+		throw new Error(
+			`peer-chat startConversation: rate limit — ${recent} new conversations with ${peer.display_name} in the last ` +
+			`${NEW_CONVO_WINDOW_MS / 60000} minutes. Wait or continue an existing conversation.`,
+		);
+	}
+
+	const isLocalTarget = String(peer.identity_pubkey).startsWith("local:");
+	const conversation_id = newConversationId();
+	const msg_id = randomUUID().replace(/-/g, "").slice(0, 16);
+
+	if (isLocalTarget) {
+		if (!input.from_agent_id) {
+			throw new Error(`peer-chat startConversation: local-target peer requires from_agent_id`);
+		}
+		const senderPeer = await findLocalPeerForAgent(ctx, input.from_agent_id);
+		if (!senderPeer) {
+			throw new Error(`peer-chat startConversation: no /peer record for sender agent ${input.from_agent_id}`);
+		}
+		const recipientAgentId = String(peer.identity_pubkey).slice("local:".length);
+		const mirror_id = newConversationId();
+
+		// Sender's conversation: peer = recipient
+		const ownerConv: Conversation = {
+			id: conversation_id,
+			peer_identity_pubkey: peer.identity_pubkey,
+			peer_hyperswarm_pubkey: peer.hyperswarm_pubkey,
+			peer_display_name: peer.display_name,
+			peer_object_id: peer.peer_id,
+			goal: input.goal.trim(),
+			status: "active",
+			started_at: now,
+			started_by_agent_id: input.from_agent_id,
+			owner_agent_id: input.from_agent_id,
+			mirror_conversation_id: mirror_id,
+			messages: [],
+			last_message_at: 0,
+			unread_count: 0,
+		};
+		state.conversations[conversation_id] = ownerConv;
+		appendMessageToConversation(state, ownerConv, {
+			msg_id, conversation_id, direction: "out", kind: "text", in_reply_to: null, body: input.text, sent_at: now,
+		});
+
+		// Recipient's mirror conversation: peer = sender
+		const mirrorConv: Conversation = {
+			id: mirror_id,
+			peer_identity_pubkey: senderPeer.identity_pubkey,
+			peer_hyperswarm_pubkey: "",
+			peer_display_name: senderPeer.display_name,
+			peer_object_id: senderPeer.peer_id,
+			goal: input.goal.trim(),
+			status: "active",
+			started_at: now,
+			started_by_agent_id: input.from_agent_id,
+			owner_agent_id: recipientAgentId,
+			mirror_conversation_id: conversation_id,
+			messages: [],
+			last_message_at: 0,
+			unread_count: 0,
+		};
+		state.conversations[mirror_id] = mirrorConv;
+		appendMessageToConversation(state, mirrorConv, {
+			msg_id, conversation_id: mirror_id, direction: "in", kind: "text", in_reply_to: null, body: input.text, sent_at: now,
+		});
+
+		await persistIfChanged(state, ctx);
+		// Fire-and-forget: nudge the recipient agent so it sees the new conversation.
+		void maybeAutoTrigger(ctx, mirror_id);
+		return { conversation_id, mirror_conversation_id: mirror_id, msg_id };
+	}
+
+	// ── Cross-machine: opening message rides over Hyperswarm ──────
+	const self_identity = await resolveSelfIdentity(ctx);
+	const payload: PeerChatPayload = {
+		msg_id,
+		kind: "text",
+		in_reply_to: null,
+		body: input.text,
+		sent_at: now,
+		from_identity_pubkey: self_identity,
+	};
+	const payload_b64 = Buffer.from(JSON.stringify(payload)).toString("base64");
+	await ctx.dispatchProgram("/transport-hyperswarm", "send", [{
+		endpoint: `swarm://${peer.hyperswarm_pubkey}`,
+		payload_b64,
+		content_type: PEER_CHAT_CONTENT_TYPE,
+		metadata: { msg_id, conversation_id, goal: input.goal.trim() },
+	}]);
+
+	const conv: Conversation = {
+		id: conversation_id,
+		peer_identity_pubkey: peer.identity_pubkey,
+		peer_hyperswarm_pubkey: peer.hyperswarm_pubkey,
+		peer_display_name: peer.display_name,
+		peer_object_id: peer.peer_id,
+		goal: input.goal.trim(),
+		status: "active",
+		started_at: now,
+		started_by_agent_id: input.from_agent_id,
+		owner_agent_id: input.from_agent_id,
+		messages: [],
+		last_message_at: 0,
+		unread_count: 0,
+	};
+	state.conversations[conversation_id] = conv;
+	appendMessageToConversation(state, conv, {
+		msg_id, conversation_id, direction: "out", kind: "text", in_reply_to: null, body: input.text, sent_at: now,
+	});
+	await persistIfChanged(state, ctx);
+	return { conversation_id, msg_id };
+}
+
+// ── send: continue an existing active conversation ────────────────
+
+interface SendInput {
+	conversation_id: string;
 	text: string;
 	in_reply_to?: string | null;
-	/** Bound by holdfast-tools so /peer-chat knows which sibling agent
-	 *  is sending. Required for local same-machine routing; ignored
-	 *  for cross-machine Hyperswarm sends (the daemon is the sender). */
 	from_agent_id?: string;
 }
 
@@ -239,61 +430,55 @@ async function doSend(ctx: ProgramContext, input: SendInput): Promise<{ msg_id: 
 	if (input.text.length > MAX_BODY_LEN) {
 		throw new Error(`peer-chat send: message too long (${input.text.length} > ${MAX_BODY_LEN})`);
 	}
-	const peer = await resolvePeerForChat(ctx, input);
+	if (typeof input?.conversation_id !== "string" || !input.conversation_id) {
+		throw new Error("peer-chat send: `conversation_id` is required. Use startConversation to begin a new thread.");
+	}
+	const state = ctx.state;
+	const conv = getConversation(state, input.conversation_id);
+	if (!conv) throw new Error(`peer-chat send: conversation ${input.conversation_id} not found`);
+	if (conv.status !== "active") {
+		throw new Error(`peer-chat send: conversation ${input.conversation_id} is ${conv.status} — start a new one to continue.`);
+	}
+
+	const isLocalTarget = String(conv.peer_identity_pubkey).startsWith("local:");
 	const msg_id = randomUUID().replace(/-/g, "").slice(0, 16);
 	const sent_at = Date.now();
-	const isLocalTarget = String(peer.identity_pubkey).startsWith("local:");
-	const state = ctx.state;
 
-	// ── Local same-machine route ──────────────────────────────────
-	// Two agents on this daemon. Skip Hyperswarm entirely and write the
-	// incoming side directly to the recipient's view in our singleton
-	// state. The outgoing entry in the sender's view is the same as the
-	// cross-machine flow below.
 	if (isLocalTarget) {
-		if (!input.from_agent_id) {
-			throw new Error(`peer-chat send: local-target peer requires from_agent_id (bind it via tool bound_args)`);
+		if (!input.from_agent_id) throw new Error(`peer-chat send: local conversation requires from_agent_id`);
+		// We're writing from the sender's perspective; conv.owner_agent_id IS the sender for this side.
+		if (conv.owner_agent_id && conv.owner_agent_id !== input.from_agent_id) {
+			throw new Error(`peer-chat send: conversation ${input.conversation_id} is owned by ${conv.owner_agent_id}, not ${input.from_agent_id}`);
 		}
-		const senderPeer = await findLocalPeerForAgent(ctx, input.from_agent_id);
-		if (!senderPeer) {
-			throw new Error(`peer-chat send: no /peer record for sender agent ${input.from_agent_id} (re-bootstrap via /holdfast to create one)`);
-		}
-
-		// 1. Outgoing in the sender's view (conversation keyed by recipient)
-		appendMessage(state, {
-			identity_pubkey: peer.identity_pubkey,
-			hyperswarm_pubkey: peer.hyperswarm_pubkey,
-			display_name: peer.display_name,
-			peer_object_id: peer.peer_id,
-		}, {
-			msg_id,
-			direction: "out",
-			kind: "text",
-			in_reply_to: input.in_reply_to ?? null,
-			body: input.text,
-			sent_at,
+		// 1. Outgoing in sender's view
+		appendMessageToConversation(state, conv, {
+			msg_id, conversation_id: conv.id, direction: "out", kind: "text",
+			in_reply_to: input.in_reply_to ?? null, body: input.text, sent_at,
 		});
 
-		// 2. Incoming in the recipient's view (conversation keyed by sender)
-		appendMessage(state, {
-			identity_pubkey: senderPeer.identity_pubkey,
-			hyperswarm_pubkey: "",
-			display_name: senderPeer.display_name,
-			peer_object_id: senderPeer.peer_id,
-		}, {
-			msg_id,
-			direction: "in",
-			kind: "text",
-			in_reply_to: input.in_reply_to ?? null,
-			body: input.text,
-			sent_at,
-		});
+		// 2. Incoming in recipient's mirror
+		const mirrorId = conv.mirror_conversation_id;
+		const mirror = mirrorId ? getConversation(state, mirrorId) : null;
+		if (mirror) {
+			appendMessageToConversation(state, mirror, {
+				msg_id, conversation_id: mirror.id, direction: "in", kind: "text",
+				in_reply_to: input.in_reply_to ?? null, body: input.text, sent_at,
+			});
+			// If the hop-cap auto-expired the owner side, propagate to the mirror.
+			if (conv.status !== "active" && mirror.status === "active") {
+				mirror.status = conv.status;
+				mirror.ended_at = sent_at;
+				mirror.ended_reason = conv.ended_reason;
+			}
+		}
 
 		await persistIfChanged(state, ctx);
+		// Nudge the recipient agent.
+		if (mirror && mirror.status === "active") void maybeAutoTrigger(ctx, mirror.id);
 		return { msg_id };
 	}
 
-	// ── Cross-machine route over Hyperswarm ───────────────────────
+	// Cross-machine
 	const self_identity = await resolveSelfIdentity(ctx);
 	const payload: PeerChatPayload = {
 		msg_id,
@@ -305,28 +490,82 @@ async function doSend(ctx: ProgramContext, input: SendInput): Promise<{ msg_id: 
 	};
 	const payload_b64 = Buffer.from(JSON.stringify(payload)).toString("base64");
 	await ctx.dispatchProgram("/transport-hyperswarm", "send", [{
-		endpoint: `swarm://${peer.hyperswarm_pubkey}`,
+		endpoint: `swarm://${conv.peer_hyperswarm_pubkey}`,
 		payload_b64,
 		content_type: PEER_CHAT_CONTENT_TYPE,
-		metadata: { msg_id },
+		metadata: { msg_id, conversation_id: conv.id },
 	}]);
-
-	// Record locally as outgoing so the UI sees it immediately.
-	appendMessage(state, {
-		identity_pubkey: peer.identity_pubkey,
-		hyperswarm_pubkey: peer.hyperswarm_pubkey,
-		display_name: peer.display_name,
-		peer_object_id: peer.peer_id,
-	}, {
-		msg_id,
-		direction: "out",
-		kind: "text",
-		in_reply_to: input.in_reply_to ?? null,
-		body: input.text,
-		sent_at,
+	appendMessageToConversation(state, conv, {
+		msg_id, conversation_id: conv.id, direction: "out", kind: "text",
+		in_reply_to: input.in_reply_to ?? null, body: input.text, sent_at,
 	});
 	await persistIfChanged(state, ctx);
 	return { msg_id };
+}
+
+// ── endConversation: one-sided "done" closes the thread ──────────
+
+interface EndConversationInput {
+	conversation_id: string;
+	reason?: string;
+	from_agent_id?: string;
+}
+
+async function doEndConversation(ctx: ProgramContext, input: EndConversationInput): Promise<{ ok: true }> {
+	if (typeof input?.conversation_id !== "string" || !input.conversation_id) {
+		throw new Error("peer-chat endConversation: `conversation_id` is required");
+	}
+	const state = ctx.state;
+	const conv = getConversation(state, input.conversation_id);
+	if (!conv) throw new Error(`peer-chat endConversation: conversation ${input.conversation_id} not found`);
+	if (conv.status !== "active") return { ok: true }; // already closed; idempotent
+	const now = Date.now();
+	conv.status = "done";
+	conv.ended_at = now;
+	conv.ended_reason = (input.reason ?? "").toString().slice(0, 200) || "no reason given";
+	conv.ended_by_agent_id = input.from_agent_id ?? conv.owner_agent_id;
+	state.conversations[conv.id] = conv;
+
+	// Mirror too (one side closing closes the whole thread, like real life)
+	if (conv.mirror_conversation_id) {
+		const mirror = getConversation(state, conv.mirror_conversation_id);
+		if (mirror && mirror.status === "active") {
+			mirror.status = "done";
+			mirror.ended_at = now;
+			mirror.ended_reason = conv.ended_reason;
+			mirror.ended_by_agent_id = conv.ended_by_agent_id;
+			state.conversations[mirror.id] = mirror;
+		}
+	}
+	await persistIfChanged(state, ctx);
+	return { ok: true };
+}
+
+// ── Auto-trigger ─────────────────────────────────────────────────
+// When an inbound message lands in a still-active local conversation,
+// nudge the recipient's /agent ask asynchronously so the conversation
+// flows. Fire-and-forget; failures stay out of the caller's path.
+async function maybeAutoTrigger(ctx: ProgramContext, conversation_id: string): Promise<void> {
+	try {
+		const conv = getConversation(ctx.state, conversation_id);
+		if (!conv || conv.status !== "active" || !conv.owner_agent_id) return;
+		const last = conv.messages[conv.messages.length - 1];
+		if (!last || last.direction !== "in") return; // only react to incoming
+		const goalPreview = conv.goal ? conv.goal.slice(0, 200) : "(no goal stated)";
+		const bodyPreview = String(last.body ?? "").slice(0, 1500);
+		const prompt = [
+			`You have a new peer-chat message in an active conversation.`,
+			`Conversation id: ${conv.id}`,
+			`Goal: ${goalPreview}`,
+			`From: ${conv.peer_display_name}`,
+			`Message: ${bodyPreview}`,
+			``,
+			`If the goal is achieved or further reply would not add value, call peer_conversation_done with a short reason. Otherwise, call peer_message_send with this conversation_id to reply. Do NOT ask the human user — this is autonomous A2A.`,
+		].join("\n");
+		await ctx.dispatchProgram("/agent", "ask", [conv.owner_agent_id, prompt]);
+	} catch (err: any) {
+		ctx.print?.(dim(`  [peer-chat] auto-trigger failed for conv ${conversation_id}: ${err?.message ?? err}`));
+	}
 }
 
 // ── Inbound: handleIncoming (dispatched via registerActorContentHandler) ──
@@ -386,13 +625,44 @@ async function doHandleIncoming(ctx: ProgramContext, input: HandleIncomingInput)
 
 	// Persist.
 	const state = ctx.state;
-	appendMessage(state, {
-		identity_pubkey: peerRow.identity_pubkey,
-		hyperswarm_pubkey: peerRow.hyperswarm_pubkey,
-		display_name: peerRow.display_name ?? "(unnamed)",
-		peer_object_id: peerRow.id,
-	}, {
+	// Match an existing active conversation with this peer, else start one
+	// (cross-machine peers that don't speak the new protocol won't send
+	// conversation_id metadata yet; we accept this gracefully).
+	const conversation_id_from_meta = (input as any)?.metadata?.conversation_id ?? null;
+	let conv: Conversation | null = null;
+	if (conversation_id_from_meta) {
+		conv = getConversation(state, conversation_id_from_meta);
+	}
+	if (!conv) {
+		// Best-effort find: same peer, latest active conversation.
+		const candidates = Object.values((state.conversations ?? {}) as Record<string, Conversation>)
+			.filter((c) => c.peer_identity_pubkey.toLowerCase() === (peerRow.identity_pubkey as string).toLowerCase())
+			.filter((c) => c.status === "active")
+			.sort((a, b) => b.started_at - a.started_at);
+		conv = candidates[0] ?? null;
+	}
+	if (!conv) {
+		// Implicit conversation with no goal — legacy peer or auto-recovered.
+		const conversation_id = newConversationId();
+		conv = {
+			id: conversation_id,
+			peer_identity_pubkey: peerRow.identity_pubkey,
+			peer_hyperswarm_pubkey: peerRow.hyperswarm_pubkey,
+			peer_display_name: peerRow.display_name ?? "(unnamed)",
+			peer_object_id: peerRow.id,
+			goal: "(implicit — inbound without conversation_id)",
+			status: "active",
+			started_at: payload.sent_at,
+			messages: [],
+			last_message_at: 0,
+			unread_count: 0,
+		};
+		state.conversations = state.conversations ?? {};
+		state.conversations[conversation_id] = conv;
+	}
+	appendMessageToConversation(state, conv, {
 		msg_id: payload.msg_id,
+		conversation_id: conv.id,
 		direction: "in",
 		kind: payload.kind ?? "text",
 		in_reply_to: payload.in_reply_to ?? null,
@@ -404,7 +674,6 @@ async function doHandleIncoming(ctx: ProgramContext, input: HandleIncomingInput)
 	// Surface a tiny notification once per conversation pause so the human
 	// notices without spam. /user-chat dedupes by source+text within a
 	// short window; we only ping if it's been quiet for >30s.
-	const conv = state.conversations[(peerRow.identity_pubkey as string).toLowerCase()];
 	if (conv && (Date.now() - (conv.last_message_at - 0) > 30_000 || conv.messages.length === 1)) {
 		const preview = payload.kind === "text" ? String(payload.body).slice(0, 80) : `(${payload.kind})`;
 		try {
@@ -420,58 +689,104 @@ async function doHandleIncoming(ctx: ProgramContext, input: HandleIncomingInput)
 
 // ── Read actions ─────────────────────────────────────────────────
 
-async function doListConversations(ctx: ProgramContext) {
+interface ListConversationsInput {
+	peer_id?: string;
+	identity_pubkey?: string;
+	status?: ConversationStatus;
+	from_agent_id?: string;        // bound by tool; filters to the asking agent's conversations
+	include_other_perspectives?: boolean;  // default false — hide mirror entries
+}
+
+async function doListConversations(ctx: ProgramContext, input?: ListConversationsInput) {
 	const state = ctx.state;
 	const conversations = (state.conversations ?? {}) as Record<string, Conversation>;
+	const i = input ?? {};
 	return Object.values(conversations)
+		.filter((c) => {
+			if (i.peer_id && c.peer_object_id !== i.peer_id) return false;
+			if (i.status && c.status !== i.status) return false;
+			if (i.identity_pubkey && c.peer_identity_pubkey.toLowerCase() !== i.identity_pubkey.toLowerCase()) return false;
+			if (i.from_agent_id && !i.include_other_perspectives) {
+				// Show only conversations this agent owns. Mirrors owned by
+				// other local agents (peer_identity_pubkey == local:<me>)
+				// belong to the OTHER side.
+				if (c.owner_agent_id && c.owner_agent_id !== i.from_agent_id) return false;
+				const ownLocal = `local:${i.from_agent_id}`.toLowerCase();
+				if (c.peer_identity_pubkey.toLowerCase() === ownLocal) return false;
+			}
+			return true;
+		})
 		.sort((a, b) => b.last_message_at - a.last_message_at)
 		.map((c) => ({
+			conversation_id: c.id,
 			peer_identity_pubkey: c.peer_identity_pubkey,
 			peer_hyperswarm_pubkey: c.peer_hyperswarm_pubkey,
 			peer_display_name: c.peer_display_name,
 			peer_object_id: c.peer_object_id,
+			goal: c.goal,
+			status: c.status,
+			started_at: c.started_at,
+			started_by_agent_id: c.started_by_agent_id,
+			owner_agent_id: c.owner_agent_id,
+			ended_at: c.ended_at,
+			ended_reason: c.ended_reason,
+			ended_by_agent_id: c.ended_by_agent_id,
 			last_message_at: c.last_message_at,
 			unread_count: c.unread_count,
 			message_count: c.messages.length,
+			hops_remaining: Math.max(0, HOP_CAP_PER_CONVERSATION - c.messages.length),
+			last_message_preview: c.messages.length > 0 ? String(c.messages[c.messages.length - 1].body ?? "").slice(0, 120) : "",
 		}));
 }
 
 interface ListMessagesInput {
+	conversation_id?: string;
 	peer_id?: string;
 	identity_pubkey?: string;
-	since?: number;     // ms epoch — return messages strictly after this
+	from_agent_id?: string;
+	since?: number;
 	limit?: number;
 }
 
 async function doListMessages(ctx: ProgramContext, input: ListMessagesInput) {
 	const state = ctx.state;
 	const conversations = (state.conversations ?? {}) as Record<string, Conversation>;
-	let key: string | undefined;
-	if (input.identity_pubkey) key = input.identity_pubkey.toLowerCase();
-	else if (input.peer_id) {
-		const conv = Object.values(conversations).find((c) => c.peer_object_id === input.peer_id);
-		if (conv) key = conv.peer_identity_pubkey.toLowerCase();
+	let conv: Conversation | null = null;
+	if (input.conversation_id) {
+		conv = conversations[input.conversation_id] ?? null;
+	} else if (input.identity_pubkey || input.peer_id) {
+		// Find the most recent active conversation owned by this agent for the requested peer.
+		const matches = Object.values(conversations).filter((c) => {
+			if (input.identity_pubkey && c.peer_identity_pubkey.toLowerCase() !== input.identity_pubkey.toLowerCase()) return false;
+			if (input.peer_id && c.peer_object_id !== input.peer_id) return false;
+			if (input.from_agent_id && c.owner_agent_id && c.owner_agent_id !== input.from_agent_id) return false;
+			return true;
+		}).sort((a, b) => b.last_message_at - a.last_message_at);
+		conv = matches[0] ?? null;
 	}
-	if (!key) return [];
-	const conv = conversations[key];
 	if (!conv) return [];
 	const since = typeof input.since === "number" ? input.since : 0;
 	const limit = typeof input.limit === "number" && input.limit > 0 ? input.limit : 500;
 	return conv.messages.filter((m) => m.sent_at > since).slice(-limit);
 }
 
-interface MarkReadInput { peer_id?: string; identity_pubkey?: string; }
+interface MarkReadInput {
+	conversation_id?: string;
+	peer_id?: string;
+	identity_pubkey?: string;
+}
 async function doMarkRead(ctx: ProgramContext, input: MarkReadInput) {
 	const state = ctx.state;
 	const conversations = (state.conversations ?? {}) as Record<string, Conversation>;
-	let key: string | undefined;
-	if (input.identity_pubkey) key = input.identity_pubkey.toLowerCase();
-	else if (input.peer_id) {
-		const conv = Object.values(conversations).find((c) => c.peer_object_id === input.peer_id);
-		if (conv) key = conv.peer_identity_pubkey.toLowerCase();
+	let conv: Conversation | null = null;
+	if (input.conversation_id) conv = conversations[input.conversation_id] ?? null;
+	else {
+		const matches = Object.values(conversations).filter((c) =>
+			(input.identity_pubkey && c.peer_identity_pubkey.toLowerCase() === input.identity_pubkey.toLowerCase()) ||
+			(input.peer_id && c.peer_object_id === input.peer_id),
+		);
+		conv = matches[0] ?? null;
 	}
-	if (!key) return { ok: true };
-	const conv = conversations[key];
 	if (!conv) return { ok: true };
 	if (conv.unread_count !== 0) {
 		conv.unread_count = 0;
@@ -483,13 +798,17 @@ async function doMarkRead(ctx: ProgramContext, input: MarkReadInput) {
 async function doStatus(ctx: ProgramContext) {
 	const state = ctx.state;
 	const conversations = (state.conversations ?? {}) as Record<string, Conversation>;
-	let in_count = 0, out_count = 0, unread = 0;
+	let in_count = 0, out_count = 0, unread = 0, active = 0, done = 0, expired = 0;
 	for (const c of Object.values(conversations)) {
 		unread += c.unread_count;
 		for (const m of c.messages) (m.direction === "in" ? in_count++ : out_count++);
+		if (c.status === "active") active++;
+		else if (c.status === "done") done++;
+		else if (c.status === "auto-expired") expired++;
 	}
 	return {
 		conversations: Object.keys(conversations).length,
+		active, done, auto_expired: expired,
 		messages_in: in_count,
 		messages_out: out_count,
 		unread,
@@ -515,7 +834,16 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 		if (!peerRef || !text) { print(red("Usage: /peer-chat send <peer-name|identity-pubkey> <message...>")); return; }
 		try {
 			const isHex = /^[0-9a-fA-F]{64}$/.test(peerRef);
-			const r = await doSend(ctx, isHex ? { identity_pubkey: peerRef, text } : { display_name: peerRef, text });
+			const ref = isHex ? { identity_pubkey: peerRef } : { display_name: peerRef };
+			// Find an active conversation with this peer; if none, start one.
+			const convs = await doListConversations(ctx, { ...ref, status: "active" });
+			let conversation_id = (convs[0] as any)?.conversation_id;
+			if (!conversation_id) {
+				const r = await doStartConversation(ctx, { ...ref, goal: "(CLI message from human)", text });
+				print(green(`started conversation ${r.conversation_id}, sent: ${r.msg_id}`));
+				return;
+			}
+			const r = await doSend(ctx, { conversation_id, text });
 			print(green(`sent: ${r.msg_id}`));
 		} catch (err: any) {
 			print(red(`Error: ${err?.message ?? String(err)}`));
@@ -542,12 +870,13 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 		return;
 	}
 	if (cmd === "list") {
-		const convs = await doListConversations(ctx);
+		const convs = await doListConversations(ctx, {});
 		if (convs.length === 0) { print(dim("(no conversations yet)")); return; }
 		for (const c of convs) {
 			const age = Math.round((Date.now() - c.last_message_at) / 1000);
 			const unread = c.unread_count > 0 ? red(` (${c.unread_count} unread)`) : "";
-			print(`  ${cyan(c.peer_display_name)}  ${dim((c.peer_identity_pubkey || "").slice(0, 16))}  ${dim(`${c.message_count} msgs, ${age}s ago`)}${unread}`);
+			const statusTag = c.status === "active" ? green("●") : c.status === "done" ? dim("✓") : yellow("⌛");
+			print(`  ${statusTag} ${cyan(c.peer_display_name)}  ${dim(`"${(c.goal || "").slice(0, 40)}"`)}  ${dim(`${c.message_count} msgs, ${age}s ago`)}${unread}`);
 		}
 		return;
 	}
@@ -571,33 +900,72 @@ const actorDef: ProgramActorDef = {
 		await restoreState(ctx.state, ctx);
 	},
 	typedActions: {
-		send: {
-			description: "Send a chat message to a peered glon. Refuses if the target's trust_level isn't peered (trusted/friend/family).",
+		startConversation: {
+			description: "Start a new goal-driven conversation with a peer. Requires goal (1-280 chars) and an opening text message. Returns conversation_id; subsequent messages use send with that id. Either side can call endConversation to close.",
 			inputSchema: {
 				type: "object",
-				required: ["text"],
+				required: ["goal", "text"],
 				properties: {
 					peer_id: { type: "string" },
 					identity_pubkey: { type: "string" },
 					display_name: { type: "string" },
+					goal: { type: "string" },
+					text: { type: "string" },
+					from_agent_id: { type: "string" },
+				},
+			},
+			handler: async (ctx, input: StartConversationInput) => doStartConversation(ctx, input),
+		},
+		send: {
+			description: "Send a message into an existing active conversation. Requires conversation_id from a prior startConversation. Fails if the conversation is done or auto-expired.",
+			inputSchema: {
+				type: "object",
+				required: ["conversation_id", "text"],
+				properties: {
+					conversation_id: { type: "string" },
 					text: { type: "string" },
 					in_reply_to: { type: ["string", "null"] },
+					from_agent_id: { type: "string" },
 				},
 			},
 			handler: async (ctx, input: SendInput) => doSend(ctx, input),
 		},
-		listConversations: {
-			description: "Return a summary list of conversations, sorted by last_message_at desc.",
-			inputSchema: { type: "object", properties: {} },
-			handler: async (ctx) => doListConversations(ctx),
+		endConversation: {
+			description: "Mark a conversation as done. One side calling this closes it for both. Idempotent on already-closed conversations.",
+			inputSchema: {
+				type: "object",
+				required: ["conversation_id"],
+				properties: {
+					conversation_id: { type: "string" },
+					reason: { type: "string" },
+					from_agent_id: { type: "string" },
+				},
+			},
+			handler: async (ctx, input: EndConversationInput) => doEndConversation(ctx, input),
 		},
-		listMessages: {
-			description: "Return messages in a conversation. Pass either peer_id or identity_pubkey. Optional since (ms epoch) returns only newer messages.",
+		listConversations: {
+			description: "List conversations, sorted by last_message_at desc. Pass from_agent_id to filter to your own perspective (drops mirror entries for sibling agents).",
 			inputSchema: {
 				type: "object",
 				properties: {
 					peer_id: { type: "string" },
 					identity_pubkey: { type: "string" },
+					status: { type: "string", enum: ["active", "done", "auto-expired"] },
+					from_agent_id: { type: "string" },
+					include_other_perspectives: { type: "boolean" },
+				},
+			},
+			handler: async (ctx, input: ListConversationsInput) => doListConversations(ctx, input ?? {}),
+		},
+		listMessages: {
+			description: "Return messages in a conversation. Prefer conversation_id; peer_id/identity_pubkey resolves to the most recent matching conversation.",
+			inputSchema: {
+				type: "object",
+				properties: {
+					conversation_id: { type: "string" },
+					peer_id: { type: "string" },
+					identity_pubkey: { type: "string" },
+					from_agent_id: { type: "string" },
 					since: { type: "number" },
 					limit: { type: "number" },
 				},
@@ -606,11 +974,11 @@ const actorDef: ProgramActorDef = {
 		},
 		markRead: {
 			description: "Reset unread_count for a conversation to 0.",
-			inputSchema: { type: "object", properties: { peer_id: { type: "string" }, identity_pubkey: { type: "string" } } },
+			inputSchema: { type: "object", properties: { conversation_id: { type: "string" }, peer_id: { type: "string" }, identity_pubkey: { type: "string" } } },
 			handler: async (ctx, input: MarkReadInput) => doMarkRead(ctx, input ?? {}),
 		},
 		status: {
-			description: "Return counters: conversations, messages in/out, unread.",
+			description: "Return counters: conversations (total/active/done/auto-expired), messages in/out, unread.",
 			inputSchema: { type: "object", properties: {} },
 			handler: async (ctx) => doStatus(ctx),
 		},
@@ -633,4 +1001,4 @@ registerActorContentHandler(PEER_CHAT_CONTENT_TYPE, "/peer-chat", "handleIncomin
 const program: ProgramDef = { handler, actor: actorDef };
 export default program;
 
-export const __test = { doSend, doHandleIncoming, doListConversations, doListMessages, appendMessage };
+export const __test = { doStartConversation, doSend, doEndConversation, doHandleIncoming, doListConversations, doListMessages };

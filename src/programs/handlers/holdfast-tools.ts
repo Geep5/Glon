@@ -549,30 +549,77 @@ function buildPeerChatTools(agentId: string): ToolSpec[] {
 	const sender = { from_agent_id: agentId };
 	return [
 		{
-			name: "peer_message_send",
-			description: "Send a text message to another peered agent or human over peer-chat. Target must be peered (trust_level family/trusted/self). Pass peer_id (from peer_list) or identity_pubkey. For same-machine sibling agents the message routes in-process; for remote peers it goes over Hyperswarm. Optionally set in_reply_to to thread.",
+			name: "peer_conversation_start",
+			description: "Start a new goal-driven conversation with a peered agent or human. Always include a clear, specific goal (e.g. 'introduce ourselves', 'coordinate Cash's pickup tomorrow', 'compare task-tracking approaches'). The opening text becomes the first message. Returns conversation_id — use that in subsequent peer_message_send / peer_conversation_done calls.",
 			input_schema: {
 				type: "object",
+				required: ["goal", "text"],
 				properties: {
-					peer_id: { type: "string", description: "Peer id from /peer (preferred)." },
-					identity_pubkey: { type: "string", description: "64-hex identity pubkey, or 'local:<agent-id>' for same-machine peers." },
-					display_name: { type: "string", description: "Display name if neither peer_id nor a known identity resolves." },
+					peer_id: { type: "string", description: "Peer id from peer_list (preferred)." },
+					identity_pubkey: { type: "string", description: "Identity pubkey (64-hex or 'local:<agent-id>')." },
+					display_name: { type: "string", description: "Display name fallback." },
+					goal: { type: "string", description: "Human-readable purpose, 1-280 chars." },
+					text: { type: "string", description: "Opening message." },
+				},
+			},
+			target_prefix: "/peer-chat",
+			target_action: "startConversation",
+			bound_args: sender,
+		},
+		{
+			name: "peer_message_send",
+			description: "Send a follow-up message into an active conversation. Requires conversation_id from a prior peer_conversation_start (or from peer_conversations_list). Fails if the conversation is done/auto-expired — start a new one to continue.",
+			input_schema: {
+				type: "object",
+				required: ["conversation_id", "text"],
+				properties: {
+					conversation_id: { type: "string", description: "From a prior peer_conversation_start or peer_conversations_list result." },
 					text: { type: "string", description: "Message body, up to ~8000 chars." },
 					in_reply_to: { type: ["string", "null"], description: "Optional msg_id this message is a reply to." },
 				},
-				required: ["text"],
 			},
 			target_prefix: "/peer-chat",
 			target_action: "send",
 			bound_args: sender,
 		},
 		{
-			name: "peer_message_list",
-			description: "List messages in a peer-chat conversation, newest last. Pass peer_id or identity_pubkey to identify the conversation. since (ms epoch) returns only newer messages; limit caps the count.",
+			name: "peer_conversation_done",
+			description: "Close a conversation when the goal is achieved, the conversation has run its course, or further reply would not add value. Either side can call this — one-sided done closes it for both. Be willing to use this freely: sign-offs, acknowledgements, and 'sounds good' filler should END the thread, not extend it. Include a short reason ('greeted', 'agreed to meet at 4pm', 'no further questions').",
+			input_schema: {
+				type: "object",
+				required: ["conversation_id"],
+				properties: {
+					conversation_id: { type: "string" },
+					reason: { type: "string", description: "Short reason — what was achieved or why ending." },
+				},
+			},
+			target_prefix: "/peer-chat",
+			target_action: "endConversation",
+			bound_args: sender,
+		},
+		{
+			name: "peer_conversations_list",
+			description: "List YOUR conversations (filtered to ones you own). Optional peer_id or identity_pubkey narrows to a specific peer; optional status (active/done/auto-expired) narrows by state. Each entry includes conversation_id, goal, status, hops_remaining, last_message_preview.",
 			input_schema: {
 				type: "object",
 				properties: {
 					peer_id: { type: "string" },
+					identity_pubkey: { type: "string" },
+					status: { type: "string", enum: ["active", "done", "auto-expired"] },
+				},
+			},
+			target_prefix: "/peer-chat",
+			target_action: "listConversations",
+			bound_args: sender,
+		},
+		{
+			name: "peer_message_list",
+			description: "Read messages in a specific conversation. Pass conversation_id (preferred) from peer_conversations_list.",
+			input_schema: {
+				type: "object",
+				properties: {
+					conversation_id: { type: "string" },
+					peer_id: { type: "string", description: "Fallback if you don't have a conversation_id; uses the most recent matching conversation." },
 					identity_pubkey: { type: "string" },
 					since: { type: "number" },
 					limit: { type: "number" },
