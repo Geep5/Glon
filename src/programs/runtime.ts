@@ -22,7 +22,6 @@ import { verify as ed25519Verify } from "../det/ed25519.js";
 
 import * as proto from "../proto.js";
 import * as swarmHost from "../swarm-host.js";
-import * as ledgerHost from "../ledger-host.js";
 
 import type { ObjectState } from "../dag/dag.js";
 
@@ -416,11 +415,6 @@ async function compileModuleProgram(ms: ModuleSet, name: string): Promise<Progra
 			// programs reach it through this external instead of importing the
 			// hyperswarm npm package (which has native deps that can't bundle).
 			"swarm-host.js": swarmHost,
-			// ledger-host: same reason. corestore/autobase/hyperbee pull in
-			// sodium-native; we keep them at the Node level and expose a
-			// thin JSON-typed API to bundled programs. Backend (autobase or
-			// raw multi-writer CRDT) is chosen at init time by the daemon.
-			"ledger-host.js": ledgerHost,
 		};
 		const factory = new Function(bundled);
 		// Node built-ins go through the real require, scoped to node: prefix only
