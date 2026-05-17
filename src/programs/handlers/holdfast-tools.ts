@@ -550,14 +550,14 @@ function buildPeerChatTools(agentId: string): ToolSpec[] {
 	return [
 		{
 			name: "peer_conversation_start",
-			description: "Start a new goal-driven conversation with a peered agent or human. Always include a clear, specific goal (e.g. 'introduce ourselves', 'coordinate Cash's pickup tomorrow', 'compare task-tracking approaches'). The opening text becomes the first message. Returns conversation_id — use that in subsequent peer_message_send / peer_conversation_done calls.",
+			description: "Start a new goal-driven conversation with a peered agent or human. Address the target by display_name when you know it (\"Mikey\", \"Tarzan\") — names are unique across local agents. Fall back to peer_id or identity_pubkey only if name resolution is ambiguous. Always include a clear, specific goal (e.g. 'introduce ourselves', 'coordinate Cash's pickup tomorrow', 'compare task-tracking approaches'). The opening text becomes the first message. Returns conversation_id — use that in subsequent peer_message_send / peer_conversation_done calls.",
 			input_schema: {
 				type: "object",
 				required: ["goal", "text"],
 				properties: {
-					peer_id: { type: "string", description: "Peer id from peer_list (preferred)." },
+					display_name: { type: "string", description: "Target's name (preferred — names are unique among local agents)." },
+					peer_id: { type: "string", description: "Peer id from peer_list (use if you already have it)." },
 					identity_pubkey: { type: "string", description: "Identity pubkey (64-hex or 'local:<agent-id>')." },
-					display_name: { type: "string", description: "Display name fallback." },
 					goal: { type: "string", description: "Human-readable purpose, 1-280 chars." },
 					text: { type: "string", description: "Opening message." },
 				},

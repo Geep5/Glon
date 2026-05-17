@@ -122,18 +122,33 @@ reading, and showing ${them} what you found are not those things.
 
 ## Peer chat (talking to other agents and humans)
 You talk to other peered agents through the \`peer_*\` tools. Conversations
-are explicit and goal-driven:
+are explicit and goal-driven, and you address other agents BY NAME — names
+are unique across local agents (the harness refuses duplicates at bootstrap).
 
-  1. \`peer_conversation_start({peer_id, goal, text})\` — open a new thread.
-     The goal is the WHY, in one short sentence ("introduce ourselves",
-     "coordinate Cash's pickup", "compare task-tracking approaches"). The
-     text is your opening message. Returns \`conversation_id\`.
+  1. \`peer_conversation_start({display_name, goal, text})\` — open a new
+     thread. The goal is the WHY, in one short sentence ("introduce
+     ourselves", "coordinate Cash's pickup", "compare task-tracking
+     approaches"). The text is your opening message. Returns
+     \`conversation_id\`.
   2. \`peer_message_send({conversation_id, text})\` — continue an active
      conversation.
   3. \`peer_conversation_done({conversation_id, reason})\` — close it. Either
      side can call. One-sided done closes for both.
   4. \`peer_conversations_list()\` — see your conversations.
   5. \`peer_message_list({conversation_id})\` — read messages.
+
+**Pattern: "${them} says to you, talk to Y about Z."** That is a direct
+instruction to spawn an A2A conversation. Do it in one tool call:
+
+  peer_conversation_start({
+    display_name: "Y",
+    goal: "Z",
+    text: "<your opening message — natural greeting + the actual ask>"
+  })
+
+You do NOT need to call peer_list first. The display_name resolves
+directly. If the name is unknown, peer_conversation_start fails with a
+clear error and you can fall back to peer_list to disambiguate.
 
 **When to call done.** Be willing to end conversations. After the goal is
 achieved, or once a reply would just be filler ("thanks!", "sounds good!",
@@ -492,6 +507,24 @@ async function findAgentPeer(ctx: ProgramContext, agentId: string): Promise<stri
 	return null;
 }
 
+/** Find any peer record matching display_name (optionally also kind).
+ *  Returns the peer object id of the first match, or null. Used to
+ *  refuse duplicate names at bootstrap. */
+async function findPeerByDisplayName(ctx: ProgramContext, name: string, kind?: string): Promise<string | null> {
+	const store = ctx.store as any;
+	const refs = await store.list("peer") as { id: string }[];
+	const wantName = name.trim().toLowerCase();
+	for (const ref of refs) {
+		const obj = await store.get(ref.id);
+		if (obj?.deleted) continue;
+		const dn = extractString(obj?.fields?.display_name);
+		if (!dn || dn.trim().toLowerCase() !== wantName) continue;
+		if (kind && extractString(obj?.fields?.kind) !== kind) continue;
+		return ref.id;
+	}
+	return null;
+}
+
 /**
  * Find the agent linked to the self peer via its `principal` field. Used on
  * a fresh actor wake when state is empty: walk every agent, return the first
@@ -558,10 +591,24 @@ async function doSetup(opts: SetupOpts, ctx: ProgramContext): Promise<SetupResul
 	const agentName = opts.name?.trim() || "Assistant";
 	const principalName = opts.principalName?.trim() || "Owner";
 
-	// Reuse if an agent with this name already exists, else create.
+	// Names are unique across agents — sibling agents address each other
+	// by display_name through peer_conversation_start, so two "Mikey"s
+	// would create ambiguity. Bootstrap is idempotent on same name +
+	// existing agent; it refuses if the name is taken by a different
+	// non-deleted agent's record (you can't have it both ways).
 	let agentId = await findAgentByName(ctx, agentName);
 	let createdAgent = false;
 	if (!agentId) {
+		// Belt-and-suspenders: a peer with kind=agent but a different
+		// (orphaned) agent_id under this name would also create chat
+		// ambiguity. Refuse rather than silently make it worse.
+		const conflictingPeer = await findPeerByDisplayName(ctx, agentName, "agent");
+		if (conflictingPeer) {
+			throw new Error(
+				`holdfast bootstrap: a peer named "${agentName}" already exists (peer ${conflictingPeer.slice(0, 8)}…). ` +
+				`Names must be unique among agents. Pick a different name or delete the existing peer first.`,
+			);
+		}
 		const system = opts.systemPrompt ?? renderDefaultSystemPrompt({ agentName, principalName });
 		const model = opts.model ?? DEFAULT_MODEL;
 		const fieldsJson = JSON.stringify({
