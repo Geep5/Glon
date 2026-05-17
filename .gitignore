@@ -13,4 +13,5 @@ dist/
 # Runtime artifacts
 *.log
 *.pid
+.glon/
 .figgies/

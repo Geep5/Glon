@@ -34,10 +34,11 @@ that everyone points at as their `FIGGIES_PEERS`.
 
 ## State
 
-Everything lives in `~/.figgies/state.json` as one JSON document. Operations
-are appended to a `log` array; applying an op is idempotent on `op.id`. Sync
-is just "send me ops you have that I don't" — last write wins on the rare
-conflict.
+Everything lives in `~/.glon/figgies-state.json` as one JSON document. The
+local wallet (which user this device is) is written to `~/.glon/wallet.json`
+so the Astrolabe UI knows who you are. Operations are appended to a `log`
+array; applying an op is idempotent on `op.id`. Sync is just "send me ops
+you have that I don't" — last write wins on the rare conflict.
 
 ## API
 

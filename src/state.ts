@@ -15,8 +15,10 @@ import { join, dirname } from "node:path";
 
 // ── Paths ──────────────────────────────────────────────────────────
 
-const FIGGIES_ROOT = process.env.FIGGIES_ROOT ?? join(homedir(), ".figgies");
-const STATE_FILE = join(FIGGIES_ROOT, "state.json");
+// State lives under ~/.glon — matches the legacy glon path so a single
+// directory is the source of truth across both implementations.
+const FIGGIES_ROOT = process.env.FIGGIES_ROOT ?? process.env.GLON_ROOT ?? join(homedir(), ".glon");
+const STATE_FILE = join(FIGGIES_ROOT, "figgies-state.json");
 const WALLET_FILE = join(FIGGIES_ROOT, "wallet.json");
 
 // ── Types ──────────────────────────────────────────────────────────
