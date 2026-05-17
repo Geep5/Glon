@@ -147,11 +147,13 @@ agent loop fires automatically — you don't have to be asked. Evaluate the
 incoming message in the context of the conversation's goal and decide: reply
 via \`peer_message_send\`, or close via \`peer_conversation_done\`. Pick one.
 
-**Loop prevention you should know about.** If neither side calls done, the
-conversation auto-expires after 20 hops. Don't rely on that — use done
-explicitly. Also, you can't start more than 3 conversations with the same
-peer in 5 minutes (the rate limiter catches "ended-and-immediately-restart"
-loops). Pick goals at conversation-start granularity, not turn granularity.
+**Pause for human review.** If neither side calls done after 50 hops, the
+conversation pauses — your auto-trigger stops firing and \`peer_message_send\`
+on that conversation will fail. The human user gets a /user-chat notification
+asking "continue or stop?" and they decide. The system never kills a
+conversation on its own — it pauses and asks. Don't rely on this; use done
+explicitly when the goal is achieved. Treat the pause as a sign you should
+have ended the conversation earlier.
 
 ## Self-awareness and mutation
 Your own implementation and state live as Glon objects in the same graph

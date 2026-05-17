@@ -32,15 +32,16 @@ const PERSISTED_STATE_FIELD = "persisted_state";
 const MAX_MESSAGES_PER_CONVERSATION = 2000;
 const MAX_BODY_LEN = 8000;
 
-// Loop-prevention backstops. Both are below the semantic done-tool layer
-// — they only trigger when agents fail to call peer_conversation_done.
-const HOP_CAP_PER_CONVERSATION = 20;
-const NEW_CONVO_WINDOW_MS = 5 * 60 * 1000;
-const MAX_NEW_CONVOS_PER_PEER_PER_WINDOW = 3;
+// When a conversation runs this many hops without explicit done, it
+// pauses for human review rather than auto-killing. The user decides
+// whether to continue (which extends the pause threshold by another
+// chunk) or end via peer_conversation_done. No hard auto-kill —
+// nothing dies without a human or an agent saying so.
+const PAUSE_FOR_REVIEW_AT_HOPS = 50;
 
 // Bump when the on-disk schema changes incompatibly; load() throws old data
 // away and starts fresh. Acceptable since peer-chat history isn't precious.
-const STATE_VERSION = 2;
+const STATE_VERSION = 3;
 
 // ── Types ────────────────────────────────────────────────────────
 
@@ -54,7 +55,7 @@ export interface PeerMessage {
 	sent_at: number;
 }
 
-export type ConversationStatus = "active" | "done" | "auto-expired";
+export type ConversationStatus = "active" | "done" | "paused";
 
 export interface Conversation {
 	id: string;                            // conversation_id
@@ -68,9 +69,12 @@ export interface Conversation {
 	started_by_agent_id?: string;          // local sender id, or undefined for cross-machine
 	owner_agent_id?: string;               // which local agent's perspective this conv is (local-route only)
 	mirror_conversation_id?: string;       // links the other side's mirror for local convos
+	hop_cap: number;                       // pause when messages.length >= hop_cap; user resume bumps by PAUSE_FOR_REVIEW_AT_HOPS
 	ended_at?: number;
 	ended_reason?: string;
 	ended_by_agent_id?: string;
+	paused_at?: number;
+	resumed_count?: number;
 	messages: PeerMessage[];
 	last_message_at: number;
 	unread_count: number;
@@ -222,9 +226,11 @@ function newConversationId(): string {
 	return `c_${randomUUID().replace(/-/g, "").slice(0, 12)}`;
 }
 
-/** Push a new message into an existing conversation. */
-function appendMessageToConversation(state: Record<string, any>, conv: Conversation, msg: PeerMessage): void {
-	if (conv.messages.some((m) => m.msg_id === msg.msg_id)) return;
+/** Push a new message into an existing conversation. Returns true if the
+ *  conversation just crossed the pause threshold this append; the caller
+ *  fires a /user-chat notification asking the human to continue or stop. */
+function appendMessageToConversation(state: Record<string, any>, conv: Conversation, msg: PeerMessage): { pausedNow: boolean } {
+	if (conv.messages.some((m) => m.msg_id === msg.msg_id)) return { pausedNow: false };
 	conv.messages.push(msg);
 	if (conv.messages.length > MAX_MESSAGES_PER_CONVERSATION) {
 		conv.messages = conv.messages.slice(-MAX_MESSAGES_PER_CONVERSATION);
@@ -232,15 +238,15 @@ function appendMessageToConversation(state: Record<string, any>, conv: Conversat
 	conv.last_message_at = msg.sent_at;
 	if (msg.direction === "in") conv.unread_count += 1;
 
-	// Backstop: if the conversation has run past the hop cap with neither
-	// side calling done, auto-expire it. Future sends fail with a clear
-	// error; the human user can start a fresh goal-driven convo.
-	if (conv.status === "active" && conv.messages.length >= HOP_CAP_PER_CONVERSATION) {
-		conv.status = "auto-expired";
-		conv.ended_at = msg.sent_at;
-		conv.ended_reason = `auto-expired after ${HOP_CAP_PER_CONVERSATION} hops without explicit done`;
+	let pausedNow = false;
+	const cap = conv.hop_cap ?? PAUSE_FOR_REVIEW_AT_HOPS;
+	if (conv.status === "active" && conv.messages.length >= cap) {
+		conv.status = "paused";
+		conv.paused_at = msg.sent_at;
+		pausedNow = true;
 	}
 	state.conversations[conv.id] = conv;
+	return { pausedNow };
 }
 
 /** Find an existing conversation by id. */
@@ -249,18 +255,15 @@ function getConversation(state: Record<string, any>, conversation_id: string): C
 	return conversations[conversation_id] ?? null;
 }
 
-/** Count recent active+done convos started by from_agent_id toward this peer
- *  (within the rate-limit window). Used to refuse runaway new-convo loops. */
-function countRecentConvos(state: Record<string, any>, peerIdentity: string, fromAgentId: string | undefined, now: number): number {
-	const conversations = (state.conversations ?? {}) as Record<string, Conversation>;
-	const wantPeer = peerIdentity.toLowerCase();
-	let n = 0;
-	for (const c of Object.values(conversations)) {
-		if ((c.peer_identity_pubkey ?? "").toLowerCase() !== wantPeer) continue;
-		if (fromAgentId && c.started_by_agent_id !== fromAgentId) continue;
-		if (now - c.started_at <= NEW_CONVO_WINDOW_MS) n++;
-	}
-	return n;
+/** Fire a /user-chat notification asking the human to continue or stop a
+ *  paused conversation. Best-effort; never throws. */
+async function notifyPauseForReview(ctx: ProgramContext, conv: Conversation): Promise<void> {
+	try {
+		const peerName = conv.peer_display_name || "(peer)";
+		const hops = conv.messages.length;
+		const text = `peer-chat: "${conv.goal}" with ${peerName} hit ${hops} hops — continue or stop?`;
+		await ctx.dispatchProgram("/user-chat", "notify", [{ text, urgency: "normal", source: "peer-chat" }]);
+	} catch { /* best-effort */ }
 }
 
 // ── startConversation ─────────────────────────────────────────────
@@ -299,15 +302,6 @@ async function doStartConversation(ctx: ProgramContext, input: StartConversation
 	state.conversations = state.conversations ?? {};
 	const now = Date.now();
 
-	// Rate-limit: refuse runaway "start a new convo every reply" loops.
-	const recent = countRecentConvos(state, peer.identity_pubkey, input.from_agent_id, now);
-	if (recent >= MAX_NEW_CONVOS_PER_PEER_PER_WINDOW) {
-		throw new Error(
-			`peer-chat startConversation: rate limit — ${recent} new conversations with ${peer.display_name} in the last ` +
-			`${NEW_CONVO_WINDOW_MS / 60000} minutes. Wait or continue an existing conversation.`,
-		);
-	}
-
 	const isLocalTarget = String(peer.identity_pubkey).startsWith("local:");
 	const conversation_id = newConversationId();
 	const msg_id = randomUUID().replace(/-/g, "").slice(0, 16);
@@ -336,6 +330,7 @@ async function doStartConversation(ctx: ProgramContext, input: StartConversation
 			started_by_agent_id: input.from_agent_id,
 			owner_agent_id: input.from_agent_id,
 			mirror_conversation_id: mirror_id,
+			hop_cap: PAUSE_FOR_REVIEW_AT_HOPS,
 			messages: [],
 			last_message_at: 0,
 			unread_count: 0,
@@ -358,6 +353,7 @@ async function doStartConversation(ctx: ProgramContext, input: StartConversation
 			started_by_agent_id: input.from_agent_id,
 			owner_agent_id: recipientAgentId,
 			mirror_conversation_id: conversation_id,
+			hop_cap: PAUSE_FOR_REVIEW_AT_HOPS,
 			messages: [],
 			last_message_at: 0,
 			unread_count: 0,
@@ -402,6 +398,7 @@ async function doStartConversation(ctx: ProgramContext, input: StartConversation
 		started_at: now,
 		started_by_agent_id: input.from_agent_id,
 		owner_agent_id: input.from_agent_id,
+		hop_cap: PAUSE_FOR_REVIEW_AT_HOPS,
 		messages: [],
 		last_message_at: 0,
 		unread_count: 0,
@@ -451,7 +448,7 @@ async function doSend(ctx: ProgramContext, input: SendInput): Promise<{ msg_id: 
 			throw new Error(`peer-chat send: conversation ${input.conversation_id} is owned by ${conv.owner_agent_id}, not ${input.from_agent_id}`);
 		}
 		// 1. Outgoing in sender's view
-		appendMessageToConversation(state, conv, {
+		const senderResult = appendMessageToConversation(state, conv, {
 			msg_id, conversation_id: conv.id, direction: "out", kind: "text",
 			in_reply_to: input.in_reply_to ?? null, body: input.text, sent_at,
 		});
@@ -459,22 +456,29 @@ async function doSend(ctx: ProgramContext, input: SendInput): Promise<{ msg_id: 
 		// 2. Incoming in recipient's mirror
 		const mirrorId = conv.mirror_conversation_id;
 		const mirror = mirrorId ? getConversation(state, mirrorId) : null;
+		let mirrorResult: { pausedNow: boolean } = { pausedNow: false };
 		if (mirror) {
-			appendMessageToConversation(state, mirror, {
+			mirrorResult = appendMessageToConversation(state, mirror, {
 				msg_id, conversation_id: mirror.id, direction: "in", kind: "text",
 				in_reply_to: input.in_reply_to ?? null, body: input.text, sent_at,
 			});
-			// If the hop-cap auto-expired the owner side, propagate to the mirror.
+			// Propagate status flips across the mirror so both sides agree.
 			if (conv.status !== "active" && mirror.status === "active") {
 				mirror.status = conv.status;
-				mirror.ended_at = sent_at;
-				mirror.ended_reason = conv.ended_reason;
+				if (conv.status === "paused") mirror.paused_at = sent_at;
+			}
+			if (mirror.status !== "active" && conv.status === "active") {
+				conv.status = mirror.status;
+				if (mirror.status === "paused") conv.paused_at = sent_at;
 			}
 		}
 
 		await persistIfChanged(state, ctx);
-		// Nudge the recipient agent.
+		// Nudge the recipient agent only if still active. Paused/done blocks auto-trigger.
 		if (mirror && mirror.status === "active") void maybeAutoTrigger(ctx, mirror.id);
+		// Surface a pause to the human user.
+		if (senderResult.pausedNow) await notifyPauseForReview(ctx, conv);
+		else if (mirrorResult.pausedNow && mirror) await notifyPauseForReview(ctx, mirror);
 		return { msg_id };
 	}
 
@@ -518,7 +522,7 @@ async function doEndConversation(ctx: ProgramContext, input: EndConversationInpu
 	const state = ctx.state;
 	const conv = getConversation(state, input.conversation_id);
 	if (!conv) throw new Error(`peer-chat endConversation: conversation ${input.conversation_id} not found`);
-	if (conv.status !== "active") return { ok: true }; // already closed; idempotent
+	if (conv.status === "done") return { ok: true }; // idempotent
 	const now = Date.now();
 	conv.status = "done";
 	conv.ended_at = now;
@@ -529,7 +533,7 @@ async function doEndConversation(ctx: ProgramContext, input: EndConversationInpu
 	// Mirror too (one side closing closes the whole thread, like real life)
 	if (conv.mirror_conversation_id) {
 		const mirror = getConversation(state, conv.mirror_conversation_id);
-		if (mirror && mirror.status === "active") {
+		if (mirror && mirror.status !== "done") {
 			mirror.status = "done";
 			mirror.ended_at = now;
 			mirror.ended_reason = conv.ended_reason;
@@ -539,6 +543,52 @@ async function doEndConversation(ctx: ProgramContext, input: EndConversationInpu
 	}
 	await persistIfChanged(state, ctx);
 	return { ok: true };
+}
+
+// ── resumeConversation: user re-greenlights a paused thread ───────
+
+interface ResumeConversationInput {
+	conversation_id: string;
+}
+
+async function doResumeConversation(ctx: ProgramContext, input: ResumeConversationInput): Promise<{ ok: true; new_hop_cap: number }> {
+	if (typeof input?.conversation_id !== "string" || !input.conversation_id) {
+		throw new Error("peer-chat resumeConversation: `conversation_id` is required");
+	}
+	const state = ctx.state;
+	const conv = getConversation(state, input.conversation_id);
+	if (!conv) throw new Error(`peer-chat resumeConversation: conversation ${input.conversation_id} not found`);
+	if (conv.status === "done") {
+		throw new Error("peer-chat resumeConversation: conversation is done — start a new one to continue.");
+	}
+	// Extend the hop cap so the next pause fires PAUSE_FOR_REVIEW_AT_HOPS messages from here.
+	conv.hop_cap = (conv.messages.length) + PAUSE_FOR_REVIEW_AT_HOPS;
+	conv.status = "active";
+	conv.resumed_count = (conv.resumed_count ?? 0) + 1;
+	conv.paused_at = undefined;
+	state.conversations[conv.id] = conv;
+
+	// Mirror gets the same treatment.
+	if (conv.mirror_conversation_id) {
+		const mirror = getConversation(state, conv.mirror_conversation_id);
+		if (mirror) {
+			mirror.hop_cap = (mirror.messages.length) + PAUSE_FOR_REVIEW_AT_HOPS;
+			mirror.status = "active";
+			mirror.resumed_count = (mirror.resumed_count ?? 0) + 1;
+			mirror.paused_at = undefined;
+			state.conversations[mirror.id] = mirror;
+		}
+	}
+	await persistIfChanged(state, ctx);
+	// Nudge whoever was waiting on a reply (the side whose latest message is incoming).
+	const lastOwner = conv.messages[conv.messages.length - 1];
+	if (lastOwner?.direction === "in" && conv.status === "active") void maybeAutoTrigger(ctx, conv.id);
+	const mirrorConv = conv.mirror_conversation_id ? getConversation(state, conv.mirror_conversation_id) : null;
+	if (mirrorConv) {
+		const lastMirror = mirrorConv.messages[mirrorConv.messages.length - 1];
+		if (lastMirror?.direction === "in" && mirrorConv.status === "active") void maybeAutoTrigger(ctx, mirrorConv.id);
+	}
+	return { ok: true, new_hop_cap: conv.hop_cap };
 }
 
 // ── Auto-trigger ─────────────────────────────────────────────────
@@ -653,6 +703,7 @@ async function doHandleIncoming(ctx: ProgramContext, input: HandleIncomingInput)
 			goal: "(implicit — inbound without conversation_id)",
 			status: "active",
 			started_at: payload.sent_at,
+			hop_cap: PAUSE_FOR_REVIEW_AT_HOPS,
 			messages: [],
 			last_message_at: 0,
 			unread_count: 0,
@@ -734,7 +785,10 @@ async function doListConversations(ctx: ProgramContext, input?: ListConversation
 			last_message_at: c.last_message_at,
 			unread_count: c.unread_count,
 			message_count: c.messages.length,
-			hops_remaining: Math.max(0, HOP_CAP_PER_CONVERSATION - c.messages.length),
+			hop_cap: c.hop_cap ?? PAUSE_FOR_REVIEW_AT_HOPS,
+			hops_remaining: Math.max(0, (c.hop_cap ?? PAUSE_FOR_REVIEW_AT_HOPS) - c.messages.length),
+			paused_at: c.paused_at,
+			resumed_count: c.resumed_count ?? 0,
 			last_message_preview: c.messages.length > 0 ? String(c.messages[c.messages.length - 1].body ?? "").slice(0, 120) : "",
 		}));
 }
@@ -798,17 +852,17 @@ async function doMarkRead(ctx: ProgramContext, input: MarkReadInput) {
 async function doStatus(ctx: ProgramContext) {
 	const state = ctx.state;
 	const conversations = (state.conversations ?? {}) as Record<string, Conversation>;
-	let in_count = 0, out_count = 0, unread = 0, active = 0, done = 0, expired = 0;
+	let in_count = 0, out_count = 0, unread = 0, active = 0, done = 0, paused = 0;
 	for (const c of Object.values(conversations)) {
 		unread += c.unread_count;
 		for (const m of c.messages) (m.direction === "in" ? in_count++ : out_count++);
 		if (c.status === "active") active++;
 		else if (c.status === "done") done++;
-		else if (c.status === "auto-expired") expired++;
+		else if (c.status === "paused") paused++;
 	}
 	return {
 		conversations: Object.keys(conversations).length,
-		active, done, auto_expired: expired,
+		active, done, paused,
 		messages_in: in_count,
 		messages_out: out_count,
 		unread,
@@ -917,7 +971,7 @@ const actorDef: ProgramActorDef = {
 			handler: async (ctx, input: StartConversationInput) => doStartConversation(ctx, input),
 		},
 		send: {
-			description: "Send a message into an existing active conversation. Requires conversation_id from a prior startConversation. Fails if the conversation is done or auto-expired.",
+			description: "Send a message into an existing active conversation. Requires conversation_id from a prior startConversation. Fails if the conversation is done. If paused (waiting for human review), the message is rejected until the user resumes.",
 			inputSchema: {
 				type: "object",
 				required: ["conversation_id", "text"],
@@ -943,6 +997,15 @@ const actorDef: ProgramActorDef = {
 			},
 			handler: async (ctx, input: EndConversationInput) => doEndConversation(ctx, input),
 		},
+		resumeConversation: {
+			description: "Resume a paused conversation. Called by the human user after reviewing whether the agents should keep going. Extends the hop cap by PAUSE_FOR_REVIEW_AT_HOPS messages and re-fires any pending auto-trigger.",
+			inputSchema: {
+				type: "object",
+				required: ["conversation_id"],
+				properties: { conversation_id: { type: "string" } },
+			},
+			handler: async (ctx, input: ResumeConversationInput) => doResumeConversation(ctx, input),
+		},
 		listConversations: {
 			description: "List conversations, sorted by last_message_at desc. Pass from_agent_id to filter to your own perspective (drops mirror entries for sibling agents).",
 			inputSchema: {
@@ -950,7 +1013,7 @@ const actorDef: ProgramActorDef = {
 				properties: {
 					peer_id: { type: "string" },
 					identity_pubkey: { type: "string" },
-					status: { type: "string", enum: ["active", "done", "auto-expired"] },
+					status: { type: "string", enum: ["active", "done", "paused"] },
 					from_agent_id: { type: "string" },
 					include_other_perspectives: { type: "boolean" },
 				},
@@ -978,7 +1041,7 @@ const actorDef: ProgramActorDef = {
 			handler: async (ctx, input: MarkReadInput) => doMarkRead(ctx, input ?? {}),
 		},
 		status: {
-			description: "Return counters: conversations (total/active/done/auto-expired), messages in/out, unread.",
+			description: "Return counters: conversations (total/active/done/paused), messages in/out, unread.",
 			inputSchema: { type: "object", properties: {} },
 			handler: async (ctx) => doStatus(ctx),
 		},
@@ -1001,4 +1064,4 @@ registerActorContentHandler(PEER_CHAT_CONTENT_TYPE, "/peer-chat", "handleIncomin
 const program: ProgramDef = { handler, actor: actorDef };
 export default program;
 
-export const __test = { doStartConversation, doSend, doEndConversation, doHandleIncoming, doListConversations, doListMessages };
+export const __test = { doStartConversation, doSend, doEndConversation, doResumeConversation, doHandleIncoming, doListConversations, doListMessages };
