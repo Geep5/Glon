@@ -441,6 +441,22 @@ async function findSelfPeer(ctx: ProgramContext): Promise<string | null> {
 	return null;
 }
 
+/** Find an existing kind=agent peer record whose identity_pubkey is
+ *  the synthetic "local:<agentId>" string. Used so /holdfast bootstrap
+ *  is idempotent — second bootstrap of the same agent reuses the peer
+ *  rather than spawning duplicates. */
+async function findAgentPeer(ctx: ProgramContext, agentId: string): Promise<string | null> {
+	const store = ctx.store as any;
+	const refs = await store.list("peer") as { id: string }[];
+	const want = `local:${agentId}`;
+	for (const ref of refs) {
+		const obj = await store.get(ref.id);
+		if (obj?.deleted) continue;
+		if (extractString(obj?.fields?.identity_pubkey) === want) return ref.id;
+	}
+	return null;
+}
+
 /**
  * Find the agent linked to the self peer via its `principal` field. Used on
  * a fresh actor wake when state is empty: walk every agent, return the first
@@ -541,6 +557,22 @@ async function doSetup(opts: SetupOpts, ctx: ProgramContext): Promise<SetupResul
 	if (createdAgent || !extractString((await store.get(agentId))?.fields?.principal)) {
 		const agentActor = client.objectActor.getOrCreate([agentId]);
 		await agentActor.setField("principal", JSON.stringify(linkVal(principalPeerId, "principal")));
+	}
+
+	// Create a peer record for the AGENT ITSELF so sibling agents on this
+	// machine can address it via /peer-chat. identity_pubkey is the
+	// synthetic "local:<agentId>" marker — /peer-chat recognizes this
+	// prefix and routes in-process instead of going over Hyperswarm.
+	const agentPeerId = await findAgentPeer(ctx, agentId);
+	if (!agentPeerId) {
+		const agentPeerFields: Record<string, unknown> = {
+			display_name: stringVal(agentName),
+			kind: stringVal("agent"),
+			trust_level: stringVal("family"),
+			identity_pubkey: stringVal(`local:${agentId}`),
+			agent_id: linkVal(agentId, "agent"),
+		};
+		await store.create("peer", JSON.stringify(agentPeerFields));
 	}
 
 	const { wired, skipped, pruned } = await autoWireTools(agentId, ctx);

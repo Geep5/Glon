@@ -148,13 +148,40 @@ async function resolveSelfIdentity(ctx: ProgramContext): Promise<string> {
 			throw new Error(`peer-chat: peer "${match.display_name}" is at trust=${match.trust_level}; need a peered trust level. Run /directory peer ${(match.identity_pubkey ?? "").slice(0, 16)} first.`);
 		}
 		if (!match.identity_pubkey) throw new Error(`peer-chat: peer "${match.display_name}" has no identity_pubkey on record (can't address)`);
-		if (!match.hyperswarm_pubkey) throw new Error(`peer-chat: peer "${match.display_name}" has no hyperswarm_pubkey yet — wait for their next announce.`);
+		// Local sibling agents have identity_pubkey="local:<agentId>" and no
+		// hyperswarm_pubkey — that's expected and fine.
+		const isLocal = String(match.identity_pubkey).startsWith("local:");
+		if (!isLocal && !match.hyperswarm_pubkey) {
+			throw new Error(`peer-chat: peer "${match.display_name}" has no hyperswarm_pubkey yet — wait for their next announce.`);
+		}
 		return {
 			peer_id: match.id,
 			identity_pubkey: match.identity_pubkey,
-			hyperswarm_pubkey: match.hyperswarm_pubkey,
+			hyperswarm_pubkey: match.hyperswarm_pubkey ?? "",
 			display_name: match.display_name ?? match.id,
 		};
+	}
+
+	/** For a "local:<agentId>" target, look up the SENDER agent's own peer
+	 *  record. Used to record the incoming side of an in-process message
+	 *  in the recipient's view. */
+	async function findLocalPeerForAgent(
+		ctx: ProgramContext,
+		agentId: string,
+	): Promise<{ peer_id: string; identity_pubkey: string; display_name: string } | null> {
+		const all = await ctx.dispatchProgram("/peer", "list", [{}]) as Array<any>;
+		const peers = Array.isArray(all) ? all : [];
+		const want = `local:${agentId}`.toLowerCase();
+		for (const p of peers) {
+			if ((p.identity_pubkey ?? "").toLowerCase() === want) {
+				return {
+					peer_id: p.id,
+					identity_pubkey: p.identity_pubkey,
+					display_name: p.display_name ?? p.id,
+				};
+			}
+		}
+		return null;
 	}
 
 /** Push a new message into a conversation; create the conversation if it doesn't exist. */
@@ -199,6 +226,10 @@ interface SendInput {
 	display_name?: string;
 	text: string;
 	in_reply_to?: string | null;
+	/** Bound by holdfast-tools so /peer-chat knows which sibling agent
+	 *  is sending. Required for local same-machine routing; ignored
+	 *  for cross-machine Hyperswarm sends (the daemon is the sender). */
+	from_agent_id?: string;
 }
 
 async function doSend(ctx: ProgramContext, input: SendInput): Promise<{ msg_id: string }> {
@@ -209,9 +240,61 @@ async function doSend(ctx: ProgramContext, input: SendInput): Promise<{ msg_id: 
 		throw new Error(`peer-chat send: message too long (${input.text.length} > ${MAX_BODY_LEN})`);
 	}
 	const peer = await resolvePeerForChat(ctx, input);
-	const self_identity = await resolveSelfIdentity(ctx);
 	const msg_id = randomUUID().replace(/-/g, "").slice(0, 16);
 	const sent_at = Date.now();
+	const isLocalTarget = String(peer.identity_pubkey).startsWith("local:");
+	const state = ctx.state;
+
+	// ── Local same-machine route ──────────────────────────────────
+	// Two agents on this daemon. Skip Hyperswarm entirely and write the
+	// incoming side directly to the recipient's view in our singleton
+	// state. The outgoing entry in the sender's view is the same as the
+	// cross-machine flow below.
+	if (isLocalTarget) {
+		if (!input.from_agent_id) {
+			throw new Error(`peer-chat send: local-target peer requires from_agent_id (bind it via tool bound_args)`);
+		}
+		const senderPeer = await findLocalPeerForAgent(ctx, input.from_agent_id);
+		if (!senderPeer) {
+			throw new Error(`peer-chat send: no /peer record for sender agent ${input.from_agent_id} (re-bootstrap via /holdfast to create one)`);
+		}
+
+		// 1. Outgoing in the sender's view (conversation keyed by recipient)
+		appendMessage(state, {
+			identity_pubkey: peer.identity_pubkey,
+			hyperswarm_pubkey: peer.hyperswarm_pubkey,
+			display_name: peer.display_name,
+			peer_object_id: peer.peer_id,
+		}, {
+			msg_id,
+			direction: "out",
+			kind: "text",
+			in_reply_to: input.in_reply_to ?? null,
+			body: input.text,
+			sent_at,
+		});
+
+		// 2. Incoming in the recipient's view (conversation keyed by sender)
+		appendMessage(state, {
+			identity_pubkey: senderPeer.identity_pubkey,
+			hyperswarm_pubkey: "",
+			display_name: senderPeer.display_name,
+			peer_object_id: senderPeer.peer_id,
+		}, {
+			msg_id,
+			direction: "in",
+			kind: "text",
+			in_reply_to: input.in_reply_to ?? null,
+			body: input.text,
+			sent_at,
+		});
+
+		await persistIfChanged(state, ctx);
+		return { msg_id };
+	}
+
+	// ── Cross-machine route over Hyperswarm ───────────────────────
+	const self_identity = await resolveSelfIdentity(ctx);
 	const payload: PeerChatPayload = {
 		msg_id,
 		kind: "text",
@@ -229,7 +312,6 @@ async function doSend(ctx: ProgramContext, input: SendInput): Promise<{ msg_id: 
 	}]);
 
 	// Record locally as outgoing so the UI sees it immediately.
-	const state = ctx.state;
 	appendMessage(state, {
 		identity_pubkey: peer.identity_pubkey,
 		hyperswarm_pubkey: peer.hyperswarm_pubkey,
