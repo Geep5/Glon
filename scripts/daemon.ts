@@ -1,641 +1,346 @@
 /**
- * Glon program daemon.
+ * Figgies — local daemon.
  *
- * Loads every program from the store, starts their actor instances
- * (tickers, IPC handlers, state), and stays resident. Unlike the REPL
- * client this has no stdin — it's headless, suitable for background
- * `nohup` operation.
+ * One process per family device. Owns this device's view of the shared
+ * state. Listens on :6430 for HTTP /dispatch from Astrolabe (the UI) and
+ * /ops for peer sync. Polls configured peers every 5s to pull new ops.
  *
- * Run: npx tsx scripts/daemon.ts
+ * Env:
+ *   FIGGIES_USER       — this device's user name (e.g., "mom", "kid1")
+ *   FIGGIES_PORT       — HTTP port (default 6430)
+ *   FIGGIES_PEERS      — comma-separated peer URLs (optional)
+ *   FIGGIES_ROOT       — state directory (default ~/.figgies)
+ *   FIGGIES_AUTO_PARENT — if "1", register the local user as parent on first run
  */
 
-	import "../src/env.js"; // side-effect: load .env into process.env
-	import { createClient } from "rivetkit/client";
-	import type { app } from "../src/index.js";
-	import { diskStats, readChangeByHex, listChangeFiles } from "../src/disk.js";
-	import { hexEncode } from "../src/crypto.js";
-	import { stringVal, intVal, floatVal, boolVal, mapVal, listVal, linkVal, displayValue } from "../src/proto.js";
-	import {
-		loadPrograms,
-		startProgramActor,
-		stopProgramActor,
-		dispatchActorAction,
-		getProgramActorByPrefix,
-		listProgramActors,
-		type ProgramContext,
-		type ProgramEntry,
-	} from "../src/programs/runtime.js";
-	import { randomUUID } from "node:crypto";
-	import { resolveEndpoint } from "../src/endpoint.js";
-	import { readFileSync, watch } from "node:fs";
-	import { resolve, basename } from "node:path";
-	import { style } from "../src/programs/shared.js";
-	import { bootstrapStore } from "../src/bootstrap.js";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import {
+	applyOp,
+	getState,
+	getUser,
+	listUsers,
+	listAuctions,
+	getAuction,
+	listBids,
+	opsSince,
+	newOpId,
+	newAuctionId,
+	writeLocalWallet,
+	type Op,
+	type Role,
+} from "../src/state.js";
+import { startSync, peerStatus } from "../src/sync.js";
 
-const ENDPOINT = resolveEndpoint();
-const client = createClient<typeof app>(ENDPOINT);
-const store = client.storeActor.getOrCreate(["root"]);
+const PORT = Number(process.env.FIGGIES_PORT ?? 6430);
+const ME = process.env.FIGGIES_USER ?? "";
+const AUTO_PARENT = process.env.FIGGIES_AUTO_PARENT === "1";
 
-async function resolveId(raw: string): Promise<string | null> {
-	if (!raw) return null;
-	const exact = await store.exists(raw);
-	if (exact) return raw;
-	const resolved = await store.resolvePrefix(raw);
-	return resolved ?? null;
-}
-
-	function buildContext(overrides: Partial<ProgramContext> = {}): ProgramContext {
-		return {
-			client,
-			store,
-			resolveId,
-			stringVal, intVal, floatVal, boolVal, mapVal, listVal, linkVal, displayValue,
-			listChangeFiles,
-			readChangeByHex,
-			hexEncode,
-			print: (msg: string) => console.log(msg),
-			style,
-			randomUUID,
-			state: {},
-			emit: () => {},
-			programId: "",
-			objectActor: (id: string) => client.objectActor.getOrCreate([id]),
-			dispatchProgram: async (prefix: string, action: string, args: unknown[]) => {
-				const inst = getProgramActorByPrefix(prefix);
-				if (!inst) throw new Error(`Program not running: ${prefix}`);
-				return await dispatchActorAction(
-					inst.programId,
-					action,
-					args,
-					(state) => buildContext({ state, programId: inst.programId }),
-				);
-			},
-			dispatchTypedAction: async (prefix: string, action: string, input: unknown) => {
-				const inst = getProgramActorByPrefix(prefix);
-				if (!inst) throw new Error(`Program not running: ${prefix}`);
-				return await dispatchActorAction(
-					inst.programId,
-					action,
-					[input],
-					(state) => buildContext({ state, programId: inst.programId }),
-				);
-			},
-			...overrides,
-		};
-	}
-
-	async function main() {
-		const DEV = process.argv.includes("--dev");
-		console.log(`[daemon] connecting to ${ENDPOINT}${DEV ? " (dev mode)" : ""}`);
-
-		// ── Hyperswarm bring-up (Phase 1 — transport-hyperswarm) ──
-		// Bring the swarm online before any program actor starts so the
-		// /directory program can call joinTopic() in its onCreate.
-		// Disabled by default for the v0 cohort that doesn't yet have peers
-		// configured; opt-in via GLON_SWARM=1 until everyone is ready.
-		if (process.env.GLON_SWARM === "1") {
-			try {
-				const { default: Hyperswarm } = await import("hyperswarm");
-				const { initSwarm, loadOrCreateKeyPair } = await import("../src/swarm-host.js");
-				const { decodeTransportEnvelope } = await import("../src/proto.js");
-				const keyPair = loadOrCreateKeyPair(() => {
-					const tmp = new Hyperswarm();
-					const kp = tmp.keyPair;
-					// Destroy the throwaway so it doesn't hold a DHT socket.
-					tmp.destroy().catch(() => {});
-					return kp;
-				});
-				const swarm = new Hyperswarm({ keyPair });
-				initSwarm({
-					swarm: swarm as any,
-					decodeEnvelope: (bytes) => {
-						const env = decodeTransportEnvelope(bytes);
-						return { contentType: env.contentType, metadata: env.metadata ?? {} };
-					},
-				});
-				console.log(`[daemon] swarm online — hyperswarm pubkey: ${keyPair.publicKey.toString("hex").slice(0, 16)}...`);
-			} catch (err: any) {
-				console.log(`[daemon] swarm bring-up failed: ${err?.message ?? err} (continuing without swarm)`);
-			}
-		}
-
-		// ── Ledger bring-up ──────────────────────────────────────
-		// Opt-in via GLON_AUCTION=1. Backend is the raw multi-writer
-		// CRDT by default (no writer set, no admission, isWritable()
-		// always true). The autobase backend is preserved as legacy
-		// opt-in via GLON_LEDGER_BACKEND=autobase for users with
-		// existing autobase data.
-		if (process.env.GLON_AUTOBASE_BOOTSTRAP) {
-			console.log(`[daemon] DEPRECATED: GLON_AUTOBASE_BOOTSTRAP is ignored under the raw ledger (no bootstrap keys exist). Set GLON_LEDGER_BACKEND=autobase if you want legacy autobase mode.`);
-		}
-		if (process.env.GLON_RAW_LEDGER === "1") {
-			console.log(`[daemon] note: GLON_RAW_LEDGER=1 is now the default and no longer required; you can drop it from your env.`);
-		}
-
-		const backendChoice = (process.env.GLON_LEDGER_BACKEND ?? "raw").toLowerCase();
-		if (process.env.GLON_AUCTION === "1") {
-			if (backendChoice !== "autobase") {
-				// ── Raw multi-writer backend ─────────────────────
-				try {
-					const { default: Corestore } = await import("corestore");
-					const ledger = await import("../src/ledger-host.js");
-
-					const corestore = new Corestore(ledger.getRawCorestoreDir());
-					await corestore.ready();
-					// "glon-writer" is our local writer hypercore. corestore
-					// persists it by name, so daemon restarts reopen the same
-					// keypair and we keep our identity across reboots.
-					const localCore = corestore.get({ name: "glon-writer" });
-					await localCore.ready();
-
-					await ledger.initRawLedger({ corestore, localCore });
-					console.log(`[daemon] raw ledger online — writer pubkey: ${localCore.key.toString("hex").slice(0, 16)}...`);
-					console.log(`[daemon] raw ledger storage: ${ledger.getRawCorestoreDir()}`);
-
-					// ── Replication swarm (Phase 2) ──────────────────
-					// Dedicated Hyperswarm for corestore replication. Joins a
-					// shared "network topic" — every glon-AH node with the
-					// same topic finds each other via the DHT. On every
-					// connection we hand the stream to corestore so it
-					// replicates whichever hypercores both sides have in
-					// common (mine + any peer writers we've added).
-					//
-					// Discovery problem: how does Alice learn that Bob's
-					// writer hypercore exists in the first place? Solution
-					// below — they announce their writer pubkeys to each
-					// other over the existing swarm-host transport.
-					try {
-						const { default: Hyperswarm } = await import("hyperswarm");
-						const { createHash } = await import("node:crypto");
-						const networkTopicLabel = process.env.GLON_LEDGER_TOPIC ?? "glon-ah-mainnet-v1";
-						const networkTopic = createHash("sha256").update(networkTopicLabel).digest();
-						const replSwarm = new Hyperswarm();
-						replSwarm.on("connection", (conn: any) => {
-							corestore.replicate(conn);
-						});
-						replSwarm.join(networkTopic, { server: true, client: true });
-						console.log(`[daemon] raw ledger replication swarm joined topic "${networkTopicLabel}" (${networkTopic.toString("hex").slice(0, 16)}...)`);
-						(globalThis as any).__glonRawLedgerSwarm = replSwarm;
-
-						// ── Announce flow (peer-writer discovery) ───
-						// Goes over swarm-host (the raw-framing transport).
-						// We broadcast our writer pubkey on the same topic;
-						// peers receive via content-handler and call
-						// ledger.addKnownWriter, which makes corestore start
-						// replicating their writer hypercore. Need
-						// GLON_SWARM=1 for swarm-host to be alive.
-						if (process.env.GLON_SWARM === "1") {
-							const swarmHost = await import("../src/swarm-host.js");
-							const runtime = await import("../src/programs/runtime.js");
-							const ANNOUNCE_CONTENT_TYPE = "glon/raw-ledger-announce";
-							const announceTopic = swarmHost.topicFor("glon-raw-ledger-announce-v1");
-
-							await swarmHost.joinTopic(announceTopic);
-							console.log(`[daemon] raw ledger announce topic joined (${announceTopic.toString("hex").slice(0, 16)}...)`);
-
-							const ourWriterHex = localCore.key.toString("hex");
-
-							// Receive announces from peers, addKnownWriter on each.
-							runtime.registerContentHandler(ANNOUNCE_CONTENT_TYPE, async (envelope: any) => {
-								try {
-									const body = JSON.parse(new TextDecoder().decode(envelope.payload));
-									const pk = (body?.writer_pubkey ?? "").toString().toLowerCase();
-									if (!/^[0-9a-fA-F]{64}$/.test(pk)) return false;
-									if (pk === ourWriterHex) return true; // ignore our own
-									await ledger.addKnownWriter(pk);
-									console.log(`[daemon] raw ledger discovered peer writer ${pk.slice(0, 16)}…`);
-									return true;
-								} catch (err: any) {
-									console.log(`[daemon] raw ledger announce handler error: ${err?.message ?? err}`);
-									return false;
-								}
-							});
-
-							// Broadcast our writer pubkey every 15s. Cheap
-							// keep-alive; new peers joining the topic learn
-							// about us on their first poll cycle.
-							const sendAnnounce = async () => {
-								try {
-									const { encodeTransportEnvelope } = await import("../src/proto.js");
-									const payload = new TextEncoder().encode(JSON.stringify({ writer_pubkey: ourWriterHex }));
-									const envelope = encodeTransportEnvelope({
-										contentType: ANNOUNCE_CONTENT_TYPE,
-										payload,
-										senderPubkey: new Uint8Array(0),
-										metadata: {},
-									});
-									swarmHost.broadcastOnTopic(announceTopic, Buffer.from(envelope));
-								} catch (err: any) {
-									console.log(`[daemon] raw ledger announce broadcast failed: ${err?.message ?? err}`);
-								}
-							};
-							setTimeout(sendAnnounce, 500); // first announce shortly after boot
-							setInterval(sendAnnounce, 15_000);
-						} else {
-							console.log(`[daemon] raw ledger: GLON_SWARM=1 not set; running without peer-writer announces (replication only works for already-known peers)`);
-						}
-					} catch (err: any) {
-						console.log(`[daemon] raw ledger swarm wiring failed: ${err?.message ?? err}`);
-					}
-				} catch (err: any) {
-					console.log(`[daemon] raw ledger bring-up failed: ${err?.message ?? err} (continuing without auction house)`);
-				}
-			} else try {
-				// ── Autobase backend (legacy default) ────────────
-				const { default: Corestore } = await import("corestore");
-				const { default: Autobase } = await import("autobase");
-				const { default: Hyperbee } = await import("hyperbee");
-				const autobaseHost = await import("../src/ledger-host.js");
-
-				const corestore = new Corestore(autobaseHost.getCorestoreDir());
-				await corestore.ready();
-
-				let bootstrap: Buffer | null = null;
-				const envBootstrap = process.env.GLON_AUTOBASE_BOOTSTRAP;
-				if (envBootstrap && /^[0-9a-fA-F]{64}$/.test(envBootstrap)) {
-					bootstrap = Buffer.from(envBootstrap, "hex");
-					console.log(`[daemon] autobase bootstrap from env: ${envBootstrap.slice(0, 16)}...`);
-				} else {
-					bootstrap = autobaseHost.loadPersistedBootstrap();
-				}
-
-				const base = new Autobase(corestore, bootstrap, {
-					open(store: any) {
-						return new Hyperbee(store.get("auction-view"), {
-							keyEncoding: "utf-8",
-							valueEncoding: "utf-8",
-						});
-					},
-					apply: autobaseHost.apply,
-				});
-				await base.ready();
-				autobaseHost.persistBootstrap(base.key);
-
-				autobaseHost.initAutobase({
-					corestore,
-					autobase: base,
-					view: base.view,
-					writerPubkey: base.local.key,
-				});
-
-				console.log(`[daemon] autobase online — bootstrap key: ${base.key.toString("hex").slice(0, 16)}...`);
-				console.log(`[daemon] autobase writer pubkey: ${base.local.key.toString("hex").slice(0, 16)}...`);
-
-				try {
-					const { default: Hyperswarm } = await import("hyperswarm");
-					const replSwarm = new Hyperswarm();
-					replSwarm.on("connection", (conn: any) => {
-						corestore.replicate(conn);
-					});
-					replSwarm.join(base.discoveryKey, { server: true, client: true });
-					console.log(`[daemon] autobase replication swarm joined topic ${base.discoveryKey.toString("hex").slice(0, 16)}...`);
-					(globalThis as any).__glonAutobaseSwarm = replSwarm;
-				} catch (err: any) {
-					console.log(`[daemon] autobase replication swarm failed: ${err?.message ?? err}`);
-				}
-			} catch (err: any) {
-				console.log(`[daemon] autobase bring-up failed: ${err?.message ?? err} (continuing without auction house)`);
-			}
-		}
-
-		let programs: ProgramEntry[] = await loadPrograms(store, client);
-		console.log(`[daemon] loaded ${programs.length} programs`);
-
-		let started = 0;
-		for (const prog of programs) {
-			try {
-				const inst = await startProgramActor(prog, (state) => buildContext({ state, programId: prog.id }));
-				if (inst) {
-					console.log(`[daemon] started ${prog.prefix} (actor=${!!prog.def?.actor}, tickMs=${prog.def?.actor?.tickMs ?? "-"})`);
-					started++;
-				}
-			} catch (err: any) {
-				console.log(`[daemon] failed to start ${prog.prefix}: ${err?.message ?? err}`);
-			}
-		}
-		console.log(`[daemon] ${started} actor(s) running. Diskstats:`, diskStats());
-
-		// ── Dev-mode file watcher ──────────────────────────────────
-		// Hot-reload programs when their handler source files change.
-		if (DEV) {
-			const handlersDir = resolve(import.meta.dirname ?? ".", "../src/programs/handlers");
-			const debounceMs = 300;
-			const pending = new Map<string, ReturnType<typeof setTimeout>>();
-
-			watch(handlersDir, { recursive: true }, (eventType, filename) => {
-				if (!filename || !filename.endsWith(".ts")) return;
-				const existing = pending.get(filename);
-				if (existing) clearTimeout(existing);
-				pending.set(
-					filename,
-					setTimeout(async () => {
-						pending.delete(filename);
-						console.log(`[dev] ${filename} changed → bootstrapping + reloading`);
-
-						try {
-							// Stop all running actors.
-							for (const prog of programs) {
-								try {
-									await stopProgramActor(prog.id, (state) =>
-										buildContext({ state, programId: prog.id }),
-									);
-								} catch {
-									// ignore stop errors
-								}
-							}
-
-							// Bootstrap disk changes into the store first.
-							await bootstrapStore(store, client, { quiet: true });
-
-							// Reload all programs (recompiles from store).
-							programs = await loadPrograms(store, client);
-
-							// Restart actors.
-							for (const prog of programs) {
-								try {
-									const inst = await startProgramActor(prog, (state) =>
-										buildContext({ state, programId: prog.id }),
-									);
-									if (inst) {
-										console.log(`[dev] reloaded ${prog.prefix}`);
-									}
-								} catch (err: any) {
-									console.log(`[dev] failed to start ${prog.prefix}: ${err?.message ?? err}`);
-								}
-							}
-						} catch (err: any) {
-							console.log(`[dev] reload failed: ${err?.message ?? err}`);
-						}
-					}, debounceMs),
-				);
-			});
-			console.log(`[dev] watching ${handlersDir}`);
-		}
-	// Track recurring tasks for inspection / toggling
-	const taskHandles: Map<string, ReturnType<typeof setInterval> | null> = new Map();
-
-	// Local HTTP dispatch: POST /dispatch {prefix, action, args} → runs in this process.
-	const { createServer } = await import("node:http");
-	const httpPort = Number(process.env.GLON_DAEMON_PORT ?? 6430);
-	const server = createServer(async (req, res) => {
-		// CORS preflight
-		if (req.method === "OPTIONS") {
-			res.writeHead(204, {
-				"Access-Control-Allow-Origin": "*",
-				"Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-				"Access-Control-Allow-Headers": "Content-Type",
-			});
-			res.end();
-			return;
-		}
-
-		const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
-
-		// ── GET /tasks ─────────────────────────────────────────────
-		if (req.method === "GET" && url.pathname === "/tasks") {
-			const running = new Map(listProgramActors().map((a) => [a.prefix, a]));
-			const actorTasks = programs
-				.filter((p) => p.def?.actor?.tickMs != null)
-				.map((p) => {
-					const inst = running.get(p.prefix);
-					return {
-						id: p.prefix,
-						name: p.prefix,
-						type: "actor",
-						enabled: inst ? inst.hasTick : false,
-						intervalMs: p.def!.actor!.tickMs,
-						programId: p.id,
-					};
-				});
-			const daemonTasks = Array.from(taskHandles.entries()).map(([name, handle]) => ({
-				id: name,
-				name,
-				type: "daemon",
-				enabled: handle !== null,
-				intervalMs: name === "trading-rounds" ? 5 * 60 * 1000 : 60_000,
-			}));
-			res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-			res.end(JSON.stringify({ ok: true, tasks: [...actorTasks, ...daemonTasks] }));
-			return;
-		}
-
-
-		// ── GET /programs ────────────────────────────────────────────
-		if (req.method === "GET" && url.pathname === "/programs") {
-			const payload = programs.map((p) => ({
-				id: p.id,
-				prefix: p.prefix,
-				name: p.name,
-				typedActions: p.def?.actor?.typedActions
-					? Object.fromEntries(
-						Object.entries(p.def.actor.typedActions).map(([k, v]) => [
-							k,
-							{ description: v.description, inputSchema: v.inputSchema },
-						]),
-					)
-					: undefined,
-				tickMs: p.def?.actor?.tickMs ?? undefined,
-			}));
-			res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-			res.end(JSON.stringify({ ok: true, programs: payload }));
-			return;
-		}
-		// ── POST /tasks/:id/toggle ─────────────────────────────────
-		if (req.method === "POST" && url.pathname.startsWith("/tasks/")) {
-			const match = url.pathname.match(/^\/tasks\/(.+?)\/toggle$/);
-			const rawId = match ? decodeURIComponent(match[1]) : "";
-			if (rawId) {
-				try {
-					// Daemon-level tasks have no leading slash (e.g. "heartbeat", "trading-rounds")
-					if (taskHandles.has(rawId)) {
-						const handle = taskHandles.get(rawId);
-						if (handle) {
-							clearInterval(handle);
-							taskHandles.set(rawId, null);
-							console.log(`[daemon] paused task ${rawId}`);
-						} else {
-							// Restart the task
-							if (rawId === "trading-rounds") {
-								if (!tradingRoundsMod) throw new Error("Trading rounds not available");
-								const h = setInterval(async () => {
-									try { await tradingRoundsMod!.checkRoundTimeout(); await tradingRoundsMod!.startRound(); }
-									catch (e: any) { console.error("[daemon] trading round error:", e.message); }
-								}, 5 * 60 * 1000);
-								taskHandles.set(rawId, h);
-							} else if (rawId === "heartbeat") {
-								const h = setInterval(() => {
-									console.log(`[daemon] alive (${new Date().toISOString()})`);
-								}, 60_000);
-								taskHandles.set(rawId, h);
-							}
-							console.log(`[daemon] resumed task ${rawId}`);
-						}
-					} else {
-						// Program actor tasks have a leading slash (e.g. "/auction")
-						const taskId = rawId.startsWith("/") ? rawId : "/" + rawId;
-						const inst = getProgramActorByPrefix(taskId);
-						if (inst && inst.tickHandle) {
-							await stopProgramActor(inst.programId, (state) => buildContext({ state, programId: inst.programId }));
-							console.log(`[daemon] paused actor ${taskId}`);
-						} else {
-							// Find the program entry and restart it
-							const prog = programs.find((p) => p.prefix === taskId);
-							if (!prog) throw new Error(`Program entry not found for ${taskId}`);
-							await startProgramActor(prog, (state) => buildContext({ state, programId: prog.id }));
-							console.log(`[daemon] resumed actor ${taskId}`);
-						}
-					}
-					res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-					res.end(JSON.stringify({ ok: true, id: rawId }));
-				} catch (err: any) {
-					res.writeHead(500, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-					res.end(JSON.stringify({ ok: false, error: err?.message ?? String(err) }));
-				}
-				return;
-			}
-		}
-
-		// ── POST /x402/verify ──────────────────────────────────────
-		if (req.method === "POST" && url.pathname === "/x402/verify") {
-			let body = "";
-			req.on("data", (c) => { body += c; });
-			req.on("end", async () => {
-				try {
-					const { authorization, signature } = JSON.parse(body || "{}");
-					const coinInst = getProgramActorByPrefix("/coin");
-					if (!coinInst) throw new Error("Coin program not running");
-
-					// Reconstruct authorization to ensure shape
-					const auth = authorization;
-					if (!auth || !signature) {
-						res.writeHead(400, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-						res.end(JSON.stringify({ valid: false, error: "missing authorization or signature" }));
-						return;
-					}
-
-					// Verify signature via coin x402 helper
-					const { verifyX402Auth } = await import("../src/programs/handlers/coin-x402.js");
-					const valid = verifyX402Auth(auth, signature);
-					if (!valid) {
-						res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-						res.end(JSON.stringify({ valid: false, error: "invalid signature" }));
-						return;
-					}
-
-					const now = Math.floor(Date.now() / 1000);
-					if (now < auth.validAfter) {
-						res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-						res.end(JSON.stringify({ valid: false, error: "authorization not yet valid" }));
-						return;
-					}
-					if (now >= auth.validBefore) {
-						res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-						res.end(JSON.stringify({ valid: false, error: "authorization expired" }));
-						return;
-					}
-
-					// TODO(autobase): re-add x402 nonce replay protection at the
-					// auction-layer indexer once Phase 2 lands.
-					res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-					res.end(JSON.stringify({ valid: true }));
-				} catch (err: any) {
-					res.writeHead(500, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-					res.end(JSON.stringify({ valid: false, error: err?.message ?? String(err) }));
-				}
-			});
-			return;
-		}
-
-		// ── POST /x402/settle ──────────────────────────────────────
-		if (req.method === "POST" && url.pathname === "/x402/settle") {
-			let body = "";
-			req.on("data", (c) => { body += c; });
-			req.on("end", async () => {
-				try {
-					const { authorization, signature, key_name } = JSON.parse(body || "{}");
-					const coinInst = getProgramActorByPrefix("/coin");
-					if (!coinInst) throw new Error("Coin program not running");
-
-					const result = await dispatchActorAction(
-						coinInst.programId,
-						"settlePayment",
-						[{ authorization, signature, keyName: key_name ?? "default" }],
-						(state) => buildContext({ state, programId: coinInst.programId }),
-					);
-
-					res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-					res.end(JSON.stringify({ settled: true, result }));
-				} catch (err: any) {
-					res.writeHead(500, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-					res.end(JSON.stringify({ settled: false, error: err?.message ?? String(err) }));
-				}
-			});
-			return;
-		}
-
-		if (req.method !== "POST") { res.writeHead(405); res.end(); return; }
-		let body = "";
-		req.on("data", (c) => { body += c; });
-		req.on("end", async () => {
-			try {
-				const { prefix, action, args } = JSON.parse(body || "{}");
-				const inst = getProgramActorByPrefix(prefix);
-				if (!inst) throw new Error(`Program not running: ${prefix}`);
-				const result = await dispatchActorAction(
-					inst.programId,
-					action,
-					Array.isArray(args) ? args : [args],
-					(state) => buildContext({ state, programId: inst.programId }),
-				);
-				res.writeHead(200, {
-					"Content-Type": "application/json",
-					"Access-Control-Allow-Origin": "*",
-				});
-				res.end(JSON.stringify({ ok: true, result }));
-			} catch (err: any) {
-				res.writeHead(500, {
-					"Content-Type": "application/json",
-					"Access-Control-Allow-Origin": "*",
-				});
-				res.end(JSON.stringify({ ok: false, error: err?.message ?? String(err) }));
-			}
-		});
-	});
-
-	server.listen(httpPort, "127.0.0.1", () => {
-		console.log(`[daemon] dispatch http listening on 127.0.0.1:${httpPort}`);
-	});
-
-	// Trading round tick: every 5 minutes during market hours
-	let tradingRoundsMod: { startRound: () => Promise<void>; checkRoundTimeout: () => Promise<void> } | null = null;
-	try {
-		tradingRoundsMod = await import("./trading-rounds.js");
-		const h = setInterval(async () => {
-			try { await tradingRoundsMod!.checkRoundTimeout(); await tradingRoundsMod!.startRound(); }
-			catch (e: any) { console.error("[daemon] trading round error:", e.message); }
-		}, 5 * 60 * 1000);
-		taskHandles.set("trading-rounds", h);
-		console.log("[daemon] trading round tick every 5 min");
-	} catch {
-		console.log("[daemon] trading rounds not available");
-	}
-
-	// Heartbeat every 60s so log shows the daemon is alive.
-	const heartbeatHandle = setInterval(() => {
-		console.log(`[daemon] alive (${new Date().toISOString()})`);
-	}, 60_000);
-	taskHandles.set("heartbeat", heartbeatHandle);
-
-	// Graceful shutdown.
-	const shutdown = () => {
-		console.log("[daemon] shutting down");
-		process.exit(0);
-	};
-	process.on("SIGTERM", shutdown);
-	process.on("SIGINT", shutdown);
-}
-
-main().catch((err) => {
-	console.error("[daemon] fatal:", err);
+if (!ME) {
+	console.error("[figgies] FIGGIES_USER is required (e.g. FIGGIES_USER=mom)");
 	process.exit(1);
+}
+
+// First-run: ensure this device's user exists, optionally as parent.
+function ensureLocalUser(): void {
+	if (getUser(ME)) return;
+	if (!AUTO_PARENT) {
+		console.log(`[figgies] user "${ME}" not registered yet — set FIGGIES_AUTO_PARENT=1 to self-register as parent, or have a parent register you via /dispatch /family register`);
+		return;
+	}
+	const op: Op = { id: newOpId(), at: Date.now(), kind: "register_user", name: ME, role: "parent" };
+	const r = applyOp(op);
+	if (r.ok) console.log(`[figgies] self-registered "${ME}" as parent`);
+}
+
+ensureLocalUser();
+writeLocalWallet(ME);
+
+// ── HTTP helpers ───────────────────────────────────────────────────
+
+function send(res: ServerResponse, status: number, body: unknown): void {
+	res.writeHead(status, {
+		"Content-Type": "application/json",
+		"Access-Control-Allow-Origin": "*",
+		"Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+		"Access-Control-Allow-Headers": "Content-Type",
+	});
+	res.end(JSON.stringify(body));
+}
+
+async function readBody(req: IncomingMessage): Promise<any> {
+	const chunks: Buffer[] = [];
+	for await (const c of req) chunks.push(c as Buffer);
+	if (chunks.length === 0) return null;
+	const raw = Buffer.concat(chunks).toString("utf-8");
+	if (!raw) return null;
+	return JSON.parse(raw);
+}
+
+// ── Dispatch handlers ──────────────────────────────────────────────
+
+type DispatchResult = { ok: true; result: unknown } | { ok: false; error: string };
+
+function dispatch(prefix: string, action: string, args: unknown[]): DispatchResult {
+	switch (prefix) {
+		case "/auction":
+			return dispatchAuction(action, args);
+		case "/coin":
+			return dispatchCoin(action, args);
+		case "/family":
+			return dispatchFamily(action, args);
+		default:
+			return { ok: false, error: `unknown program: ${prefix}` };
+	}
+}
+
+function dispatchAuction(action: string, args: unknown[]): DispatchResult {
+	switch (action) {
+		case "status": {
+			return {
+				ok: true,
+				result: {
+					backend: "figgies",
+					bootstrap_key: "family",
+					writer_pubkey: ME,
+					view_length: getState().log.length,
+					system_length: getState().log.length,
+					known_writers: Object.keys(getState().users).length,
+				},
+			};
+		}
+		case "list": {
+			const auctions = listAuctions().map((a) => ({
+				kind: "auction.create",
+				id: a.id,
+				seller_pubkey: a.seller,
+				give: [{ object_id: a.title }],
+				want: [{ token: "figgies", amount: String(a.asking) }],
+				expiry_ms: a.expires_at,
+				created_at: a.created_at,
+				signature: "",
+				status: a.status,
+				recipient_pubkey: undefined,
+			}));
+			return { ok: true, result: auctions };
+		}
+		case "getBids": {
+			const id = args[0] as string;
+			const bids = listBids(id).map((b) => ({
+				auction_id: id,
+				bidder_pubkey: b.bidder,
+				offer: [{ token: "figgies", amount: String(b.amount) }],
+				created_at: b.at,
+				signature: "",
+			}));
+			bids.sort((a, b) => b.created_at - a.created_at);
+			return { ok: true, result: bids };
+		}
+		case "post": {
+			const body = (args[0] ?? {}) as {
+				give?: Array<{ object_id?: string; token?: string; amount?: string }>;
+				want?: Array<{ token?: string; amount?: string }>;
+				expiryMs?: number;
+			};
+			const title =
+				body.give?.[0]?.object_id ??
+				(body.give?.[0]?.token ? `${body.give[0].amount} ${body.give[0].token}` : "untitled");
+			const asking = Number(body.want?.[0]?.amount ?? 0);
+			const expires_at = Number(body.expiryMs ?? Date.now() + 24 * 60 * 60 * 1000);
+			const auction_id = newAuctionId();
+			const op: Op = {
+				id: newOpId(),
+				at: Date.now(),
+				kind: "post_auction",
+				auction_id,
+				seller: ME,
+				title,
+				asking,
+				expires_at,
+			};
+			const r = applyOp(op);
+			if (!r.ok) return { ok: false, error: r.error ?? "post failed" };
+			return { ok: true, result: { auction_id } };
+		}
+		case "bid": {
+			const body = (args[0] ?? {}) as {
+				auctionId?: string;
+				offer?: Array<{ token?: string; amount?: string }>;
+			};
+			if (!body.auctionId) return { ok: false, error: "auctionId required" };
+			const amount = Number(body.offer?.[0]?.amount ?? 0);
+			if (!Number.isFinite(amount) || amount <= 0) return { ok: false, error: "amount must be positive" };
+			const op: Op = {
+				id: newOpId(),
+				at: Date.now(),
+				kind: "bid",
+				auction_id: body.auctionId,
+				bidder: ME,
+				amount,
+			};
+			const r = applyOp(op);
+			if (!r.ok) return { ok: false, error: r.error ?? "bid failed" };
+			return { ok: true, result: {} };
+		}
+		case "settle": {
+			const body = (args[0] ?? {}) as { auctionId?: string; winner?: string };
+			if (!body.auctionId || !body.winner) return { ok: false, error: "auctionId and winner required" };
+			const op: Op = {
+				id: newOpId(),
+				at: Date.now(),
+				kind: "settle",
+				auction_id: body.auctionId,
+				winner: body.winner,
+				by: ME,
+			};
+			const r = applyOp(op);
+			if (!r.ok) return { ok: false, error: r.error ?? "settle failed" };
+			return { ok: true, result: {} };
+		}
+		case "cancel": {
+			const body = (args[0] ?? {}) as { auctionId?: string };
+			if (!body.auctionId) return { ok: false, error: "auctionId required" };
+			const op: Op = {
+				id: newOpId(),
+				at: Date.now(),
+				kind: "cancel",
+				auction_id: body.auctionId,
+				by: ME,
+			};
+			const r = applyOp(op);
+			if (!r.ok) return { ok: false, error: r.error ?? "cancel failed" };
+			return { ok: true, result: {} };
+		}
+		default:
+			return { ok: false, error: `unknown /auction action: ${action}` };
+	}
+}
+
+function dispatchCoin(action: string, _args: unknown[]): DispatchResult {
+	switch (action) {
+		case "list": {
+			// One synthetic token: figgies. Total "supply" = sum of all balances.
+			const users = listUsers();
+			const supply = users.reduce((sum, u) => sum + u.balance, 0);
+			return {
+				ok: true,
+				result: [
+					{
+						kind: "coin.deploy",
+						token_id: "figgies",
+						name: "Figgies",
+						symbol: "FIG",
+						decimals: 0,
+						supply: String(supply),
+						owner_pubkey: users.find((u) => u.role === "parent")?.name ?? ME,
+						mint_renounced: false,
+						created_at: 0,
+						signature: "",
+					},
+				],
+			};
+		}
+		case "holders": {
+			const holders = listUsers()
+				.filter((u) => u.balance > 0)
+				.map((u) => ({ pubkey: u.name, balance: String(u.balance) }));
+			return { ok: true, result: holders };
+		}
+		default:
+			return { ok: false, error: `unknown /coin action: ${action}` };
+	}
+}
+
+function dispatchFamily(action: string, args: unknown[]): DispatchResult {
+	switch (action) {
+		case "list":
+			return { ok: true, result: listUsers() };
+		case "me":
+			return { ok: true, result: { name: ME, user: getUser(ME) ?? null } };
+		case "register": {
+			const body = (args[0] ?? {}) as { name?: string; role?: Role };
+			if (!body.name) return { ok: false, error: "name required" };
+			if (body.role !== "parent" && body.role !== "kid") return { ok: false, error: "role must be parent or kid" };
+			const op: Op = { id: newOpId(), at: Date.now(), kind: "register_user", name: body.name, role: body.role };
+			const r = applyOp(op);
+			if (!r.ok) return { ok: false, error: r.error ?? "register failed" };
+			return { ok: true, result: {} };
+		}
+		case "mint": {
+			const body = (args[0] ?? {}) as { to?: string; amount?: number; memo?: string };
+			if (!body.to) return { ok: false, error: "to required" };
+			const amount = Number(body.amount ?? 0);
+			if (!Number.isFinite(amount) || amount <= 0) return { ok: false, error: "amount must be positive" };
+			const op: Op = { id: newOpId(), at: Date.now(), kind: "mint", to: body.to, amount, memo: body.memo, by: ME };
+			const r = applyOp(op);
+			if (!r.ok) return { ok: false, error: r.error ?? "mint failed" };
+			return { ok: true, result: {} };
+		}
+		case "transfer": {
+			const body = (args[0] ?? {}) as { to?: string; amount?: number; memo?: string };
+			if (!body.to) return { ok: false, error: "to required" };
+			const amount = Number(body.amount ?? 0);
+			if (!Number.isFinite(amount) || amount <= 0) return { ok: false, error: "amount must be positive" };
+			const op: Op = { id: newOpId(), at: Date.now(), kind: "transfer", from: ME, to: body.to, amount, memo: body.memo };
+			const r = applyOp(op);
+			if (!r.ok) return { ok: false, error: r.error ?? "transfer failed" };
+			return { ok: true, result: {} };
+		}
+		case "log":
+			return { ok: true, result: getState().log };
+		case "peers":
+			return { ok: true, result: peerStatus() };
+		default:
+			return { ok: false, error: `unknown /family action: ${action}` };
+	}
+}
+
+// ── Server ─────────────────────────────────────────────────────────
+
+const server = createServer(async (req, res) => {
+	if (req.method === "OPTIONS") {
+		send(res, 204, {});
+		return;
+	}
+	const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
+
+	try {
+		if (req.method === "POST" && url.pathname === "/dispatch") {
+			const body = (await readBody(req)) ?? {};
+			const result = dispatch(body.prefix ?? "", body.action ?? "", body.args ?? []);
+			send(res, result.ok ? 200 : 400, result);
+			return;
+		}
+
+		if (req.method === "GET" && url.pathname === "/ops") {
+			const since = url.searchParams.get("since");
+			const ops = opsSince(since);
+			send(res, 200, { ops });
+			return;
+		}
+
+		if (req.method === "GET" && url.pathname === "/state") {
+			send(res, 200, getState());
+			return;
+		}
+
+		if (req.method === "GET" && url.pathname === "/health") {
+			send(res, 200, { ok: true, user: ME, users: Object.keys(getState().users).length, auctions: Object.keys(getState().auctions).length });
+			return;
+		}
+
+		send(res, 404, { ok: false, error: "not found" });
+	} catch (err: any) {
+		send(res, 500, { ok: false, error: err?.message ?? String(err) });
+	}
 });
+
+server.listen(PORT, "127.0.0.1", () => {
+	console.log(`[figgies] daemon listening on 127.0.0.1:${PORT} as "${ME}"`);
+	startSync();
+});
+
+// Heartbeat so logs show liveness.
+setInterval(() => {
+	const s = getState();
+	console.log(`[figgies] alive — ${Object.keys(s.users).length} user(s), ${Object.keys(s.auctions).length} auction(s), ${s.log.length} op(s)`);
+}, 60_000);
