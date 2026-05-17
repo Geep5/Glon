@@ -37,7 +37,11 @@
 
 // ── Constants ────────────────────────────────────────────────────
 
-const DEFAULT_MODEL = "claude-sonnet-4-20250514";
+// Default to Kimi since the typical local-dev .env has KIMI_API_KEY but
+// no ANTHROPIC_API_KEY. Callers can still override via the `model` field
+// on /holdfast bootstrap / setup (or via /crud setField on an existing
+// agent's `model` key).
+const DEFAULT_MODEL = "kimi-k2-0905-preview";
 
 /**
  * Render the default system prompt with the configured names substituted in.
