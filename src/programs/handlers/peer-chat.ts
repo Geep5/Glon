@@ -101,6 +101,16 @@ interface PeerChatPayload {
 	body: unknown;
 	sent_at: number;
 	from_identity_pubkey: string; // claim; cross-checked against /peer's hyperswarm pubkey
+	// Additive cross-machine A2A routing fields. Both optional:
+	//   from_agent_id — sender-side agent id (on the sender's glon). Lets
+	//                   the receiver address replies back to a specific
+	//                   remote agent and render messages as agent-tagged.
+	//   to_agent_id   — receiver-side agent id (on this glon). Receiver
+	//                   uses it to set conv.owner_agent_id so the right
+	//                   local agent's loop fires. If absent, the message
+	//                   is human-routed (notification to the principal).
+	from_agent_id?: string;
+	to_agent_id?: string;
 }
 
 interface BlobMeta {
@@ -162,15 +172,21 @@ async function resolveSelfIdentity(ctx: ProgramContext): Promise<string> {
 	} catch { return ""; }
 }
 
-	/** Find a peered /peer record by identity_pubkey, peer_id, or display_name. Refuses non-peered. */
+	/** Find a peered /peer record by identity_pubkey, peer_id, or display_name. Refuses non-peered.
+	 *  Returns `agent_id_remote` for remote-agent peers (the agent's id on
+	 *  the host glon) — used to set to_agent_id on cross-machine envelopes
+	 *  so the receiver routes the message to the right agent. */
 	async function resolvePeerForChat(
 		ctx: ProgramContext,
 		ref: { peer_id?: string; identity_pubkey?: string; display_name?: string },
-	): Promise<{ peer_id: string; identity_pubkey: string; hyperswarm_pubkey: string; display_name: string }> {
+	): Promise<{ peer_id: string; identity_pubkey: string; hyperswarm_pubkey: string; display_name: string; agent_id_remote?: string }> {
 		const all = await ctx.dispatchProgram("/peer", "list", [{}]) as Array<any>;
 		const peers = Array.isArray(all) ? all : [];
 
-		// Collect candidates that match any provided ref field, then prefer peered.
+		// Collect candidates that match any provided ref field. Prefer
+		// remote-agent records (kind=agent + agent_id_remote) over the
+		// kind=human host record so display_name="Nova" routes to the
+		// remote agent Nova rather than the human host who runs that glon.
 		const candidates = peers.filter((p) => {
 			if (ref.peer_id && p.id === ref.peer_id) return true;
 			if (ref.identity_pubkey && (p.identity_pubkey ?? "").toLowerCase() === ref.identity_pubkey.toLowerCase()) return true;
@@ -178,10 +194,28 @@ async function resolveSelfIdentity(ctx: ProgramContext): Promise<string> {
 			return false;
 		});
 
-		const match = candidates.find((p) => isPeered(p.trust_level)) ?? candidates[0];
+		// Rank: peered first, then agent over human (more specific target),
+		// then by recency.
+		const rank = (p: any) => {
+			let s = 0;
+			if (isPeered(p.trust_level)) s += 100;
+			if (p.kind === "agent") s += 10;
+			return s;
+		};
+		const match = candidates.slice().sort((a, b) => rank(b) - rank(a))[0];
 
 		if (!match) throw new Error(`peer-chat: no peer matches ${JSON.stringify(ref)}. Have you peered with them? Try /directory list.`);
-		if (!isPeered(match.trust_level)) {
+		// Remote-agent records inherit trust from their host (the only
+		// trust handshake is host-to-host; agents are addressable iff the
+		// host that owns them is peered). If the matched record is a
+		// remote-agent peer and not directly trusted, look up the host
+		// via host_peer_id and use its trust.
+		let effectiveTrust = match.trust_level;
+		if (!isPeered(effectiveTrust) && match.kind === "agent" && match.host_peer_id) {
+			const host = peers.find((p) => p.id === match.host_peer_id);
+			if (host && isPeered(host.trust_level)) effectiveTrust = host.trust_level;
+		}
+		if (!isPeered(effectiveTrust)) {
 			throw new Error(`peer-chat: peer "${match.display_name}" is at trust=${match.trust_level}; need a peered trust level. Run /directory peer ${(match.identity_pubkey ?? "").slice(0, 16)} first.`);
 		}
 		if (!match.identity_pubkey) throw new Error(`peer-chat: peer "${match.display_name}" has no identity_pubkey on record (can't address)`);
@@ -196,6 +230,7 @@ async function resolveSelfIdentity(ctx: ProgramContext): Promise<string> {
 			identity_pubkey: match.identity_pubkey,
 			hyperswarm_pubkey: match.hyperswarm_pubkey ?? "",
 			display_name: match.display_name ?? match.id,
+			agent_id_remote: match.agent_id_remote,
 		};
 	}
 
@@ -378,6 +413,8 @@ async function doStartConversation(ctx: ProgramContext, input: StartConversation
 		body: input.text,
 		sent_at: now,
 		from_identity_pubkey: self_identity,
+		from_agent_id: input.from_agent_id,        // undefined when sent by the human principal
+		to_agent_id: peer.agent_id_remote,         // set only when targeting a remote agent
 	};
 	const payload_b64 = Buffer.from(JSON.stringify(payload)).toString("base64");
 	await ctx.dispatchProgram("/transport-hyperswarm", "send", [{
@@ -484,6 +521,14 @@ async function doSend(ctx: ProgramContext, input: SendInput): Promise<{ msg_id: 
 
 	// Cross-machine
 	const self_identity = await resolveSelfIdentity(ctx);
+	// Look up the peer's agent_id_remote so replies route back to the same
+	// remote agent — without this, a reply to a remote-agent conversation
+	// would land as a generic human notification on the receiving glon.
+	let to_agent_id: string | undefined;
+	try {
+		const peerRow = await ctx.dispatchProgram("/peer", "get", [conv.peer_object_id]) as { agent_id_remote?: string } | null;
+		to_agent_id = peerRow?.agent_id_remote;
+	} catch { /* peer record removed — proceed without targeted routing */ }
 	const payload: PeerChatPayload = {
 		msg_id,
 		kind: "text",
@@ -491,6 +536,8 @@ async function doSend(ctx: ProgramContext, input: SendInput): Promise<{ msg_id: 
 		body: input.text,
 		sent_at,
 		from_identity_pubkey: self_identity,
+		from_agent_id: input.from_agent_id,
+		to_agent_id,
 	};
 	const payload_b64 = Buffer.from(JSON.stringify(payload)).toString("base64");
 	await ctx.dispatchProgram("/transport-hyperswarm", "send", [{
@@ -650,28 +697,51 @@ async function doHandleIncoming(ctx: ProgramContext, input: HandleIncomingInput)
 		return false;
 	}
 
-	// Authenticate sender: cross-check the claimed identity_pubkey against
-	// the /peer record whose hyperswarm_pubkey matches the channel pubkey.
-	// If they don't agree, drop — somebody is trying to spoof.
+	// Authenticate sender by hyperswarm channel pubkey. There may be
+	// multiple /peer records sharing that hpk (the host + every remote
+	// agent on that glon); the HOST (kind=human) is the authoritative
+	// trust gate — agent records inherit. We pick a representative
+	// senderPeer to attach to the conversation, preferring the specific
+	// agent when from_agent_id is set.
 	const fromHex = (input.from ?? "").replace(/^swarm:\/\//, "").toLowerCase();
 	if (!fromHex) {
 		ctx.print?.(dim(`[peer-chat] dropped: no from_endpoint on blob`));
 		return false;
 	}
 	const all = await ctx.dispatchProgram("/peer", "list", [{}]) as Array<any>;
-	const peerRow = (Array.isArray(all) ? all : []).find((p) => (p.hyperswarm_pubkey ?? "").toLowerCase() === fromHex);
-	if (!peerRow) {
+	const peersByHpk = (Array.isArray(all) ? all : []).filter((p) => (p.hyperswarm_pubkey ?? "").toLowerCase() === fromHex);
+	if (peersByHpk.length === 0) {
 		ctx.print?.(dim(`[peer-chat] dropped: sender hyperswarm=${fromHex.slice(0, 12)} not in /peer (not peered)`));
 		return false;
 	}
-	if (!isPeered(peerRow.trust_level)) {
-		ctx.print?.(dim(`[peer-chat] dropped: sender ${peerRow.display_name} at trust=${peerRow.trust_level}; need peered`));
+	// Trust gate: at least one record for this glon must be peered. Host
+	// is the canonical record (kind=human); if it's peered the whole glon
+	// is. Falls back to "any record peered" so legacy installs without a
+	// separate host record (pre-roster) still work.
+	const hostPeer = peersByHpk.find((p) => p.kind === "human") ?? peersByHpk[0];
+	if (!isPeered(hostPeer.trust_level)) {
+		ctx.print?.(dim(`[peer-chat] dropped: sender host ${hostPeer.display_name} at trust=${hostPeer.trust_level}; need peered`));
 		return false;
 	}
-	if (payload.from_identity_pubkey && peerRow.identity_pubkey && payload.from_identity_pubkey.toLowerCase() !== (peerRow.identity_pubkey as string).toLowerCase()) {
-		ctx.print?.(dim(`[peer-chat] dropped: claimed identity=${payload.from_identity_pubkey.slice(0, 12)} doesn't match /peer record ${(peerRow.identity_pubkey as string).slice(0, 12)} for that hyperswarm key`));
+	if (payload.from_identity_pubkey && hostPeer.identity_pubkey && payload.from_identity_pubkey.toLowerCase() !== (hostPeer.identity_pubkey as string).toLowerCase()) {
+		ctx.print?.(dim(`[peer-chat] dropped: claimed identity=${payload.from_identity_pubkey.slice(0, 12)} doesn't match host /peer record ${(hostPeer.identity_pubkey as string).slice(0, 12)} for that hyperswarm key`));
 		return false;
 	}
+	// Pick the senderPeer that should own this side of the conversation:
+	// if the envelope names a specific agent on the sender glon, find that
+	// remote-agent /peer record. Otherwise the host is the sender.
+	let senderPeer = hostPeer;
+	if (payload.from_agent_id) {
+		const agentPeer = peersByHpk.find((p) => p.kind === "agent" && p.agent_id_remote === payload.from_agent_id);
+		if (agentPeer) senderPeer = agentPeer;
+	}
+
+	// Resolve which local agent (if any) should own this conversation.
+	// If the envelope carries to_agent_id, route to that agent's loop so
+	// agent-to-agent A2A actually fires the recipient's tool loop. If
+	// to_agent_id is absent, the message is human-routed (the principal
+	// gets a notification, no agent processes it automatically).
+	const owner_agent_id = payload.to_agent_id;
 
 	// Persist.
 	const state = ctx.state;
@@ -684,9 +754,10 @@ async function doHandleIncoming(ctx: ProgramContext, input: HandleIncomingInput)
 		conv = getConversation(state, conversation_id_from_meta);
 	}
 	if (!conv) {
-		// Best-effort find: same peer, latest active conversation.
+		// Best-effort find: same peer (by senderPeer.identity_pubkey),
+		// latest active conversation.
 		const candidates = Object.values((state.conversations ?? {}) as Record<string, Conversation>)
-			.filter((c) => c.peer_identity_pubkey.toLowerCase() === (peerRow.identity_pubkey as string).toLowerCase())
+			.filter((c) => c.peer_identity_pubkey.toLowerCase() === (senderPeer.identity_pubkey as string).toLowerCase())
 			.filter((c) => c.status === "active")
 			.sort((a, b) => b.started_at - a.started_at);
 		conv = candidates[0] ?? null;
@@ -696,13 +767,14 @@ async function doHandleIncoming(ctx: ProgramContext, input: HandleIncomingInput)
 		const conversation_id = newConversationId();
 		conv = {
 			id: conversation_id,
-			peer_identity_pubkey: peerRow.identity_pubkey,
-			peer_hyperswarm_pubkey: peerRow.hyperswarm_pubkey,
-			peer_display_name: peerRow.display_name ?? "(unnamed)",
-			peer_object_id: peerRow.id,
+			peer_identity_pubkey: senderPeer.identity_pubkey,
+			peer_hyperswarm_pubkey: senderPeer.hyperswarm_pubkey ?? fromHex,
+			peer_display_name: senderPeer.display_name ?? "(unnamed)",
+			peer_object_id: senderPeer.id,
 			goal: "(implicit — inbound without conversation_id)",
 			status: "active",
 			started_at: payload.sent_at,
+			owner_agent_id,                   // routes maybeAutoTrigger to the right agent
 			hop_cap: PAUSE_FOR_REVIEW_AT_HOPS,
 			messages: [],
 			last_message_at: 0,
@@ -710,6 +782,10 @@ async function doHandleIncoming(ctx: ProgramContext, input: HandleIncomingInput)
 		};
 		state.conversations = state.conversations ?? {};
 		state.conversations[conversation_id] = conv;
+	} else if (owner_agent_id && !conv.owner_agent_id) {
+		// Back-patch ownership onto an implicit conversation that the
+		// sender has now learned to address explicitly.
+		conv.owner_agent_id = owner_agent_id;
 	}
 	appendMessageToConversation(state, conv, {
 		msg_id: payload.msg_id,
@@ -729,7 +805,7 @@ async function doHandleIncoming(ctx: ProgramContext, input: HandleIncomingInput)
 		const preview = payload.kind === "text" ? String(payload.body).slice(0, 80) : `(${payload.kind})`;
 		try {
 			await ctx.dispatchProgram("/user-chat", "notify", [{
-				text: `${peerRow.display_name}: ${preview}`,
+				text: `${senderPeer.display_name}: ${preview}`,
 				urgency: "low",
 				source: "peer-chat",
 			}]);

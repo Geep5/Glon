@@ -371,9 +371,8 @@ async function handleAnnounce(ctx: ProgramContext, envelope: { payload: Uint8Arr
 		});
 		if (peerId) merged.peer_object_id = peerId;
 		// Cache the peer's agent roster on their /peer record as a JSON
-		// blob. Lets UIs render specific remote agents and address chats
-		// to them. Forward-compat with pre-roster peers: missing/empty
-		// stays missing/empty.
+		// blob (legacy, kept for UIs that read it). Forward-compat with
+		// pre-roster peers: missing/empty stays missing/empty.
 		if (peerId && Array.isArray(body.agents)) {
 			try {
 				const rosterJson = JSON.stringify(
@@ -384,6 +383,43 @@ async function handleAnnounce(ctx: ProgramContext, envelope: { payload: Uint8Arr
 				);
 				await ctx.dispatchProgram("/peer", "setField", [peerId, "agents_json", rosterJson]);
 			} catch { /* peer field not whitelisted yet, or transient — non-fatal */ }
+		}
+		// First-class /peer records for every remote agent. Lets /peer-chat
+		// address them by peer_id or display_name, and lets the UI navigate
+		// to them and render a chat pane for each. identity_pubkey is a
+		// synthetic swarm-routable id: `swarm:<host-hpk>:<agent-id>` — the
+		// peer-chat sender uses this to set to_agent_id on the envelope.
+		if (peerId && Array.isArray(body.agents)) {
+			const agentTrust = body.identity_pubkey || body.hyperswarm_pubkey
+				? "discovered"        // inherit host's discovered baseline
+				: "discovered";
+			for (const a of body.agents.slice(0, 32)) {
+				if (!a || typeof a.id !== "string" || typeof a.name !== "string") continue;
+				const syntheticIdentity = `swarm:${body.hyperswarm_pubkey}:${a.id}`;
+				try {
+					const found = await ctx.dispatchProgram("/peer", "findOrCreate", [{
+						external_key: "identity_pubkey",
+						external_value: syntheticIdentity,
+						defaults: {
+							display_name: a.name,
+							kind: "agent",
+							trust_level: agentTrust,
+						},
+					}]) as { id?: string; created?: boolean } | null;
+					const remoteAgentPeerId = found?.id;
+					if (!remoteAgentPeerId) continue;
+					// Patch routing fields — the daemon needs hyperswarm_pubkey
+					// to send to, agent_id_remote to put in the envelope's
+					// to_agent_id, and host_peer_id so UIs can group agents
+					// under their host.
+					await ctx.dispatchProgram("/peer", "setField", [remoteAgentPeerId, "hyperswarm_pubkey", body.hyperswarm_pubkey]);
+					await ctx.dispatchProgram("/peer", "setField", [remoteAgentPeerId, "agent_id_remote", a.id]);
+					await ctx.dispatchProgram("/peer", "setField", [remoteAgentPeerId, "host_peer_id", peerId]);
+					await ctx.dispatchProgram("/peer", "setField", [remoteAgentPeerId, "last_seen", String(Date.now())]);
+				} catch (err: any) {
+					console.log(`[directory] remote-agent peer upsert failed for ${a.name}: ${err?.message ?? String(err)}`);
+				}
+			}
 		}
 	}
 	await persistIfChanged(state, ctx);

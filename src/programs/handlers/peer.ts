@@ -40,6 +40,12 @@ import { dim, bold, cyan, red, green, yellow, magenta } from "../shared.js";
 		email?: string;
 		notes?: string;
 		last_seen?: string;
+		/** For remote-agent peers: the agent's id on the host glon. Used as
+		 *  to_agent_id when routing peer-chat envelopes back to it. */
+		agent_id_remote?: string;
+		/** For remote-agent peers: the host's /peer id (kind=human). Lets
+		 *  the UI navigate from an agent up to its glon. */
+		host_peer_id?: string;
 	}
 
 /**
@@ -74,7 +80,7 @@ export function isPeered(trust_level: string | undefined | null): boolean {
 //   agents_json — JSON-encoded array of {id, name} from the peer's most
 //                 recent announce. Lets UIs render that peer's specific
 //                 agents and (later) address messages to them by id.
-	const PEER_FIELDS = ["display_name", "kind", "trust_level", "identity_pubkey", "hyperswarm_pubkey", "endpoints", "preferred_transport", "key_verified_at", "attestations", "discord_id", "email", "notes", "last_seen", "agents_json"] as const;
+	const PEER_FIELDS = ["display_name", "kind", "trust_level", "identity_pubkey", "hyperswarm_pubkey", "endpoints", "preferred_transport", "key_verified_at", "attestations", "discord_id", "email", "notes", "last_seen", "agents_json", "agent_id_remote", "host_peer_id"] as const;
 
 // ── Helpers ──────────────────────────────────────────────────────
 
@@ -101,6 +107,8 @@ function extractString(v: any): string | undefined {
 			email: extractString(fields?.email),
 			notes: extractString(fields?.notes),
 			last_seen: extractString(fields?.last_seen),
+			agent_id_remote: extractString(fields?.agent_id_remote),
+			host_peer_id: extractString(fields?.host_peer_id),
 		};
 	}
 
