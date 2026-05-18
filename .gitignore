@@ -12,6 +12,8 @@ dist/
 
 # Runtime artifacts
 *.log
+*.err
+*.out
 *.pid
 .glon/
 .figgies/

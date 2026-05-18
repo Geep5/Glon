@@ -160,25 +160,34 @@ async function notifyUser(ctx: ProgramContext, text: string, urgency: "low" | "n
 async function upsertPeer(ctx: ProgramContext, opts: {
 	identity_pubkey: string;
 	hyperswarm_pubkey: string;
-	agent_name: string;
+	display_name: string;          // principal_name when known, falls back to agent_name (legacy)
 	trust_level: "discovered" | "trusted";
 	existing_peer_object_id?: string;
 }): Promise<string | null> {
 	try {
-		// Index by identity_pubkey — the stable chain identity. Even if the
-		// caller doesn't remember an existing peer_object_id (e.g. because
-		// state.discovered hadn't been populated yet on a fresh restart),
-		// /peer findOrCreate dedupes by the external key so we never create
-		// a second row for the same identity.
+		// Prefer identity_pubkey (stable chain identity); fall back to
+		// hyperswarm_pubkey when the peer hasn't bootstrapped a wallet yet
+		// — without this fallback, /peer findOrCreate would throw on an
+		// empty external_value and the peer record would never be created,
+		// silently breaking the trust handshake.
+		const hasIdentity = !!(opts.identity_pubkey && opts.identity_pubkey.length > 0);
+		const externalKey = hasIdentity ? "identity_pubkey" : "hyperswarm_pubkey";
+		const externalValue = hasIdentity ? opts.identity_pubkey : opts.hyperswarm_pubkey;
+		if (!externalValue) return null;
+
 		let peerId: string | null = opts.existing_peer_object_id ?? null;
 		let createdNow = false;
 		if (!peerId) {
 			const found = await ctx.dispatchProgram("/peer", "findOrCreate", [{
-				external_key: "identity_pubkey",
-				external_value: opts.identity_pubkey,
+				external_key: externalKey,
+				external_value: externalValue,
 				defaults: {
-					display_name: opts.agent_name,
-					kind: "agent",
+					display_name: opts.display_name,
+					// Discovered peers are remote glon hosts (the human
+					// principal) — not agents. The roster of remote agents
+					// is carried in the announce body's `agents` field and
+					// surfaced via the /peer record's agents_json.
+					kind: "human",
 					trust_level: opts.trust_level,
 				},
 			}]) as { id?: string; created?: boolean } | null;
@@ -187,6 +196,12 @@ async function upsertPeer(ctx: ProgramContext, opts: {
 		}
 		if (peerId) {
 			await ctx.dispatchProgram("/peer", "setField", [peerId, "hyperswarm_pubkey", opts.hyperswarm_pubkey]);
+			// If we keyed by hyperswarm_pubkey but the announce now carries
+			// an identity_pubkey, patch it onto the existing record so the
+			// next lookup can prefer the stable identity key.
+			if (hasIdentity) {
+				await ctx.dispatchProgram("/peer", "setField", [peerId, "identity_pubkey", opts.identity_pubkey]);
+			}
 			await ctx.dispatchProgram("/peer", "setField", [peerId, "last_seen", String(Date.now())]);
 			// Promote-only: only call setTrust when we're upgrading to
 			// "trusted". Never write "discovered" over an existing record —
@@ -197,7 +212,7 @@ async function upsertPeer(ctx: ProgramContext, opts: {
 		}
 		return peerId;
 	} catch (err: any) {
-		ctx.print?.(dim(`  [directory] peer upsert failed: ${err?.message ?? String(err)}`));
+		console.log(`[directory] peer upsert failed: ${err?.message ?? String(err)}`);
 		return null;
 	}
 }
@@ -232,21 +247,29 @@ interface PeerAnnounceBody {
 	agent_name: string;
 	capabilities: string[];
 	announced_at: number;
-	// New in this protocol_version (still v1 — additive). Pre-v1 receivers
-	// just ignore it. The roster lets remote UIs render specific agents
-	// orbiting the peer's sun and address chat envelopes to individual
-	// agents (once from_subentity_id / to_subentity_id are wired into
-	// peer-chat envelopes).
+	// Additive v1 fields. Pre-v1 receivers just ignore them.
+	//   agents       — full roster, so remote UIs can render specific agents.
+	//   principal_name — the human host's display name (from self peer).
+	//                    Discovered glons render this as the host row label.
 	agents?: AnnouncedAgent[];
+	principal_name?: string;
 }
 
-async function resolveSelfIdentity(ctx: ProgramContext): Promise<{ identity_pubkey: string; agent_name: string; agents: AnnouncedAgent[] }> {
+async function resolveSelfIdentity(ctx: ProgramContext): Promise<{ identity_pubkey: string; agent_name: string; agents: AnnouncedAgent[]; principal_name: string }> {
 	// Wallet's default key is treated as this daemon's chain identity.
 	let identity_pubkey = "";
 	try {
 		const info = await ctx.dispatchProgram("/wallet", "show", ["default"]) as { pubkey?: string } | null;
 		identity_pubkey = info?.pubkey ?? "";
 	} catch { /* no wallet, no key */ }
+	// Self peer's display_name is the human principal's name. Falls back
+	// to "host" if no self peer has been set up yet (pre-/holdfast-bootstrap).
+	let principal_name = "host";
+	try {
+		const peers = await ctx.dispatchProgram("/peer", "list", [{}]) as Array<{ kind?: string; display_name?: string }> | null;
+		const selfPeer = (peers ?? []).find((p) => p?.kind === "self");
+		if (selfPeer?.display_name) principal_name = selfPeer.display_name;
+	} catch { /* no /peer or empty — keep fallback */ }
 	// Walk the DAG's agent objects once: gives us both the "first agent"
 	// for the legacy agent_name field AND the full roster for the new
 	// `agents` array on the announce body.
@@ -260,13 +283,13 @@ async function resolveSelfIdentity(ctx: ProgramContext): Promise<{ identity_pubk
 		for (const a of liveAgents) agents.push({ id: a.id, name: a.name as string });
 		if (agents.length > 0) agent_name = agents[0].name;
 	} catch { /* no /crud, or empty DAG — keep fallback */ }
-	return { identity_pubkey, agent_name, agents };
+	return { identity_pubkey, agent_name, agents, principal_name };
 }
 
 async function broadcastAnnounce(ctx: ProgramContext): Promise<{ sent: number; skipped: number } | null> {
 	if (!swarmIsReady()) return null;
 	const hyperswarm_pubkey = getHyperswarmPublicKeyHex();
-	const { identity_pubkey, agent_name, agents } = await resolveSelfIdentity(ctx);
+	const { identity_pubkey, agent_name, agents, principal_name } = await resolveSelfIdentity(ctx);
 	const body: PeerAnnounceBody = {
 		protocol_version: ANNOUNCE_PROTOCOL_VERSION,
 		identity_pubkey,
@@ -275,6 +298,7 @@ async function broadcastAnnounce(ctx: ProgramContext): Promise<{ sent: number; s
 		capabilities: ["trade", "swap"],
 		announced_at: Date.now(),
 		agents,                            // remote glons render these as orbiters of this peer's sun
+		principal_name,                    // the human host's name — rendered as the host row label
 	};
 	const payload_b64 = Buffer.from(JSON.stringify(body)).toString("base64");
 	const topicHex = directoryTopic().toString("hex");
@@ -334,12 +358,14 @@ async function handleAnnounce(ctx: ProgramContext, envelope: { payload: Uint8Arr
 	state.discovered[idKey] = merged;
 
 	// Upsert /peer with trust_level=discovered (or refresh last_seen if
-	// already known). Don't downgrade trusted peers.
-	if (body.identity_pubkey) {
+	// already known). Don't downgrade trusted peers. The peer needs at
+	// least a hyperswarm_pubkey — identity_pubkey is preferred but not
+	// required (upsertPeer falls back to hyperswarm-keyed records).
+	if (body.identity_pubkey || body.hyperswarm_pubkey) {
 		const peerId = await upsertPeer(ctx, {
 			identity_pubkey: body.identity_pubkey,
 			hyperswarm_pubkey: body.hyperswarm_pubkey,
-			agent_name: body.agent_name || "(unnamed)",
+			display_name: body.principal_name || body.agent_name || "(unnamed host)",
 			trust_level: "discovered",
 			existing_peer_object_id: merged.peer_object_id,
 		});
@@ -450,7 +476,7 @@ async function handlePeerRequest(ctx: ProgramContext, envelope: { payload: Uint8
 	await upsertPeer(ctx, {
 		identity_pubkey: req.peer_identity_pubkey,
 		hyperswarm_pubkey: req.peer_hyperswarm_pubkey,
-		agent_name: req.peer_agent_name,
+		display_name: req.peer_agent_name,
 		trust_level: "trusted",
 		existing_peer_object_id: existing?.peer_object_id,
 	});
@@ -564,7 +590,7 @@ async function requestPeering(ctx: ProgramContext, input: { hyperswarm_pubkey?: 
 		await upsertPeer(ctx, {
 			identity_pubkey: req.peer_identity_pubkey,
 			hyperswarm_pubkey: req.peer_hyperswarm_pubkey,
-			agent_name: req.peer_agent_name,
+			display_name: req.peer_agent_name,
 			trust_level: "trusted",
 			existing_peer_object_id: existing?.peer_object_id,
 		});

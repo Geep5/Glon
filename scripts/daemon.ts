@@ -90,10 +90,10 @@ async function resolveId(raw: string): Promise<string | null> {
 
 		// ── Hyperswarm bring-up (Phase 1 — transport-hyperswarm) ──
 		// Bring the swarm online before any program actor starts so the
-		// /directory program can call joinTopic() in its onCreate.
-		// Disabled by default for the v0 cohort that doesn't yet have peers
-		// configured; opt-in via GLON_SWARM=1 until everyone is ready.
-		if (process.env.GLON_SWARM === "1") {
+		// /directory program can call joinTopic() in its onCreate. Always on
+		// by default — set GLON_SWARM=0 to opt out (useful for tests that
+		// don't want to touch the DHT).
+		if (process.env.GLON_SWARM !== "0") {
 			try {
 				const { default: Hyperswarm } = await import("hyperswarm");
 				const { initSwarm, loadOrCreateKeyPair } = await import("../src/swarm-host.js");
@@ -136,6 +136,24 @@ async function resolveId(raw: string): Promise<string | null> {
 			}
 		}
 		console.log(`[daemon] ${started} actor(s) running. Diskstats:`, diskStats());
+
+		// ── Wallet bootstrap ──────────────────────────────────────
+		// Every glon needs a chain identity (Ed25519 keypair). Auto-create
+		// a "default" key on first run so /directory announces carry a
+		// non-empty identity_pubkey out of the gate — without it, peer
+		// records can't be deduped by chain identity across machines.
+		try {
+			const walletCtx = buildContext({ state: {}, programId: "daemon-bootstrap" });
+			const existing = await walletCtx.dispatchProgram("/wallet", "show", ["default"]) as { pubkey?: string } | null;
+			if (!existing) {
+				const created = await walletCtx.dispatchProgram("/wallet", "new", ["default"]) as { pubkey?: string };
+				console.log(`[daemon] wallet: created default key ${created?.pubkey?.slice(0, 16)}...`);
+			} else {
+				console.log(`[daemon] wallet: default key ${existing.pubkey?.slice(0, 16)}...`);
+			}
+		} catch (err: any) {
+			console.log(`[daemon] wallet auto-create skipped: ${err?.message ?? err}`);
+		}
 
 		// ── Dev-mode file watcher ──────────────────────────────────
 		// Hot-reload programs when their handler source files change.

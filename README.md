@@ -152,7 +152,8 @@ on the wire). Astrolabe is just an HTTP client of this endpoint.
 - `~/Library/Application Support/rivetkit/glonFiggies-<hash>/` — actor
   state + SQLite index. Derived from the .pb files; safe to delete.
 
-Wipe `~/.glon` plus that rivetkit dir for a true clean-slate reset.
+Wipe `~/.glon` plus that rivetkit dir for a true clean-slate reset, or
+just run `./scripts/reset.sh`.
 
 ## Configuration
 
@@ -165,7 +166,7 @@ list):
 | `ANTHROPIC_API_KEY` | Anthropic LLM auth | required if using Claude models |
 | `GLON_DAEMON_PORT` | daemon dispatch port | `6430` |
 | `GLON_HOST_PORT` | rivetkit host port | `6420` |
-| `GLON_SWARM` | enable hyperswarm peer announces | off |
+| `GLON_SWARM` | set to `0` to disable hyperswarm peer announces | on |
 | `ANTHROPIC_DEFAULT_MODEL` | model id when an agent uses Anthropic | `claude-sonnet-4-20250514` |
 | `KIMI_DEFAULT_MODEL` | model id when an agent uses Kimi | `kimi-k2-0905-preview` |
 

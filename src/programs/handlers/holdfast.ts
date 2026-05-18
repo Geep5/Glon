@@ -621,6 +621,15 @@ async function doSetup(opts: SetupOpts, ctx: ProgramContext): Promise<SetupResul
 	}
 
 	// Self peer (the principal): reuse any peer with kind=self, else create.
+	// Wire the wallet's default Ed25519 pubkey as the principal's chain
+	// identity so /directory announces carry a stable identity_pubkey and
+	// remote glons can dedupe across reconnects.
+	let walletPubkey: string | undefined;
+	try {
+		const wInfo = await ctx.dispatchProgram("/wallet", "show", ["default"]) as { pubkey?: string } | null;
+		walletPubkey = wInfo?.pubkey;
+	} catch { /* no wallet program (unusual) — proceed without identity */ }
+
 	let principalPeerId = await findSelfPeer(ctx);
 	let createdPeer = false;
 	if (!principalPeerId) {
@@ -629,10 +638,20 @@ async function doSetup(opts: SetupOpts, ctx: ProgramContext): Promise<SetupResul
 			kind: stringVal("self"),
 			trust_level: stringVal("self"),
 		};
+		if (walletPubkey) peerFields.identity_pubkey = stringVal(walletPubkey);
 		if (opts.principalDiscordId) peerFields.discord_id = stringVal(opts.principalDiscordId);
 		if (opts.principalEmail) peerFields.email = stringVal(opts.principalEmail);
 		principalPeerId = (await store.create("peer", JSON.stringify(peerFields))) as string;
 		createdPeer = true;
+	} else if (walletPubkey) {
+		// Back-patch identity_pubkey onto an older self peer that pre-dates
+		// wallet auto-create. Idempotent: setField writes the same value
+		// each call until the key rotates.
+		const existing = await store.get(principalPeerId);
+		if (!extractString(existing?.fields?.identity_pubkey)) {
+			const peerActor = client.objectActor.getOrCreate([principalPeerId]);
+			await peerActor.setField("identity_pubkey", JSON.stringify(stringVal(walletPubkey)));
+		}
 	}
 
 	// Link agent → principal peer (graph relation for future queries).
