@@ -798,6 +798,15 @@ async function doHandleIncoming(ctx: ProgramContext, input: HandleIncomingInput)
 	});
 	await persistIfChanged(state, ctx);
 
+	// If the envelope addressed a specific local agent (to_agent_id),
+	// nudge that agent's loop so it actually responds. Without this, the
+	// message lands in state.conversations and just sits there — the
+	// recipient agent never sees it. Mirrors what local startConversation
+	// does for same-machine targets.
+	if (conv.owner_agent_id && conv.status === "active") {
+		void maybeAutoTrigger(ctx, conv.id);
+	}
+
 	// Surface a tiny notification once per conversation pause so the human
 	// notices without spam. /user-chat dedupes by source+text within a
 	// short window; we only ping if it's been quiet for >30s.
