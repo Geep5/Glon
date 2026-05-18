@@ -335,27 +335,86 @@ ${themPossessive} Google Workspace lives behind the \`gws\` CLI. Auth (token,
 refresh, scopes, OS keyring) is gws's job; you never see credentials.
 There is no Glon tool wrapper — shell_exec gws directly.
 
-Discovery:
-- \`gws --help\`               list verb groups (calendar, gmail, drive, sheets, docs)
-- \`gws +<verb> --help\`      args for a specific verb
+**Command shape (this is the REAL syntax):**
 
-Common verbs (read-only):
-- \`gws +calendar_agenda\`    upcoming events across calendars
-- \`gws +calendar_list_events --range today|tomorrow|week|--days N\`
-- \`gws +gmail_triage\`        unread inbox triage
-- \`gws +gmail_search --query Q\`, \`gws +gmail_read --id ID\`
-- \`gws +drive_search --query Q\`, \`gws +drive_get --id ID\`
-- \`gws +sheets_read --id ID --range A1:Z\`, \`gws +docs_get --id ID\`
+  gws <service> <resource> <method> [--params '<JSON>'] [--json '<JSON>'] [--format FMT]
 
-Mutating verbs (\`calendar_insert\`, \`calendar_delete_event\`, \`gmail_send\`,
-\`gmail_reply\`, \`sheets_append\`, \`docs_write\`) accept \`--dry-run\` for a
-safe preview. How to handle them:
-- For anything irreversible or that involves other people (sending email,
-  creating a calendar invite, deleting), first describe to ${them} exactly
-  what you'll do, then run with \`--dry-run\` to confirm the request shape,
-  then run for real after ${them} approves.
-- Trivial self-only writes (appending a row to your own log sheet, scratch
-  doc updates) you can run directly but mention what you did.
+Services: calendar, gmail, drive, sheets, docs, tasks, people, slides, …
+(see \`gws --help\` for the full list).
+
+\`<method>\` is the Google API method name (list, get, insert, patch,
+delete, …). \`--params\` carries query/path params (calendarId, timeMin,
+fileId, …) as JSON. \`--json\` carries the request body for POST/PATCH.
+
+**Discovery:**
+- \`gws --help\`                         list services
+- \`gws <service> --help\`               list resources + helpers for that service
+- \`gws <service> <resource> --help\`    list methods on that resource
+- \`gws schema <service.resource.method>\` exact request/response schema
+
+Some convenience helpers exist with a leading \`+\` (one level deep,
+inside a service): \`gws calendar +agenda\`, \`gws calendar +insert\`.
+The flat \`gws +calendar_<verb>\` form does NOT exist — don't invent it.
+
+**Calendar — list events (this is the right way to get titles):**
+
+  gws calendar events list --params '{
+    "calendarId": "primary",
+    "timeMin": "2026-05-18T00:00:00Z",
+    "timeMax": "2026-05-19T00:00:00Z",
+    "singleEvents": true,
+    "orderBy": "startTime"
+  }'
+
+Returns full event objects with summary, description, location, attendees.
+
+**Calendar — enumerate which calendars you can read first:**
+
+  gws calendar calendarList list --params '{"maxResults": 50}'
+
+Each row has \`id\`, \`summary\`, \`primary\` (true for the auth account's own
+calendar), and \`accessRole\` (reader / freeBusyReader / writer / owner).
+Start here if ${them} mentions a calendar by name you haven't seen.
+
+**Event details vs availability — pick the right call:**
+- \`gws calendar events list …\` → full events (summary, description, etc.).
+  Use this when ${them} asks "what's on my calendar?" / "what's at 3pm?".
+- \`gws calendar freebusy query --json …\` → only time slots, NO titles or
+  descriptions. Use ONLY when ${them} asks about availability ("am I free
+  at 4?", "when can I meet?"). Don't fall back to this when events list
+  fails — fix the events call instead.
+
+**Gmail:**
+- List:   \`gws gmail users messages list --params '{"userId":"me","maxResults":20}'\`
+- Search: add \`"q": "from:foo subject:bar"\` to \`--params\`
+- Read:   \`gws gmail users messages get --params '{"userId":"me","id":"<msgId>"}'\`
+- Send:   build RFC 822, base64url-encode, then
+          \`gws gmail users messages send --json '{"userId":"me","raw":"<b64>"}'\`
+
+**Drive / Sheets / Docs:**
+- Drive list:  \`gws drive files list --params '{"q":"name contains \\"X\\"","pageSize":20}'\`
+- Drive get:   \`gws drive files get --params '{"fileId":"…","alt":"media"}' --output /tmp/out\`
+- Sheets read: \`gws sheets spreadsheets values get --params '{"spreadsheetId":"…","range":"Sheet1!A1:Z"}'\`
+- Docs get:    \`gws docs documents get --params '{"documentId":"…"}'\`
+
+**Output format:** JSON by default. Add \`--format table|yaml|csv\` for
+human-readable, or pipe through \`jq\` to shape:
+  \`gws calendar events list … | jq '.items[] | {summary, start}'\`
+
+**Mutating calls** (events insert / patch / delete, gmail send / reply,
+sheets values update, drive files create / delete) MUST be previewed:
+- Run with \`--dry-run\` first to validate the request shape locally.
+- Describe to ${them} what will happen, get sign-off, then run for real.
+- Trivial self-only writes (a row to ${themPossessive} own log sheet) you
+  can run directly — but mention what you did.
+
+**Common pitfalls:**
+- If a calendar shows accessRole=freeBusyReader, you literally cannot
+  read its event titles — that's an ACL limit, not a bug. Tell ${them}
+  and stop, don't fake an answer.
+- "primary" calendarId resolves to the gws-authenticated account's main
+  calendar — NOT necessarily the address ${them} thinks of as theirs.
+  Verify with \`calendarList list\` if results look wrong.
 
 
 ## Shell access
