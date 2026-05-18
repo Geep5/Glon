@@ -81,6 +81,11 @@ export interface PendingRequest {
 interface PersistedDirectoryState {
 	discovered: Record<string, DiscoveredPeer>;
 	requests: Record<string, PendingRequest>;
+	/** Pubkeys (identity or hyperswarm) the user has explicitly forgotten.
+	 *  Future announces matching either field are silently dropped so the
+	 *  row doesn't spring back from the next ping. Stored as a flat map
+	 *  for cheap lookups; the value is the timestamp of when we blocked it. */
+	blocked?: Record<string, number>;
 }
 
 interface BlobMeta {
@@ -116,6 +121,7 @@ function snapshotState(state: Record<string, any>): string {
 	return JSON.stringify({
 		discovered: state.discovered ?? {},
 		requests: state.requests ?? {},
+		blocked: state.blocked ?? {},
 	});
 }
 
@@ -129,6 +135,7 @@ async function restoreState(state: Record<string, any>, ctx: ProgramContext) {
 		const parsed = JSON.parse(raw) as PersistedDirectoryState;
 		if (parsed.discovered) state.discovered = parsed.discovered;
 		if (parsed.requests) state.requests = parsed.requests;
+		if (parsed.blocked) state.blocked = parsed.blocked;
 		state._lastPersistedSnapshot = snapshotState(state);
 	} catch (err: any) {
 		ctx.print?.(dim(`  [directory] restore failed: ${err?.message ?? String(err)}`));
@@ -359,6 +366,14 @@ async function handleAnnounce(ctx: ProgramContext, envelope: { payload: Uint8Arr
 	if (!body.hyperswarm_pubkey) return false;
 	// Ignore our own announces.
 	if (swarmIsReady() && body.hyperswarm_pubkey === getHyperswarmPublicKeyHex()) return true;
+	// Honor the blocklist: peers the user has explicitly forgotten don't
+	// get to re-appear from the next announce. Match on either identity
+	// or hyperswarm pubkey so a peer can't bypass by rotating one.
+	const blocked = (ctx.state.blocked ?? {}) as Record<string, number>;
+	if ((body.identity_pubkey && blocked[body.identity_pubkey.toLowerCase()])
+		|| (body.hyperswarm_pubkey && blocked[body.hyperswarm_pubkey.toLowerCase()])) {
+		return true;        // accept the envelope (don't trip retry) but drop silently
+	}
 	// Forward-compat: accept higher protocol_versions as long as the
 	// required v1 fields parsed. Log once per session so we notice if a
 	// peer is on a newer schema and we should consider upgrading.
@@ -900,6 +915,48 @@ const actorDef: ProgramActorDef = {
 		},
 		acceptRequest: { description: "Accept an incoming peer request.", inputSchema: { type: "object", required: ["request_id"], properties: { request_id: { type: "string" } } }, handler: async (ctx, input: { request_id: string }) => acceptRequest(ctx, input.request_id) },
 		declineRequest: { description: "Decline an incoming peer request.", inputSchema: { type: "object", required: ["request_id"], properties: { request_id: { type: "string" }, reason: { type: "string" } } }, handler: async (ctx, input: { request_id: string; reason?: "declined" | "approval_timeout" }) => declineRequest(ctx, input.request_id, input.reason ?? "declined") },
+		forgetDiscovered: {
+			description: "Drop a peer from state.discovered AND add it to the blocklist so future announces don't re-add it. Match by identity_pubkey, hyperswarm_pubkey, or both.",
+			inputSchema: { type: "object", properties: { identity_pubkey: { type: "string" }, hyperswarm_pubkey: { type: "string" } } },
+			handler: async (ctx, input: { identity_pubkey?: string; hyperswarm_pubkey?: string }) => {
+				const state = ctx.state;
+				state.discovered = state.discovered ?? {};
+				state.blocked = state.blocked ?? {};
+				const ipk = (input.identity_pubkey ?? "").toLowerCase();
+				const hpk = (input.hyperswarm_pubkey ?? "").toLowerCase();
+				if (!ipk && !hpk) throw new Error("forgetDiscovered: identity_pubkey or hyperswarm_pubkey required");
+				let removed = 0;
+				for (const key of Object.keys(state.discovered)) {
+					const d = state.discovered[key] as DiscoveredPeer;
+					const di = (d.identity_pubkey ?? "").toLowerCase();
+					const dh = (d.hyperswarm_pubkey ?? "").toLowerCase();
+					if ((ipk && di === ipk) || (hpk && dh === hpk)) {
+						delete state.discovered[key];
+						removed++;
+					}
+				}
+				const now = Date.now();
+				if (ipk) state.blocked[ipk] = now;
+				if (hpk) state.blocked[hpk] = now;
+				await persistIfChanged(state, ctx);
+				return { ok: true, removed, blocked: { identity_pubkey: ipk || undefined, hyperswarm_pubkey: hpk || undefined } };
+			},
+		},
+		unblock: {
+			description: "Remove a pubkey from the directory blocklist so its announces are accepted again.",
+			inputSchema: { type: "object", properties: { identity_pubkey: { type: "string" }, hyperswarm_pubkey: { type: "string" } } },
+			handler: async (ctx, input: { identity_pubkey?: string; hyperswarm_pubkey?: string }) => {
+				const state = ctx.state;
+				state.blocked = state.blocked ?? {};
+				const ipk = (input.identity_pubkey ?? "").toLowerCase();
+				const hpk = (input.hyperswarm_pubkey ?? "").toLowerCase();
+				let dropped = 0;
+				if (ipk && state.blocked[ipk]) { delete state.blocked[ipk]; dropped++; }
+				if (hpk && state.blocked[hpk]) { delete state.blocked[hpk]; dropped++; }
+				await persistIfChanged(state, ctx);
+				return { ok: true, dropped };
+			},
+		},
 		status: {
 			description: "Network state snapshot, including a `self` block so UIs can show 'you'.",
 			inputSchema: { type: "object", properties: {} },
