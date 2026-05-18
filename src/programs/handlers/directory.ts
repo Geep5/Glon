@@ -209,11 +209,41 @@ async function upsertPeer(ctx: ProgramContext, opts: {
 			if (!createdNow && opts.trust_level === "trusted") {
 				await ctx.dispatchProgram("/peer", "setTrust", [peerId, "trusted"]);
 			}
+			// When a HOST gets promoted to trusted, cascade to every
+			// remote-agent /peer record sharing this hyperswarm_pubkey.
+			// Without the cascade, agent records stay at "discovered" and
+			// the UI / API has to do per-record host-trust lookups
+			// everywhere it reads trust.
+			if (opts.trust_level === "trusted" && opts.hyperswarm_pubkey) {
+				await cascadeHostTrustToAgents(ctx, opts.hyperswarm_pubkey, "trusted");
+			}
 		}
 		return peerId;
 	} catch (err: any) {
 		console.log(`[directory] peer upsert failed: ${err?.message ?? String(err)}`);
 		return null;
+	}
+}
+
+/** Walk every kind=agent /peer record whose hyperswarm_pubkey matches
+ *  the given host's, and bump them to the host's trust level. Idempotent. */
+async function cascadeHostTrustToAgents(ctx: ProgramContext, hyperswarmPubkey: string, trustLevel: string): Promise<void> {
+	if (!hyperswarmPubkey) return;
+	try {
+		const all = await ctx.dispatchProgram("/peer", "list", [{}]) as Array<any>;
+		const targetHpk = hyperswarmPubkey.toLowerCase();
+		for (const p of all || []) {
+			if (p?.kind !== "agent") continue;
+			if ((p?.hyperswarm_pubkey ?? "").toLowerCase() !== targetHpk) continue;
+			if (p?.trust_level === trustLevel) continue;
+			try {
+				await ctx.dispatchProgram("/peer", "setTrust", [p.id, trustLevel]);
+			} catch (err: any) {
+				console.log(`[directory] cascade setTrust failed for ${p.display_name ?? p.id}: ${err?.message ?? err}`);
+			}
+		}
+	} catch (err: any) {
+		console.log(`[directory] cascade list failed: ${err?.message ?? err}`);
 	}
 }
 
@@ -390,9 +420,14 @@ async function handleAnnounce(ctx: ProgramContext, envelope: { payload: Uint8Arr
 		// synthetic swarm-routable id: `swarm:<host-hpk>:<agent-id>` — the
 		// peer-chat sender uses this to set to_agent_id on the envelope.
 		if (peerId && Array.isArray(body.agents)) {
-			const agentTrust = body.identity_pubkey || body.hyperswarm_pubkey
-				? "discovered"        // inherit host's discovered baseline
-				: "discovered";
+			// Inherit the host's CURRENT trust so agents on an already-
+			// trusted host don't appear at trust=discovered (which would
+			// make UIs and API merges treat them as second-class).
+			let agentTrust = "discovered";
+			try {
+				const hostPeer = await ctx.dispatchProgram("/peer", "get", [peerId]) as { trust_level?: string } | null;
+				if (hostPeer?.trust_level) agentTrust = hostPeer.trust_level;
+			} catch { /* host record not readable — keep discovered baseline */ }
 			for (const a of body.agents.slice(0, 32)) {
 				if (!a || typeof a.id !== "string" || typeof a.name !== "string") continue;
 				const syntheticIdentity = `swarm:${body.hyperswarm_pubkey}:${a.id}`;
@@ -416,6 +451,12 @@ async function handleAnnounce(ctx: ProgramContext, envelope: { payload: Uint8Arr
 					await ctx.dispatchProgram("/peer", "setField", [remoteAgentPeerId, "agent_id_remote", a.id]);
 					await ctx.dispatchProgram("/peer", "setField", [remoteAgentPeerId, "host_peer_id", peerId]);
 					await ctx.dispatchProgram("/peer", "setField", [remoteAgentPeerId, "last_seen", String(Date.now())]);
+					// Promote existing records up to the host's current trust
+					// (handles the case where the agent record was created
+					// at "discovered" before the host got peered).
+					if (!found?.created && agentTrust !== "discovered") {
+						await ctx.dispatchProgram("/peer", "setTrust", [remoteAgentPeerId, agentTrust]);
+					}
 				} catch (err: any) {
 					console.log(`[directory] remote-agent peer upsert failed for ${a.name}: ${err?.message ?? String(err)}`);
 				}
