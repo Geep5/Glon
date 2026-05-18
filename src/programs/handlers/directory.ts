@@ -41,7 +41,11 @@ export const PEER_ACCEPT_CONTENT_TYPE = "glon/peer-accept";
 export const PEER_DECLINE_CONTENT_TYPE = "glon/peer-decline";
 
 const DEFAULT_ANNOUNCE_INTERVAL_S = 60;
-const DEFAULT_PRESENCE_TTL_S = 300;
+// Discovered peers get pruned after this many seconds of silence. Long
+// enough that a laptop sleep or short network blip doesn't wipe trusted
+// contacts out of the UI; short enough that genuinely-gone peers
+// eventually fall off. Override with DIRECTORY_PRESENCE_TTL_S.
+const DEFAULT_PRESENCE_TTL_S = 24 * 60 * 60;
 const DEFAULT_PEER_REQUEST_APPROVAL_TIMEOUT_S = 600; // 10 min
 const TICK_MS = 30_000;
 
