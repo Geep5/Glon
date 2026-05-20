@@ -19,6 +19,7 @@
 
 import type { ProgramDef, ProgramContext, ProgramActorDef } from "../runtime.js";
 import { dim, bold, cyan, red, green, yellow } from "../shared.js";
+import { createHash } from "node:crypto";
 
 
 // ── Constants ────────────────────────────────────────────────────
@@ -189,15 +190,20 @@ function a2aCategoryName(): string {
 	return process.env.GLON_A2A_CATEGORY_NAME ?? A2A_CATEGORY_NAME_DEFAULT;
 }
 
-/** Deterministic channel name for an unordered pair of identity pubkeys.
- *  Sorts the two values lexicographically so both sides produce the same
- *  name; truncates each to 16 hex chars for readability. */
+/** Deterministic Discord-safe channel name for an unordered pair of
+ *  identity pubkeys (or any identity strings, including "local:<agentId>").
+ *  Hashes each input to 16 hex chars and sorts so both daemons compute
+ *  the same name. Discord channel names allow [a-z0-9_-] only, which
+ *  hex satisfies. */
 export function pairChannelName(idA: string, idB: string): string {
-	const a = String(idA ?? "").toLowerCase();
-	const b = String(idB ?? "").toLowerCase();
+	const a = String(idA ?? "");
+	const b = String(idB ?? "");
 	if (!a || !b) throw new Error("pairChannelName: both identity pubkeys required");
-	const [lo, hi] = a < b ? [a, b] : [b, a];
-	return `pair-${lo.slice(0, 16)}-${hi.slice(0, 16)}`;
+	const hash = (s: string) => createHash("sha256").update(s.toLowerCase()).digest("hex").slice(0, 16);
+	const ha = hash(a);
+	const hb = hash(b);
+	const [lo, hi] = ha < hb ? [ha, hb] : [hb, ha];
+	return `pair-${lo}-${hi}`;
 }
 
 async function listGuildChannels(guildId: string): Promise<DiscordChannelSummary[]> {
@@ -276,11 +282,159 @@ async function doEnsurePairChannel(state: Record<string, any>, input: EnsurePair
 		name,
 		type: DISCORD_CHANNEL_TYPE_TEXT,
 		parent_id: cat.category_id,
-		topic: `glon agent-to-agent channel between ${input.peer_a_identity_pubkey.slice(0, 16)}… and ${input.peer_b_identity_pubkey.slice(0, 16)}…`,
+		topic: `glon A2A channel · ${input.peer_a_identity_pubkey.slice(0, 24)} ↔ ${input.peer_b_identity_pubkey.slice(0, 24)}`,
 	});
 	if (!created?.id) throw new Error("Discord did not return a channel id when creating pair channel");
 	state.a2aPairChannel[cacheKey] = created.id as string;
 	return { channel_id: created.id as string, name: created.name as string, created: true, category_id: cat.category_id };
+}
+
+// ── A2A envelope wire format ─────────────────────────────────────
+// Discord messages in pair channels carry a human-readable preamble
+// (so the channel reads naturally) plus a fenced code block containing
+// the machine-parsable JSON envelope. The fence tag distinguishes glon
+// protocol messages from arbitrary human chatter that may live in the
+// same channel.
+
+const A2A_ENVELOPE_FENCE = "glon-msg";
+const A2A_FENCE_RE = new RegExp("```\\s*" + A2A_ENVELOPE_FENCE + "\\s*\\n([\\s\\S]*?)\\n```", "i");
+const A2A_POLL_BATCH = 25;
+
+export interface A2AEnvelope {
+	v: 1;
+	msg_id: string;
+	conversation_id: string;
+	kind: "text" | "done";
+	from_identity_pubkey: string;
+	from_agent_id?: string;
+	from_display_name?: string;
+	to_identity_pubkey: string;
+	to_agent_id?: string;
+	to_display_name?: string;
+	body: unknown;
+	in_reply_to: string | null;
+	sent_at: number;
+	goal?: string;
+}
+
+export function formatA2AMessage(env: A2AEnvelope): string {
+	const sender = env.from_display_name || env.from_agent_id || "agent";
+	const target = env.to_display_name || env.to_agent_id || "agent";
+	const convShort = (env.conversation_id || "").slice(0, 12);
+	const goalSnippet = env.goal ? ` · "${String(env.goal).slice(0, 60)}"` : "";
+	const bodyText = env.kind === "text" ? String(env.body ?? "") : `[${env.kind}]`;
+	const bodyPreview = bodyText.length > 1500 ? bodyText.slice(0, 1500) + "…" : bodyText;
+	const quoted = bodyPreview.split("\n").map((line) => `> ${line}`).join("\n");
+	const preamble = `**${sender} → ${target}** · \`${convShort}\`${goalSnippet}\n${quoted}`;
+	const jsonBlock = "```" + A2A_ENVELOPE_FENCE + "\n" + JSON.stringify(env) + "\n```";
+	return `${preamble}\n${jsonBlock}`;
+}
+
+export function parseA2AMessage(content: string): A2AEnvelope | null {
+	const m = A2A_FENCE_RE.exec(content ?? "");
+	if (!m) return null;
+	try {
+		const parsed = JSON.parse(m[1]);
+		if (!parsed || typeof parsed !== "object") return null;
+		if (parsed.v !== 1) return null;
+		if (typeof parsed.msg_id !== "string" || typeof parsed.conversation_id !== "string") return null;
+		return parsed as A2AEnvelope;
+	} catch {
+		return null;
+	}
+}
+
+interface PostA2AInput {
+	peer_a_identity_pubkey: string;
+	peer_b_identity_pubkey: string;
+	envelope: A2AEnvelope;
+}
+
+interface PostA2AResult {
+	channel_id: string;
+	channel_name: string;
+	message_ids: string[];
+}
+
+async function doPostA2A(state: Record<string, any>, input: PostA2AInput): Promise<PostA2AResult> {
+	if (!input?.envelope) throw new Error("discord.postA2A: envelope required");
+	const ch = await doEnsurePairChannel(state, {
+		peer_a_identity_pubkey: input.peer_a_identity_pubkey,
+		peer_b_identity_pubkey: input.peer_b_identity_pubkey,
+	});
+	const body = formatA2AMessage(input.envelope);
+	const message_ids = await postMessage(ch.channel_id, body);
+	return { channel_id: ch.channel_id, channel_name: ch.name, message_ids };
+}
+
+/** Poll one A2A pair channel for new envelopes. Unlike pollBridgeChannel,
+ *  the bot itself is the only Discord author — we still ingest every
+ *  message but filter to those carrying a glon-msg fenced block. The
+ *  recipient's daemon picks up envelopes addressed to its local agents;
+ *  the sender's daemon naturally ignores its own outbound because
+ *  to_agent_id will name the peer, not anyone local. */
+async function pollA2APairChannel(channelId: string, state: Record<string, any>, ctx: ProgramContext): Promise<number> {
+	state.a2aWatermarks = state.a2aWatermarks ?? {};
+	const watermark = state.a2aWatermarks[channelId] as string | undefined;
+	const isFirstPoll = !watermark;
+
+	const qs = isFirstPoll ? `?limit=${A2A_POLL_BATCH}` : `?limit=${A2A_POLL_BATCH}&after=${watermark}`;
+	const msgs = await discord("GET", `/channels/${channelId}/messages${qs}`) as DiscordMessage[] | null;
+	if (!msgs || msgs.length === 0) {
+		if (isFirstPoll) state.a2aWatermarks[channelId] = "0";
+		return 0;
+	}
+	const sorted = [...msgs].sort((a, b) => a.id.localeCompare(b.id));
+	const newest = sorted[sorted.length - 1].id;
+	if (!watermark || newest > watermark) state.a2aWatermarks[channelId] = newest;
+
+	const now = Date.now();
+	const eligible = isFirstPoll
+		? sorted.filter((m) => now - snowflakeTimestampMs(m.id) <= FIRST_POLL_RECENCY_MS)
+		: sorted;
+
+	let processed = 0;
+	for (const m of eligible) {
+		const env = parseA2AMessage(m.content ?? "");
+		if (!env) continue;
+		processed++;
+		try {
+			await ctx.dispatchProgram("/peer-chat", "handleA2A", [{
+				envelope: env,
+				channel_id: channelId,
+				discord_message_id: m.id,
+			}]);
+		} catch (err: any) {
+			ctx.print(dim(`  [discord] A2A dispatch failed (channel ${channelId}, msg ${m.id}): ${err?.message ?? String(err)}`));
+		}
+	}
+	return processed;
+}
+
+/** Enumerate pair channels under the A2A category and poll each. Returns
+ *  total envelopes processed. */
+async function pollA2AGuild(state: Record<string, any>, ctx: ProgramContext): Promise<number> {
+	if (!process.env.GLON_A2A_DISCORD_GUILD) return 0;
+	let total = 0;
+	try {
+		const cat = await doEnsurePairCategory(state);
+		const channels = await listGuildChannels(a2aGuildId());
+		const pairChannels = channels.filter((c) =>
+			c.type === DISCORD_CHANNEL_TYPE_TEXT
+			&& c.parent_id === cat.category_id
+			&& c.name.startsWith("pair-"),
+		);
+		for (const ch of pairChannels) {
+			try {
+				total += await pollA2APairChannel(ch.id, state, ctx);
+			} catch (err: any) {
+				ctx.print(dim(`  [discord] A2A poll error for ${ch.name}: ${err?.message ?? String(err)}`));
+			}
+		}
+	} catch (err: any) {
+		ctx.print(dim(`  [discord] A2A poll setup failed: ${err?.message ?? String(err)}`));
+	}
+	return total;
 }
 
 // ── Core: sending ────────────────────────────────────────────────
@@ -527,7 +681,7 @@ async function pollBridgeChannel(channelId: string, state: Record<string, any>, 
 }
 
 
-async function runPoll(state: Record<string, any>, ctx: ProgramContext): Promise<{ peers: number; processed: number; bridges: number }> {
+async function runPoll(state: Record<string, any>, ctx: ProgramContext): Promise<{ peers: number; processed: number; bridges: number; a2a: number }> {
 	const peers = await fetchPeersWithDiscord(ctx);
 	let processed = 0;
 	for (const peer of peers) {
@@ -547,7 +701,9 @@ async function runPoll(state: Record<string, any>, ctx: ProgramContext): Promise
 			ctx.print(dim(`  [discord] bridge poll error for ${channelId}: ${err?.message ?? String(err)}`));
 		}
 	}
-	return { peers: peers.length, processed, bridges };
+
+	const a2a = await pollA2AGuild(state, ctx);
+	return { peers: peers.length, processed, bridges, a2a };
 }
 
 // ── Core: Gateway (presence / "online" status) ─────────────────
@@ -1057,6 +1213,20 @@ const actorDef: ProgramActorDef = {
 		ensurePairChannel: async (ctx: ProgramContext, input: string | EnsurePairChannelInput) => {
 			const args = typeof input === "string" ? JSON.parse(input) : input;
 			return await doEnsurePairChannel(ctx.state, args);
+		},
+
+		/** Post a glon-msg envelope into the pair channel for two identity
+		 *  pubkeys. Creates the channel if absent. Used by /peer-chat to
+		 *  push outbound A2A traffic onto Discord. */
+		postA2A: async (ctx: ProgramContext, input: string | PostA2AInput) => {
+			const args = typeof input === "string" ? JSON.parse(input) : input;
+			return await doPostA2A(ctx.state, args);
+		},
+
+		/** Force an A2A poll cycle. Useful for tests that don't want to wait
+		 *  for the tick. */
+		pollA2A: async (ctx: ProgramContext) => {
+			return { processed: await pollA2AGuild(ctx.state, ctx) };
 		},
 	},
 };
