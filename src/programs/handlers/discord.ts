@@ -158,6 +158,131 @@ async function fetchPeersWithDiscord(ctx: ProgramContext): Promise<PeerSnapshot[
 	return all.filter((p) => !!p.discord_id);
 }
 
+// ── A2A channel management ───────────────────────────────────────
+// Inter-glon agent communication runs over admin-bot-managed channels
+// in a single Discord guild. The bot creates a dedicated category and
+// one channel per agent-pair, named deterministically from the two
+// identity pubkeys (sorted) so both sides converge on the same channel.
+//
+// Env:
+//   GLON_A2A_DISCORD_GUILD     — target guild id (required)
+//   GLON_A2A_CATEGORY_NAME     — category name (default "glon-a2a")
+
+const A2A_CATEGORY_NAME_DEFAULT = "glon-a2a";
+const DISCORD_CHANNEL_TYPE_CATEGORY = 4;
+const DISCORD_CHANNEL_TYPE_TEXT = 0;
+
+interface DiscordChannelSummary {
+	id: string;
+	name: string;
+	type: number;
+	parent_id?: string | null;
+}
+
+function a2aGuildId(): string {
+	const g = process.env.GLON_A2A_DISCORD_GUILD;
+	if (!g) throw new Error("GLON_A2A_DISCORD_GUILD not set — required for A2A channel ops");
+	return g;
+}
+
+function a2aCategoryName(): string {
+	return process.env.GLON_A2A_CATEGORY_NAME ?? A2A_CATEGORY_NAME_DEFAULT;
+}
+
+/** Deterministic channel name for an unordered pair of identity pubkeys.
+ *  Sorts the two values lexicographically so both sides produce the same
+ *  name; truncates each to 16 hex chars for readability. */
+export function pairChannelName(idA: string, idB: string): string {
+	const a = String(idA ?? "").toLowerCase();
+	const b = String(idB ?? "").toLowerCase();
+	if (!a || !b) throw new Error("pairChannelName: both identity pubkeys required");
+	const [lo, hi] = a < b ? [a, b] : [b, a];
+	return `pair-${lo.slice(0, 16)}-${hi.slice(0, 16)}`;
+}
+
+async function listGuildChannels(guildId: string): Promise<DiscordChannelSummary[]> {
+	const raw = await discord("GET", `/guilds/${guildId}/channels`);
+	if (!Array.isArray(raw)) return [];
+	return raw.map((c: any) => ({
+		id: String(c.id),
+		name: String(c.name ?? ""),
+		type: Number(c.type ?? 0),
+		parent_id: c.parent_id ?? null,
+	}));
+}
+
+interface EnsureCategoryResult {
+	category_id: string;
+	created: boolean;
+	name: string;
+}
+
+async function doEnsurePairCategory(state: Record<string, any>): Promise<EnsureCategoryResult> {
+	const guildId = a2aGuildId();
+	const wantName = a2aCategoryName();
+	state.a2aCategoryByGuild = state.a2aCategoryByGuild ?? {} as Record<string, string>;
+	const cached = state.a2aCategoryByGuild[guildId];
+	if (cached) return { category_id: cached, created: false, name: wantName };
+
+	const channels = await listGuildChannels(guildId);
+	const existing = channels.find((c) => c.type === DISCORD_CHANNEL_TYPE_CATEGORY && c.name.toLowerCase() === wantName.toLowerCase());
+	if (existing) {
+		state.a2aCategoryByGuild[guildId] = existing.id;
+		return { category_id: existing.id, created: false, name: existing.name };
+	}
+
+	const created = await discord("POST", `/guilds/${guildId}/channels`, {
+		name: wantName,
+		type: DISCORD_CHANNEL_TYPE_CATEGORY,
+	});
+	if (!created?.id) throw new Error("Discord did not return a channel id when creating category");
+	state.a2aCategoryByGuild[guildId] = created.id as string;
+	return { category_id: created.id as string, created: true, name: created.name as string };
+}
+
+interface EnsurePairChannelInput {
+	peer_a_identity_pubkey: string;
+	peer_b_identity_pubkey: string;
+}
+
+interface EnsurePairChannelResult {
+	channel_id: string;
+	name: string;
+	created: boolean;
+	category_id: string;
+}
+
+async function doEnsurePairChannel(state: Record<string, any>, input: EnsurePairChannelInput): Promise<EnsurePairChannelResult> {
+	if (!input?.peer_a_identity_pubkey || !input?.peer_b_identity_pubkey) {
+		throw new Error("discord.ensurePairChannel: peer_a_identity_pubkey and peer_b_identity_pubkey required");
+	}
+	const guildId = a2aGuildId();
+	const cat = await doEnsurePairCategory(state);
+	const name = pairChannelName(input.peer_a_identity_pubkey, input.peer_b_identity_pubkey);
+
+	state.a2aPairChannel = state.a2aPairChannel ?? {} as Record<string, string>;
+	const cacheKey = `${guildId}:${name}`;
+	const cached = state.a2aPairChannel[cacheKey];
+	if (cached) return { channel_id: cached, name, created: false, category_id: cat.category_id };
+
+	const channels = await listGuildChannels(guildId);
+	const existing = channels.find((c) => c.type === DISCORD_CHANNEL_TYPE_TEXT && c.parent_id === cat.category_id && c.name.toLowerCase() === name.toLowerCase());
+	if (existing) {
+		state.a2aPairChannel[cacheKey] = existing.id;
+		return { channel_id: existing.id, name: existing.name, created: false, category_id: cat.category_id };
+	}
+
+	const created = await discord("POST", `/guilds/${guildId}/channels`, {
+		name,
+		type: DISCORD_CHANNEL_TYPE_TEXT,
+		parent_id: cat.category_id,
+		topic: `glon agent-to-agent channel between ${input.peer_a_identity_pubkey.slice(0, 16)}… and ${input.peer_b_identity_pubkey.slice(0, 16)}…`,
+	});
+	if (!created?.id) throw new Error("Discord did not return a channel id when creating pair channel");
+	state.a2aPairChannel[cacheKey] = created.id as string;
+	return { channel_id: created.id as string, name: created.name as string, created: true, category_id: cat.category_id };
+}
+
 // ── Core: sending ────────────────────────────────────────────────
 
 async function doSend(peerId: string, text: string, state: Record<string, any>, ctx: ProgramContext): Promise<{ channel_id: string; message_ids: string[] }> {
@@ -919,6 +1044,19 @@ const actorDef: ProgramActorDef = {
 			} finally {
 				ctx.state.tickInProgress = false;
 			}
+		},
+
+		/** Idempotently ensure the A2A category exists in GLON_A2A_DISCORD_GUILD. */
+		ensurePairCategory: async (ctx: ProgramContext) => {
+			return await doEnsurePairCategory(ctx.state);
+		},
+
+		/** Idempotently ensure a pair channel exists for two identity pubkeys.
+		 *  Channel name is deterministic: pair-<short_lo>-<short_hi> so both
+		 *  sides converge. */
+		ensurePairChannel: async (ctx: ProgramContext, input: string | EnsurePairChannelInput) => {
+			const args = typeof input === "string" ? JSON.parse(input) : input;
+			return await doEnsurePairChannel(ctx.state, args);
 		},
 	},
 };
