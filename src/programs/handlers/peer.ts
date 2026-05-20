@@ -31,7 +31,6 @@ import { dim, bold, cyan, red, green, yellow, magenta } from "../shared.js";
 		kind: string;
 		trust_level: string;
 		identity_pubkey?: string;
-		hyperswarm_pubkey?: string;
 		endpoints?: string;
 		preferred_transport?: string;
 		key_verified_at?: string;
@@ -53,18 +52,11 @@ import { dim, bold, cyan, red, green, yellow, magenta } from "../shared.js";
  *   self    — this daemon's own identity
  *   family  — human-marked highest-trust peer
  *   friend  — human-marked second-highest
- *   trusted — peered via /directory handshake (the default after peer-accept)
- *   discovered — seen on the swarm but no handshake yet
+ *   trusted — explicitly peered
  *   stranger — default for /peer add with no trust set
  *
  * `isPeered()` is a UX filter — used by /peer-chat to scope incoming
  * messages to known contacts, and by UIs to highlight trusted peers.
- *
- * Note: trust here is NOT a security gate for auctions or coin transfers.
- * The auction-house autobase is permissionless; conservation rules
- * (signature verification + balance checks) are enforced in apply, not
- * at the trust layer. Anyone you've never peered with can still post
- * auctions you'll see in your /auction list.
  */
 export const PEER_TRUSTED_LEVELS: ReadonlySet<string> = new Set(["trusted", "friend", "family", "self"]);
 export function isPeered(trust_level: string | undefined | null): boolean {
@@ -73,14 +65,7 @@ export function isPeered(trust_level: string | undefined | null): boolean {
 
 // Recognised field keys for peer objects. Any other field is ignored by
 // the read path but preserved on disk.
-//   hyperswarm_pubkey — current Noise pubkey learned via /directory announce.
-//                       May rotate; rewritten on every upsertPeer.
-//   last_seen          — wall-clock ms of last announce/handshake. Used by
-//                       UIs to surface fresh peers.
-//   agents_json — JSON-encoded array of {id, name} from the peer's most
-//                 recent announce. Lets UIs render that peer's specific
-//                 agents and (later) address messages to them by id.
-	const PEER_FIELDS = ["display_name", "kind", "trust_level", "identity_pubkey", "hyperswarm_pubkey", "endpoints", "preferred_transport", "key_verified_at", "attestations", "discord_id", "email", "notes", "last_seen", "agents_json", "agent_id_remote", "host_peer_id"] as const;
+	const PEER_FIELDS = ["display_name", "kind", "trust_level", "identity_pubkey", "endpoints", "preferred_transport", "key_verified_at", "attestations", "discord_id", "email", "notes", "last_seen", "agents_json", "agent_id_remote", "host_peer_id"] as const;
 
 // ── Helpers ──────────────────────────────────────────────────────
 
@@ -98,7 +83,6 @@ function extractString(v: any): string | undefined {
 			kind: extractString(fields?.kind) ?? "human",
 			trust_level: extractString(fields?.trust_level) ?? "stranger",
 			identity_pubkey: extractString(fields?.identity_pubkey),
-			hyperswarm_pubkey: extractString(fields?.hyperswarm_pubkey),
 			endpoints: extractString(fields?.endpoints),
 			preferred_transport: extractString(fields?.preferred_transport),
 			key_verified_at: extractString(fields?.key_verified_at),

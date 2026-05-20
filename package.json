@@ -12,7 +12,6 @@
   },
   "dependencies": {
     "esbuild": "^0.28.0",
-    "hyperswarm": "^4.17.0",
     "protobufjs": "^7.5.3",
     "rivetkit": "^2.0.0"
   },

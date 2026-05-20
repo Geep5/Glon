@@ -21,7 +21,6 @@ import { canonicalEncodeChangeForSigning } from "../det/canonical.js";
 import { verify as ed25519Verify } from "../det/ed25519.js";
 
 import * as proto from "../proto.js";
-import * as swarmHost from "../swarm-host.js";
 
 import type { ObjectState } from "../dag/dag.js";
 
@@ -411,10 +410,6 @@ async function compileModuleProgram(ms: ModuleSet, name: string): Promise<Progra
 			"det/index.js": det,
 			"shared.js": sharedMod,
 			"runtime.js": { registerIndexHook, getIndexHook, registerAuthVerifier, getAuthVerifier, getValidator, isChainModeType, registerContentHandler, registerActorContentHandler, getContentHandler },
-			// swarm-host's hyperswarm instance is owned by the daemon; bundled
-			// programs reach it through this external instead of importing the
-			// hyperswarm npm package (which has native deps that can't bundle).
-			"swarm-host.js": swarmHost,
 		};
 		const factory = new Function(bundled);
 		// Node built-ins go through the real require, scoped to node: prefix only
@@ -608,9 +603,7 @@ const contentHandlers = new Map<string, ContentHandlerFn>();
  * ⚠️  GOTCHA — the handler is invoked from `/transport-router`'s tick with
  *     `/transport-router`'s `ctx`. Any `ctx.state` mutation lands on the
  *     router's state, and `persistIfChanged`-style writes go to the router's
- *     actor — NOT the program you think you're writing for. We hit this with
- *     /directory's peer-request handlers (commit 5215330) and lost incoming
- *     requests until envelopes were re-routed through /directory's actor.
+ *     actor — NOT the program you think you're writing for.
  *
  * If your handler MUTATES PERSISTED STATE, prefer `registerActorContentHandler`
  * below — it dispatches into your program's actor for you. Use the raw

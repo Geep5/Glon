@@ -82,14 +82,13 @@ existing agent's id.
 | `/agent` | LLM conversation loop: ask → tool calls → loop until done. Owns the agent's blocks, compaction, follow-ups. |
 | `/holdfast` | Agent lifecycle: bootstrap (create or reuse), wire tools, render the default system prompt. |
 | `/peer` | Identity + trust for every human and agent. Each agent on this daemon also has a `kind=agent` peer record so siblings can address them by name. |
-| `/peer-chat` | Goal-driven conversations between peers. Same-machine routes in-process, cross-machine over Hyperswarm. One-sided `done` closes the thread. Pauses for human review at 50 hops if neither side calls `done`. |
-| `/directory` | Hyperswarm-based peer discovery. Other glons on the same topic find each other via the DHT. |
+| `/peer-chat` | Goal-driven conversations between peers. Same-machine A2A only — cross-machine routing returns once the Discord transport is wired (step 2). One-sided `done` closes the thread. Pauses for human review at 50 hops if neither side calls `done`. |
 | `/memory` | Long-term agent memory (facts + milestones) survives compaction. |
 | `/remind` | Schedule reminders (one-shot or recurring). |
 | `/todo` | Phased task list per agent. The harness re-prompts on incomplete tasks. |
 | `/shell` | Bash exec on the host, with sessions. The universal escape hatch when no dedicated tool fits. |
 | `/discord` | Send DMs / channel messages on the principal's account. |
-| `/transport-{hyperswarm,http,gmail,discord,file,router}` | Pluggable message transports. |
+| `/transport-{http,gmail,discord,file,router}` | Pluggable message transports. |
 | `/wallet` | Local Ed25519 keypair management for signing Changes. |
 | `/auth` | OAuth/credential storage for LLM providers (Anthropic, Kimi). |
 | `/sync`, `/inspect`, `/help`, `/crud`, `/gc`, `/graph`, `/anytype`, `/browser`, `/chat`, `/user-chat`, `/comment`, `/ipc`, `/ttt`, `/web` | Smaller utilities and demo programs. |
@@ -148,7 +147,6 @@ on the wire). Astrolabe is just an HTTP client of this endpoint.
 - `~/.glon/changes/<object-id>/<sha>.pb` — the canonical DAG, one protobuf
   per Change. Every mutation lands here first.
 - `~/.glon/wallet.json` — local Ed25519 keys for signing Changes.
-- `~/.glon/hyperswarm.key` — this node's network identity for Hyperswarm.
 - `~/Library/Application Support/rivetkit/glonFiggies-<hash>/` — actor
   state + SQLite index. Derived from the .pb files; safe to delete.
 
@@ -166,7 +164,6 @@ list):
 | `ANTHROPIC_API_KEY` | Anthropic LLM auth | required if using Claude models |
 | `GLON_DAEMON_PORT` | daemon dispatch port | `6430` |
 | `GLON_HOST_PORT` | rivetkit host port | `6420` |
-| `GLON_SWARM` | set to `0` to disable hyperswarm peer announces | on |
 | `ANTHROPIC_DEFAULT_MODEL` | model id when an agent uses Anthropic | `claude-sonnet-4-20250514` |
 | `KIMI_DEFAULT_MODEL` | model id when an agent uses Kimi | `kimi-k2-0905-preview` |
 

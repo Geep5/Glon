@@ -691,8 +691,7 @@ async function doSetup(opts: SetupOpts, ctx: ProgramContext): Promise<SetupResul
 
 	// Self peer (the principal): reuse any peer with kind=self, else create.
 	// Wire the wallet's default Ed25519 pubkey as the principal's chain
-	// identity so /directory announces carry a stable identity_pubkey and
-	// remote glons can dedupe across reconnects.
+	// identity so peer records have a stable identity_pubkey for dedup.
 	let walletPubkey: string | undefined;
 	try {
 		const wInfo = await ctx.dispatchProgram("/wallet", "show", ["default"]) as { pubkey?: string } | null;

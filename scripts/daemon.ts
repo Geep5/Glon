@@ -88,38 +88,6 @@ async function resolveId(raw: string): Promise<string | null> {
 		const DEV = process.argv.includes("--dev");
 		console.log(`[daemon] connecting to ${ENDPOINT}${DEV ? " (dev mode)" : ""}`);
 
-		// ── Hyperswarm bring-up (Phase 1 — transport-hyperswarm) ──
-		// Bring the swarm online before any program actor starts so the
-		// /directory program can call joinTopic() in its onCreate. Always on
-		// by default — set GLON_SWARM=0 to opt out (useful for tests that
-		// don't want to touch the DHT).
-		if (process.env.GLON_SWARM !== "0") {
-			try {
-				const { default: Hyperswarm } = await import("hyperswarm");
-				const { initSwarm, loadOrCreateKeyPair } = await import("../src/swarm-host.js");
-				const { decodeTransportEnvelope } = await import("../src/proto.js");
-				const keyPair = loadOrCreateKeyPair(() => {
-					const tmp = new Hyperswarm();
-					const kp = tmp.keyPair;
-					// Destroy the throwaway so it doesn't hold a DHT socket.
-					tmp.destroy().catch(() => {});
-					return kp;
-				});
-				const swarm = new Hyperswarm({ keyPair });
-				initSwarm({
-					swarm: swarm as any,
-					decodeEnvelope: (bytes) => {
-						const env = decodeTransportEnvelope(bytes);
-						return { contentType: env.contentType, metadata: env.metadata ?? {} };
-					},
-				});
-				console.log(`[daemon] swarm online — hyperswarm pubkey: ${keyPair.publicKey.toString("hex").slice(0, 16)}...`);
-			} catch (err: any) {
-				console.log(`[daemon] swarm bring-up failed: ${err?.message ?? err} (continuing without swarm)`);
-			}
-		}
-
-
 		let programs: ProgramEntry[] = await loadPrograms(store, client);
 		console.log(`[daemon] loaded ${programs.length} programs`);
 
@@ -139,9 +107,8 @@ async function resolveId(raw: string): Promise<string | null> {
 
 		// ── Wallet bootstrap ──────────────────────────────────────
 		// Every glon needs a chain identity (Ed25519 keypair). Auto-create
-		// a "default" key on first run so /directory announces carry a
-		// non-empty identity_pubkey out of the gate — without it, peer
-		// records can't be deduped by chain identity across machines.
+		// a "default" key on first run so the principal's /peer record
+		// carries a stable identity_pubkey for cross-glon dedup.
 		try {
 			const walletCtx = buildContext({ state: {}, programId: "daemon-bootstrap" });
 			const existing = await walletCtx.dispatchProgram("/wallet", "show", ["default"]) as { pubkey?: string } | null;

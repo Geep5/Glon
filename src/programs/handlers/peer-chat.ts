@@ -1,22 +1,15 @@
-// peer-chat — agent-to-agent text messaging over Hyperswarm.
+// peer-chat — agent-to-agent text messaging.
 //
-// One conversation per peered identity. Outbound messages dispatch through
-// /transport-hyperswarm; inbound envelopes route through this program's
-// actor via registerActorContentHandler so state mutations land in our
-// own actor (not /transport-router's, lesson from commit 5215330).
+// Same-daemon (local) A2A: one conversation per peered identity. The
+// recipient agent's loop fires automatically on each inbound message via
+// maybeAutoTrigger. Cross-machine peer-chat is currently unsupported —
+// step 1 of the Discord-native switch removed the Hyperswarm transport;
+// step 2 will wire a Discord channel transport back in.
 //
-// Trust gate (both directions) is /peer isPeered() — i.e. trust_level ∈
-// {trusted, friend, family, self}. Strangers and discovered-but-not-peered
-// senders are dropped silently with a one-line warning so spam on the DHT
-// can't pollute the chat log.
-//
-// Envelope payload shape is Phase-2 ready — `kind` is a string with v1
-// emitting only "text". When agent-RPC kinds ship later (`agent-request`,
-// `agent-response`), no protocol migration needed: receivers that don't
-// recognise a kind just store the message verbatim and surface it raw.
+// Trust gate (local routing) is /peer isPeered() — i.e. trust_level ∈
+// {trusted, friend, family, self}.
 
 import type { ProgramDef, ProgramContext, ProgramActorDef } from "../runtime.js";
-import { registerActorContentHandler } from "../runtime.js";
 import { dim, bold, cyan, green, red, yellow } from "../shared.js";
 import { randomUUID } from "node:crypto";
 
@@ -60,14 +53,13 @@ export type ConversationStatus = "active" | "done" | "paused";
 export interface Conversation {
 	id: string;                            // conversation_id
 	peer_identity_pubkey: string;
-	peer_hyperswarm_pubkey: string;
 	peer_display_name: string;
 	peer_object_id?: string;
 	goal: string;                          // human-readable purpose
 	status: ConversationStatus;
 	started_at: number;
-	started_by_agent_id?: string;          // local sender id, or undefined for cross-machine
-	owner_agent_id?: string;               // which local agent's perspective this conv is (local-route only)
+	started_by_agent_id?: string;
+	owner_agent_id?: string;               // which local agent's perspective this conv is
 	mirror_conversation_id?: string;       // links the other side's mirror for local convos
 	hop_cap: number;                       // pause when messages.length >= hop_cap; user resume bumps by PAUSE_FOR_REVIEW_AT_HOPS
 	ended_at?: number;
@@ -85,41 +77,7 @@ interface PersistedChatState {
 	conversations: Record<string, Conversation>;   // keyed by conversation_id
 }
 
-/**
- * On-wire payload shape inside a glon/peer-chat envelope. Forward-compat
- * rules (mirroring PeerAnnounceBody):
- *   - `kind` is the version axis. Receivers MUST accept unknown kinds and
- *     either store-verbatim (text-style fallback) or ignore. Never crash.
- *   - Unknown fields MUST be tolerated; future Phase-2 kinds may add e.g.
- *     `tool_name`, `tool_args` for agent-request, without bumping any
- *     external version number.
- */
-interface PeerChatPayload {
-	msg_id: string;
-	kind: string;                 // "text" today; future: "agent-request", "agent-response"
-	in_reply_to: string | null;
-	body: unknown;
-	sent_at: number;
-	from_identity_pubkey: string; // claim; cross-checked against /peer's hyperswarm pubkey
-	// Additive cross-machine A2A routing fields. Both optional:
-	//   from_agent_id — sender-side agent id (on the sender's glon). Lets
-	//                   the receiver address replies back to a specific
-	//                   remote agent and render messages as agent-tagged.
-	//   to_agent_id   — receiver-side agent id (on this glon). Receiver
-	//                   uses it to set conv.owner_agent_id so the right
-	//                   local agent's loop fires. If absent, the message
-	//                   is human-routed (notification to the principal).
-	from_agent_id?: string;
-	to_agent_id?: string;
-}
-
-interface BlobMeta {
-	fromEndpoint?: string;
-	receivedAt?: number;
-	transportMetadata?: Record<string, string>;
-}
-
-// ── Persistence (same pattern as /directory) ────────────────────
+// ── Persistence ─────────────────────────────────────────────────
 
 function snapshotState(state: Record<string, any>): string {
 	return JSON.stringify({ version: STATE_VERSION, conversations: state.conversations ?? {} });
@@ -165,21 +123,14 @@ async function persistIfChanged(state: Record<string, any>, ctx: ProgramContext)
 
 // ── Helpers ──────────────────────────────────────────────────────
 
-async function resolveSelfIdentity(ctx: ProgramContext): Promise<string> {
-	try {
-		const info = await ctx.dispatchProgram("/wallet", "show", ["default"]) as { pubkey?: string } | null;
-		return info?.pubkey ?? "";
-	} catch { return ""; }
-}
-
 	/** Find a peered /peer record by identity_pubkey, peer_id, or display_name. Refuses non-peered.
 	 *  Returns `agent_id_remote` for remote-agent peers (the agent's id on
-	 *  the host glon) — used to set to_agent_id on cross-machine envelopes
-	 *  so the receiver routes the message to the right agent. */
+	 *  the host glon). Cross-machine routing is currently unsupported —
+	 *  only local:<agentId> targets work until the Discord transport lands. */
 	async function resolvePeerForChat(
 		ctx: ProgramContext,
 		ref: { peer_id?: string; identity_pubkey?: string; display_name?: string },
-	): Promise<{ peer_id: string; identity_pubkey: string; hyperswarm_pubkey: string; display_name: string; agent_id_remote?: string }> {
+	): Promise<{ peer_id: string; identity_pubkey: string; display_name: string; agent_id_remote?: string }> {
 		const all = await ctx.dispatchProgram("/peer", "list", [{}]) as Array<any>;
 		const peers = Array.isArray(all) ? all : [];
 
@@ -194,8 +145,6 @@ async function resolveSelfIdentity(ctx: ProgramContext): Promise<string> {
 			return false;
 		});
 
-		// Rank: peered first, then agent over human (more specific target),
-		// then by recency.
 		const rank = (p: any) => {
 			let s = 0;
 			if (isPeered(p.trust_level)) s += 100;
@@ -204,31 +153,19 @@ async function resolveSelfIdentity(ctx: ProgramContext): Promise<string> {
 		};
 		const match = candidates.slice().sort((a, b) => rank(b) - rank(a))[0];
 
-		if (!match) throw new Error(`peer-chat: no peer matches ${JSON.stringify(ref)}. Have you peered with them? Try /directory list.`);
-		// Remote-agent records inherit trust from their host (the only
-		// trust handshake is host-to-host; agents are addressable iff the
-		// host that owns them is peered). If the matched record is a
-		// remote-agent peer and not directly trusted, look up the host
-		// via host_peer_id and use its trust.
+		if (!match) throw new Error(`peer-chat: no peer matches ${JSON.stringify(ref)}. Have you peered with them?`);
 		let effectiveTrust = match.trust_level;
 		if (!isPeered(effectiveTrust) && match.kind === "agent" && match.host_peer_id) {
 			const host = peers.find((p) => p.id === match.host_peer_id);
 			if (host && isPeered(host.trust_level)) effectiveTrust = host.trust_level;
 		}
 		if (!isPeered(effectiveTrust)) {
-			throw new Error(`peer-chat: peer "${match.display_name}" is at trust=${match.trust_level}; need a peered trust level. Run /directory peer ${(match.identity_pubkey ?? "").slice(0, 16)} first.`);
+			throw new Error(`peer-chat: peer "${match.display_name}" is at trust=${match.trust_level}; need a peered trust level.`);
 		}
 		if (!match.identity_pubkey) throw new Error(`peer-chat: peer "${match.display_name}" has no identity_pubkey on record (can't address)`);
-		// Local sibling agents have identity_pubkey="local:<agentId>" and no
-		// hyperswarm_pubkey — that's expected and fine.
-		const isLocal = String(match.identity_pubkey).startsWith("local:");
-		if (!isLocal && !match.hyperswarm_pubkey) {
-			throw new Error(`peer-chat: peer "${match.display_name}" has no hyperswarm_pubkey yet — wait for their next announce.`);
-		}
 		return {
 			peer_id: match.id,
 			identity_pubkey: match.identity_pubkey,
-			hyperswarm_pubkey: match.hyperswarm_pubkey ?? "",
 			display_name: match.display_name ?? match.id,
 			agent_id_remote: match.agent_id_remote,
 		};
@@ -341,93 +278,22 @@ async function doStartConversation(ctx: ProgramContext, input: StartConversation
 	const conversation_id = newConversationId();
 	const msg_id = randomUUID().replace(/-/g, "").slice(0, 16);
 
-	if (isLocalTarget) {
-		if (!input.from_agent_id) {
-			throw new Error(`peer-chat startConversation: local-target peer requires from_agent_id`);
-		}
-		const senderPeer = await findLocalPeerForAgent(ctx, input.from_agent_id);
-		if (!senderPeer) {
-			throw new Error(`peer-chat startConversation: no /peer record for sender agent ${input.from_agent_id}`);
-		}
-		const recipientAgentId = String(peer.identity_pubkey).slice("local:".length);
-		const mirror_id = newConversationId();
-
-		// Sender's conversation: peer = recipient
-		const ownerConv: Conversation = {
-			id: conversation_id,
-			peer_identity_pubkey: peer.identity_pubkey,
-			peer_hyperswarm_pubkey: peer.hyperswarm_pubkey,
-			peer_display_name: peer.display_name,
-			peer_object_id: peer.peer_id,
-			goal: input.goal.trim(),
-			status: "active",
-			started_at: now,
-			started_by_agent_id: input.from_agent_id,
-			owner_agent_id: input.from_agent_id,
-			mirror_conversation_id: mirror_id,
-			hop_cap: PAUSE_FOR_REVIEW_AT_HOPS,
-			messages: [],
-			last_message_at: 0,
-			unread_count: 0,
-		};
-		state.conversations[conversation_id] = ownerConv;
-		appendMessageToConversation(state, ownerConv, {
-			msg_id, conversation_id, direction: "out", kind: "text", in_reply_to: null, body: input.text, sent_at: now,
-		});
-
-		// Recipient's mirror conversation: peer = sender
-		const mirrorConv: Conversation = {
-			id: mirror_id,
-			peer_identity_pubkey: senderPeer.identity_pubkey,
-			peer_hyperswarm_pubkey: "",
-			peer_display_name: senderPeer.display_name,
-			peer_object_id: senderPeer.peer_id,
-			goal: input.goal.trim(),
-			status: "active",
-			started_at: now,
-			started_by_agent_id: input.from_agent_id,
-			owner_agent_id: recipientAgentId,
-			mirror_conversation_id: conversation_id,
-			hop_cap: PAUSE_FOR_REVIEW_AT_HOPS,
-			messages: [],
-			last_message_at: 0,
-			unread_count: 0,
-		};
-		state.conversations[mirror_id] = mirrorConv;
-		appendMessageToConversation(state, mirrorConv, {
-			msg_id, conversation_id: mirror_id, direction: "in", kind: "text", in_reply_to: null, body: input.text, sent_at: now,
-		});
-
-		await persistIfChanged(state, ctx);
-		// Fire-and-forget: nudge the recipient agent so it sees the new conversation.
-		void maybeAutoTrigger(ctx, mirror_id);
-		return { conversation_id, mirror_conversation_id: mirror_id, msg_id };
+	if (!isLocalTarget) {
+		throw new Error(`peer-chat startConversation: cross-machine peer-chat is not available — the Hyperswarm transport was removed. Wire the Discord transport (step 2) before talking to "${peer.display_name}".`);
 	}
+	if (!input.from_agent_id) {
+		throw new Error(`peer-chat startConversation: local-target peer requires from_agent_id`);
+	}
+	const senderPeer = await findLocalPeerForAgent(ctx, input.from_agent_id);
+	if (!senderPeer) {
+		throw new Error(`peer-chat startConversation: no /peer record for sender agent ${input.from_agent_id}`);
+	}
+	const recipientAgentId = String(peer.identity_pubkey).slice("local:".length);
+	const mirror_id = newConversationId();
 
-	// ── Cross-machine: opening message rides over Hyperswarm ──────
-	const self_identity = await resolveSelfIdentity(ctx);
-	const payload: PeerChatPayload = {
-		msg_id,
-		kind: "text",
-		in_reply_to: null,
-		body: input.text,
-		sent_at: now,
-		from_identity_pubkey: self_identity,
-		from_agent_id: input.from_agent_id,        // undefined when sent by the human principal
-		to_agent_id: peer.agent_id_remote,         // set only when targeting a remote agent
-	};
-	const payload_b64 = Buffer.from(JSON.stringify(payload)).toString("base64");
-	await ctx.dispatchProgram("/transport-hyperswarm", "send", [{
-		endpoint: `swarm://${peer.hyperswarm_pubkey}`,
-		payload_b64,
-		content_type: PEER_CHAT_CONTENT_TYPE,
-		metadata: { msg_id, conversation_id, goal: input.goal.trim() },
-	}]);
-
-	const conv: Conversation = {
+	const ownerConv: Conversation = {
 		id: conversation_id,
 		peer_identity_pubkey: peer.identity_pubkey,
-		peer_hyperswarm_pubkey: peer.hyperswarm_pubkey,
 		peer_display_name: peer.display_name,
 		peer_object_id: peer.peer_id,
 		goal: input.goal.trim(),
@@ -435,17 +301,41 @@ async function doStartConversation(ctx: ProgramContext, input: StartConversation
 		started_at: now,
 		started_by_agent_id: input.from_agent_id,
 		owner_agent_id: input.from_agent_id,
+		mirror_conversation_id: mirror_id,
 		hop_cap: PAUSE_FOR_REVIEW_AT_HOPS,
 		messages: [],
 		last_message_at: 0,
 		unread_count: 0,
 	};
-	state.conversations[conversation_id] = conv;
-	appendMessageToConversation(state, conv, {
+	state.conversations[conversation_id] = ownerConv;
+	appendMessageToConversation(state, ownerConv, {
 		msg_id, conversation_id, direction: "out", kind: "text", in_reply_to: null, body: input.text, sent_at: now,
 	});
+
+	const mirrorConv: Conversation = {
+		id: mirror_id,
+		peer_identity_pubkey: senderPeer.identity_pubkey,
+		peer_display_name: senderPeer.display_name,
+		peer_object_id: senderPeer.peer_id,
+		goal: input.goal.trim(),
+		status: "active",
+		started_at: now,
+		started_by_agent_id: input.from_agent_id,
+		owner_agent_id: recipientAgentId,
+		mirror_conversation_id: conversation_id,
+		hop_cap: PAUSE_FOR_REVIEW_AT_HOPS,
+		messages: [],
+		last_message_at: 0,
+		unread_count: 0,
+	};
+	state.conversations[mirror_id] = mirrorConv;
+	appendMessageToConversation(state, mirrorConv, {
+		msg_id, conversation_id: mirror_id, direction: "in", kind: "text", in_reply_to: null, body: input.text, sent_at: now,
+	});
+
 	await persistIfChanged(state, ctx);
-	return { conversation_id, msg_id };
+	void maybeAutoTrigger(ctx, mirror_id);
+	return { conversation_id, mirror_conversation_id: mirror_id, msg_id };
 }
 
 // ── send: continue an existing active conversation ────────────────
@@ -475,82 +365,43 @@ async function doSend(ctx: ProgramContext, input: SendInput): Promise<{ msg_id: 
 	}
 
 	const isLocalTarget = String(conv.peer_identity_pubkey).startsWith("local:");
+	if (!isLocalTarget) {
+		throw new Error(`peer-chat send: conversation ${input.conversation_id} is cross-machine. Cross-machine peer-chat is not available — the Hyperswarm transport was removed. Wire the Discord transport (step 2) before continuing.`);
+	}
 	const msg_id = randomUUID().replace(/-/g, "").slice(0, 16);
 	const sent_at = Date.now();
 
-	if (isLocalTarget) {
-		if (!input.from_agent_id) throw new Error(`peer-chat send: local conversation requires from_agent_id`);
-		// We're writing from the sender's perspective; conv.owner_agent_id IS the sender for this side.
-		if (conv.owner_agent_id && conv.owner_agent_id !== input.from_agent_id) {
-			throw new Error(`peer-chat send: conversation ${input.conversation_id} is owned by ${conv.owner_agent_id}, not ${input.from_agent_id}`);
-		}
-		// 1. Outgoing in sender's view
-		const senderResult = appendMessageToConversation(state, conv, {
-			msg_id, conversation_id: conv.id, direction: "out", kind: "text",
-			in_reply_to: input.in_reply_to ?? null, body: input.text, sent_at,
-		});
-
-		// 2. Incoming in recipient's mirror
-		const mirrorId = conv.mirror_conversation_id;
-		const mirror = mirrorId ? getConversation(state, mirrorId) : null;
-		let mirrorResult: { pausedNow: boolean } = { pausedNow: false };
-		if (mirror) {
-			mirrorResult = appendMessageToConversation(state, mirror, {
-				msg_id, conversation_id: mirror.id, direction: "in", kind: "text",
-				in_reply_to: input.in_reply_to ?? null, body: input.text, sent_at,
-			});
-			// Propagate status flips across the mirror so both sides agree.
-			if (conv.status !== "active" && mirror.status === "active") {
-				mirror.status = conv.status;
-				if (conv.status === "paused") mirror.paused_at = sent_at;
-			}
-			if (mirror.status !== "active" && conv.status === "active") {
-				conv.status = mirror.status;
-				if (mirror.status === "paused") conv.paused_at = sent_at;
-			}
-		}
-
-		await persistIfChanged(state, ctx);
-		// Nudge the recipient agent only if still active. Paused/done blocks auto-trigger.
-		if (mirror && mirror.status === "active") void maybeAutoTrigger(ctx, mirror.id);
-		// Surface a pause to the human user.
-		if (senderResult.pausedNow) await notifyPauseForReview(ctx, conv);
-		else if (mirrorResult.pausedNow && mirror) await notifyPauseForReview(ctx, mirror);
-		return { msg_id };
+	if (!input.from_agent_id) throw new Error(`peer-chat send: local conversation requires from_agent_id`);
+	if (conv.owner_agent_id && conv.owner_agent_id !== input.from_agent_id) {
+		throw new Error(`peer-chat send: conversation ${input.conversation_id} is owned by ${conv.owner_agent_id}, not ${input.from_agent_id}`);
 	}
-
-	// Cross-machine
-	const self_identity = await resolveSelfIdentity(ctx);
-	// Look up the peer's agent_id_remote so replies route back to the same
-	// remote agent — without this, a reply to a remote-agent conversation
-	// would land as a generic human notification on the receiving glon.
-	let to_agent_id: string | undefined;
-	try {
-		const peerRow = await ctx.dispatchProgram("/peer", "get", [conv.peer_object_id]) as { agent_id_remote?: string } | null;
-		to_agent_id = peerRow?.agent_id_remote;
-	} catch { /* peer record removed — proceed without targeted routing */ }
-	const payload: PeerChatPayload = {
-		msg_id,
-		kind: "text",
-		in_reply_to: input.in_reply_to ?? null,
-		body: input.text,
-		sent_at,
-		from_identity_pubkey: self_identity,
-		from_agent_id: input.from_agent_id,
-		to_agent_id,
-	};
-	const payload_b64 = Buffer.from(JSON.stringify(payload)).toString("base64");
-	await ctx.dispatchProgram("/transport-hyperswarm", "send", [{
-		endpoint: `swarm://${conv.peer_hyperswarm_pubkey}`,
-		payload_b64,
-		content_type: PEER_CHAT_CONTENT_TYPE,
-		metadata: { msg_id, conversation_id: conv.id },
-	}]);
-	appendMessageToConversation(state, conv, {
+	const senderResult = appendMessageToConversation(state, conv, {
 		msg_id, conversation_id: conv.id, direction: "out", kind: "text",
 		in_reply_to: input.in_reply_to ?? null, body: input.text, sent_at,
 	});
+
+	const mirrorId = conv.mirror_conversation_id;
+	const mirror = mirrorId ? getConversation(state, mirrorId) : null;
+	let mirrorResult: { pausedNow: boolean } = { pausedNow: false };
+	if (mirror) {
+		mirrorResult = appendMessageToConversation(state, mirror, {
+			msg_id, conversation_id: mirror.id, direction: "in", kind: "text",
+			in_reply_to: input.in_reply_to ?? null, body: input.text, sent_at,
+		});
+		if (conv.status !== "active" && mirror.status === "active") {
+			mirror.status = conv.status;
+			if (conv.status === "paused") mirror.paused_at = sent_at;
+		}
+		if (mirror.status !== "active" && conv.status === "active") {
+			conv.status = mirror.status;
+			if (mirror.status === "paused") conv.paused_at = sent_at;
+		}
+	}
+
 	await persistIfChanged(state, ctx);
+	if (mirror && mirror.status === "active") void maybeAutoTrigger(ctx, mirror.id);
+	if (senderResult.pausedNow) await notifyPauseForReview(ctx, conv);
+	else if (mirrorResult.pausedNow && mirror) await notifyPauseForReview(ctx, mirror);
 	return { msg_id };
 }
 
@@ -587,44 +438,6 @@ async function doEndConversation(ctx: ProgramContext, input: EndConversationInpu
 			mirror.ended_reason = reason;
 			mirror.ended_by_agent_id = conv.ended_by_agent_id;
 			state.conversations[mirror.id] = mirror;
-		}
-	}
-
-	// Cross-machine: tell the remote side this conversation is done. Without
-	// this, their conv stays "active" while ours is "done" — they'll send
-	// more messages and we'll silently drop them because we can't append
-	// to a closed thread, AND if they're the agent owner their auto-trigger
-	// won't fire because status check requires active. Best-effort send;
-	// don't fail the local close on network hiccup.
-	const isLocalTarget = String(conv.peer_identity_pubkey || "").startsWith("local:");
-	if (!isLocalTarget && conv.peer_hyperswarm_pubkey) {
-		try {
-			const self_identity = await resolveSelfIdentity(ctx);
-			let to_agent_id: string | undefined;
-			try {
-				const peerRow = await ctx.dispatchProgram("/peer", "get", [conv.peer_object_id]) as { agent_id_remote?: string } | null;
-				to_agent_id = peerRow?.agent_id_remote;
-			} catch { /* peer gone — proceed without targeted routing */ }
-			const msg_id = randomUUID().replace(/-/g, "").slice(0, 16);
-			const payload: PeerChatPayload = {
-				msg_id,
-				kind: "done",
-				in_reply_to: null,
-				body: reason,
-				sent_at: now,
-				from_identity_pubkey: self_identity,
-				from_agent_id: input.from_agent_id,
-				to_agent_id,
-			};
-			const payload_b64 = Buffer.from(JSON.stringify(payload)).toString("base64");
-			await ctx.dispatchProgram("/transport-hyperswarm", "send", [{
-				endpoint: `swarm://${conv.peer_hyperswarm_pubkey}`,
-				payload_b64,
-				content_type: PEER_CHAT_CONTENT_TYPE,
-				metadata: { msg_id, conversation_id: conv.id, kind: "done" },
-			}]);
-		} catch (err: any) {
-			ctx.print?.(dim(`[peer-chat] cross-machine done send failed: ${err?.message ?? err}`));
 		}
 	}
 
@@ -705,189 +518,6 @@ async function maybeAutoTrigger(ctx: ProgramContext, conversation_id: string): P
 	}
 }
 
-// ── Inbound: handleIncoming (dispatched via registerActorContentHandler) ──
-
-interface HandleIncomingInput {
-	envelope_b64: string;
-	content_type?: string;
-	from?: string;
-}
-
-async function doHandleIncoming(ctx: ProgramContext, input: HandleIncomingInput): Promise<boolean> {
-	let payload: PeerChatPayload;
-	try {
-		const raw = Buffer.from(input.envelope_b64, "base64").toString("utf8");
-		payload = JSON.parse(raw);
-	} catch {
-		ctx.print?.(dim(`[peer-chat] dropped: payload not valid JSON`));
-		return false;
-	}
-	if (!payload || typeof payload.msg_id !== "string" || typeof payload.sent_at !== "number") {
-		ctx.print?.(dim(`[peer-chat] dropped: payload missing msg_id or sent_at`));
-		return false;
-	}
-	// Body validation: today we only render "text". Other kinds are STORED
-	// (forward-compat — they may be Phase-2 agent-RPC) but not parsed here.
-	if (payload.kind === "text" && typeof payload.body !== "string") {
-		ctx.print?.(dim(`[peer-chat] dropped: kind=text but body is not a string`));
-		return false;
-	}
-	if (payload.kind === "text" && (payload.body as string).length > MAX_BODY_LEN) {
-		ctx.print?.(dim(`[peer-chat] dropped: text body too long`));
-		return false;
-	}
-
-	// Authenticate sender by hyperswarm channel pubkey. There may be
-	// multiple /peer records sharing that hpk (the host + every remote
-	// agent on that glon); the HOST (kind=human) is the authoritative
-	// trust gate — agent records inherit. We pick a representative
-	// senderPeer to attach to the conversation, preferring the specific
-	// agent when from_agent_id is set.
-	const fromHex = (input.from ?? "").replace(/^swarm:\/\//, "").toLowerCase();
-	if (!fromHex) {
-		ctx.print?.(dim(`[peer-chat] dropped: no from_endpoint on blob`));
-		return false;
-	}
-	const all = await ctx.dispatchProgram("/peer", "list", [{}]) as Array<any>;
-	const peersByHpk = (Array.isArray(all) ? all : []).filter((p) => (p.hyperswarm_pubkey ?? "").toLowerCase() === fromHex);
-	if (peersByHpk.length === 0) {
-		ctx.print?.(dim(`[peer-chat] dropped: sender hyperswarm=${fromHex.slice(0, 12)} not in /peer (not peered)`));
-		return false;
-	}
-	// Trust gate: at least one record for this glon must be peered. Host
-	// is the canonical record (kind=human); if it's peered the whole glon
-	// is. Falls back to "any record peered" so legacy installs without a
-	// separate host record (pre-roster) still work.
-	const hostPeer = peersByHpk.find((p) => p.kind === "human") ?? peersByHpk[0];
-	if (!isPeered(hostPeer.trust_level)) {
-		ctx.print?.(dim(`[peer-chat] dropped: sender host ${hostPeer.display_name} at trust=${hostPeer.trust_level}; need peered`));
-		return false;
-	}
-	if (payload.from_identity_pubkey && hostPeer.identity_pubkey && payload.from_identity_pubkey.toLowerCase() !== (hostPeer.identity_pubkey as string).toLowerCase()) {
-		ctx.print?.(dim(`[peer-chat] dropped: claimed identity=${payload.from_identity_pubkey.slice(0, 12)} doesn't match host /peer record ${(hostPeer.identity_pubkey as string).slice(0, 12)} for that hyperswarm key`));
-		return false;
-	}
-	// Pick the senderPeer that should own this side of the conversation:
-	// if the envelope names a specific agent on the sender glon, find that
-	// remote-agent /peer record. Otherwise the host is the sender.
-	let senderPeer = hostPeer;
-	if (payload.from_agent_id) {
-		const agentPeer = peersByHpk.find((p) => p.kind === "agent" && p.agent_id_remote === payload.from_agent_id);
-		if (agentPeer) senderPeer = agentPeer;
-	}
-
-	// Resolve which local agent (if any) should own this conversation.
-	// If the envelope carries to_agent_id, route to that agent's loop so
-	// agent-to-agent A2A actually fires the recipient's tool loop. If
-	// to_agent_id is absent, the message is human-routed (the principal
-	// gets a notification, no agent processes it automatically).
-	const owner_agent_id = payload.to_agent_id;
-
-	// Cross-machine "done" envelope: the remote side closed this thread.
-	// Close our matching conv so the user / our agent stops trying to
-	// reply into a dead conversation. Look up the conv by the explicit
-	// conversation_id in metadata first; fall back to the latest active
-	// one for this sender.
-	const state = ctx.state;
-	if (payload.kind === "done") {
-		const meta_conv_id = (input as any)?.metadata?.conversation_id ?? null;
-		let target: Conversation | null = meta_conv_id ? getConversation(state, meta_conv_id) : null;
-		if (!target) {
-			const candidates = Object.values((state.conversations ?? {}) as Record<string, Conversation>)
-				.filter((c) => c.peer_identity_pubkey.toLowerCase() === (senderPeer.identity_pubkey as string).toLowerCase())
-				.filter((c) => c.status === "active")
-				.sort((a, b) => b.started_at - a.started_at);
-			target = candidates[0] ?? null;
-		}
-		if (target && target.status !== "done") {
-			target.status = "done";
-			target.ended_at = payload.sent_at;
-			target.ended_reason = String(payload.body ?? "remote closed");
-			state.conversations[target.id] = target;
-			await persistIfChanged(state, ctx);
-		}
-		return true;
-	}
-
-	// Persist.
-	// Match an existing active conversation with this peer, else start one
-	// (cross-machine peers that don't speak the new protocol won't send
-	// conversation_id metadata yet; we accept this gracefully).
-	const conversation_id_from_meta = (input as any)?.metadata?.conversation_id ?? null;
-	let conv: Conversation | null = null;
-	if (conversation_id_from_meta) {
-		conv = getConversation(state, conversation_id_from_meta);
-	}
-	if (!conv) {
-		// Best-effort find: same peer (by senderPeer.identity_pubkey),
-		// latest active conversation.
-		const candidates = Object.values((state.conversations ?? {}) as Record<string, Conversation>)
-			.filter((c) => c.peer_identity_pubkey.toLowerCase() === (senderPeer.identity_pubkey as string).toLowerCase())
-			.filter((c) => c.status === "active")
-			.sort((a, b) => b.started_at - a.started_at);
-		conv = candidates[0] ?? null;
-	}
-	if (!conv) {
-		// Implicit conversation with no goal — legacy peer or auto-recovered.
-		const conversation_id = newConversationId();
-		conv = {
-			id: conversation_id,
-			peer_identity_pubkey: senderPeer.identity_pubkey,
-			peer_hyperswarm_pubkey: senderPeer.hyperswarm_pubkey ?? fromHex,
-			peer_display_name: senderPeer.display_name ?? "(unnamed)",
-			peer_object_id: senderPeer.id,
-			goal: "(implicit — inbound without conversation_id)",
-			status: "active",
-			started_at: payload.sent_at,
-			owner_agent_id,                   // routes maybeAutoTrigger to the right agent
-			hop_cap: PAUSE_FOR_REVIEW_AT_HOPS,
-			messages: [],
-			last_message_at: 0,
-			unread_count: 0,
-		};
-		state.conversations = state.conversations ?? {};
-		state.conversations[conversation_id] = conv;
-	} else if (owner_agent_id && !conv.owner_agent_id) {
-		// Back-patch ownership onto an implicit conversation that the
-		// sender has now learned to address explicitly.
-		conv.owner_agent_id = owner_agent_id;
-	}
-	appendMessageToConversation(state, conv, {
-		msg_id: payload.msg_id,
-		conversation_id: conv.id,
-		direction: "in",
-		kind: payload.kind ?? "text",
-		in_reply_to: payload.in_reply_to ?? null,
-		body: payload.body,
-		sent_at: payload.sent_at,
-	});
-	await persistIfChanged(state, ctx);
-
-	// If the envelope addressed a specific local agent (to_agent_id),
-	// nudge that agent's loop so it actually responds. Without this, the
-	// message lands in state.conversations and just sits there — the
-	// recipient agent never sees it. Mirrors what local startConversation
-	// does for same-machine targets.
-	if (conv.owner_agent_id && conv.status === "active") {
-		void maybeAutoTrigger(ctx, conv.id);
-	}
-
-	// Surface a tiny notification once per conversation pause so the human
-	// notices without spam. /user-chat dedupes by source+text within a
-	// short window; we only ping if it's been quiet for >30s.
-	if (conv && (Date.now() - (conv.last_message_at - 0) > 30_000 || conv.messages.length === 1)) {
-		const preview = payload.kind === "text" ? String(payload.body).slice(0, 80) : `(${payload.kind})`;
-		try {
-			await ctx.dispatchProgram("/user-chat", "notify", [{
-				text: `${senderPeer.display_name}: ${preview}`,
-				urgency: "low",
-				source: "peer-chat",
-			}]);
-		} catch { /* notify is best-effort */ }
-	}
-	return true;
-}
-
 // ── Read actions ─────────────────────────────────────────────────
 
 interface ListConversationsInput {
@@ -921,7 +551,6 @@ async function doListConversations(ctx: ProgramContext, input?: ListConversation
 		.map((c) => ({
 			conversation_id: c.id,
 			peer_identity_pubkey: c.peer_identity_pubkey,
-			peer_hyperswarm_pubkey: c.peer_hyperswarm_pubkey,
 			peer_display_name: c.peer_display_name,
 			peer_object_id: c.peer_object_id,
 			goal: c.goal,
@@ -1085,7 +714,7 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 		return;
 	}
 	print([
-		bold("  peer-chat") + dim(" — agent-to-agent messaging over Hyperswarm"),
+		bold("  peer-chat") + dim(" — agent-to-agent messaging (same-daemon only until Discord transport lands)"),
 		`    ${cyan("/peer-chat list")}                          list conversations`,
 		`    ${cyan("/peer-chat read")} ${dim("<peer>")}                    read a conversation`,
 		`    ${cyan("/peer-chat send")} ${dim("<peer> <message...>")}        send a message`,
@@ -1195,23 +824,10 @@ const actorDef: ProgramActorDef = {
 			inputSchema: { type: "object", properties: {} },
 			handler: async (ctx) => doStatus(ctx),
 		},
-		handleIncoming: {
-			description: "Process an incoming glon/peer-chat envelope. Wired via registerActorContentHandler so it runs with /peer-chat's actor state, not /transport-router's.",
-			inputSchema: {
-				type: "object",
-				required: ["envelope_b64"],
-				properties: { envelope_b64: { type: "string" }, content_type: { type: "string" }, from: { type: "string" } },
-			},
-			handler: async (ctx, input: HandleIncomingInput) => doHandleIncoming(ctx, input),
-		},
 	},
 };
-
-// ── Content handler registration ────────────────────────────────
-
-registerActorContentHandler(PEER_CHAT_CONTENT_TYPE, "/peer-chat", "handleIncoming");
 
 const program: ProgramDef = { handler, actor: actorDef };
 export default program;
 
-export const __test = { doStartConversation, doSend, doEndConversation, doResumeConversation, doHandleIncoming, doListConversations, doListMessages };
+export const __test = { doStartConversation, doSend, doEndConversation, doResumeConversation, doListConversations, doListMessages };
