@@ -1,22 +1,31 @@
 // Peer — identity + trust for every human and agent the harness talks to.
 //
 // A peer is a first-class Glon object (type "peer"). The principal, their
-// family, trusted contacts, external agents — all peers, unified under one
-// abstraction.
-// Because peers are Glon objects, they sync across instances and carry
-// replayable history (when was trust bumped, when was a note added).
+// family, trusted contacts, agents — all peers, unified under one abstraction.
+//
+// Identity model (post Discord-as-substrate cleanup):
+//   - Agents are addressed by `agent_uuid` — a globally unique v4 minted
+//     at bootstrap. The same UUID is on the /agent object and on the
+//     kind=agent /peer record. agent_object_id (derived from the agent_id
+//     link) is the daemon-local rivetkit id used to dispatch /agent.ask;
+//     it's present only for agents that live on this daemon.
+//   - Humans are addressed by `discord_id` for routing. Cross-glon dedup
+//     is implicit — same Discord user means same human.
+//
+// Trust model: the admin bot's Discord token IS the auth boundary. Anyone
+// with the token can post as any agent into pair channels. /peer.trust_level
+// is a UX gate (who am I willing to let initiate or receive a peer-chat
+// conversation), not a cryptographic boundary.
 //
 // Fields:
-//   display_name: human-readable name
+//   display_name: human-readable name (unique among local agents)
 //   kind:         self | human | agent | service
-//   trust_level:  self | family | ops | stranger
-//   discord_id?:  Discord user id (for DM routing)
+//   trust_level:  self | family | friend | trusted | stranger
+//   agent_uuid?:  globally unique agent identifier (kind=agent only)
+//   discord_id?:  Discord user id (for DM routing on kind=human)
 //   email?:       email address (for mail tools)
 //   notes?:       free-text, owner-editable
-//
-// The set of valid `kind` / `trust_level` values is soft — the harness's
-// system prompt and downstream programs interpret them. New categories
-// can be added without schema changes.
+//   host_peer_id?: for remote-agent peers, the host human's /peer id
 
 import type { ProgramDef, ProgramContext, ProgramActorDef } from "../runtime.js";
 
@@ -30,20 +39,20 @@ import { dim, bold, cyan, red, green, yellow, magenta } from "../shared.js";
 		display_name: string;
 		kind: string;
 		trust_level: string;
-		identity_pubkey?: string;
-		endpoints?: string;
-		preferred_transport?: string;
-		key_verified_at?: string;
-		attestations?: string;
+		/** Globally unique v4 UUID for kind=agent records. Both /agent and the
+		 *  /peer record carry the same value so peer-chat envelopes can resolve
+		 *  back to the local rivetkit object. */
+		agent_uuid?: string;
+		/** Daemon-local rivetkit object id (= /agent object id). Derived from
+		 *  the `agent_id` link on the peer object — set for kind=agent records
+		 *  whose agent lives on THIS daemon, absent for remote-agent peers. */
+		agent_object_id?: string;
 		discord_id?: string;
 		email?: string;
 		notes?: string;
 		last_seen?: string;
-		/** For remote-agent peers: the agent's id on the host glon. Used as
-		 *  to_agent_id when routing peer-chat envelopes back to it. */
-		agent_id_remote?: string;
-		/** For remote-agent peers: the host's /peer id (kind=human). Lets
-		 *  the UI navigate from an agent up to its glon. */
+		/** For remote-agent peers: the host human's /peer id. Lets the UI
+		 *  navigate from an agent up to its operator. */
 		host_peer_id?: string;
 	}
 
@@ -65,7 +74,9 @@ export function isPeered(trust_level: string | undefined | null): boolean {
 
 // Recognised field keys for peer objects. Any other field is ignored by
 // the read path but preserved on disk.
-	const PEER_FIELDS = ["display_name", "kind", "trust_level", "identity_pubkey", "endpoints", "preferred_transport", "key_verified_at", "attestations", "discord_id", "email", "notes", "last_seen", "agents_json", "agent_id_remote", "host_peer_id"] as const;
+//   agent_object_id is NOT in this list — it's not a settable string field
+//   but a derived value read from the `agent_id` link on the peer object.
+	const PEER_FIELDS = ["display_name", "kind", "trust_level", "agent_uuid", "discord_id", "email", "notes", "last_seen", "host_peer_id"] as const;
 
 // ── Helpers ──────────────────────────────────────────────────────
 
@@ -76,22 +87,25 @@ function extractString(v: any): string | undefined {
 	return undefined;
 }
 
+	function extractLinkTarget(v: any): string | undefined {
+		if (!v) return undefined;
+		// Proto Value with linkValue wrapper, or a bare LinkValue object.
+		const lv = v.linkValue ?? v;
+		return typeof lv?.targetId === "string" ? lv.targetId : undefined;
+	}
+
 	function recordFromState(id: string, fields: Record<string, any>): PeerRecord {
 		return {
 			id,
 			display_name: extractString(fields?.display_name) ?? "",
 			kind: extractString(fields?.kind) ?? "human",
 			trust_level: extractString(fields?.trust_level) ?? "stranger",
-			identity_pubkey: extractString(fields?.identity_pubkey),
-			endpoints: extractString(fields?.endpoints),
-			preferred_transport: extractString(fields?.preferred_transport),
-			key_verified_at: extractString(fields?.key_verified_at),
-			attestations: extractString(fields?.attestations),
+			agent_uuid: extractString(fields?.agent_uuid),
+			agent_object_id: extractLinkTarget(fields?.agent_id),
 			discord_id: extractString(fields?.discord_id),
 			email: extractString(fields?.email),
 			notes: extractString(fields?.notes),
 			last_seen: extractString(fields?.last_seen),
-			agent_id_remote: extractString(fields?.agent_id_remote),
 			host_peer_id: extractString(fields?.host_peer_id),
 		};
 	}

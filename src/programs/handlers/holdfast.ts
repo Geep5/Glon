@@ -33,6 +33,7 @@
 	import type { ProgramDef, ProgramContext, ProgramActorDef } from "../runtime.js";
 	import { dim, bold, cyan, red, green, magenta } from "../shared.js";
 	import { buildHarnessTools, autoWireTools } from "./holdfast-tools.js";
+	import { randomUUID } from "node:crypto";
 
 
 // ── Constants ────────────────────────────────────────────────────
@@ -560,18 +561,19 @@ async function findSelfPeer(ctx: ProgramContext): Promise<string | null> {
 	return null;
 }
 
-/** Find an existing kind=agent peer record whose identity_pubkey is
- *  the synthetic "local:<agentId>" string. Used so /holdfast bootstrap
- *  is idempotent — second bootstrap of the same agent reuses the peer
- *  rather than spawning duplicates. */
+/** Find an existing kind=agent peer record whose agent_id link points at
+ *  this daemon's /agent object. Used so /holdfast bootstrap is idempotent —
+ *  second bootstrap of the same agent reuses the peer rather than spawning
+ *  duplicates. */
 async function findAgentPeer(ctx: ProgramContext, agentId: string): Promise<string | null> {
 	const store = ctx.store as any;
 	const refs = await store.list("peer") as { id: string }[];
-	const want = `local:${agentId}`;
 	for (const ref of refs) {
 		const obj = await store.get(ref.id);
 		if (obj?.deleted) continue;
-		if (extractString(obj?.fields?.identity_pubkey) === want) return ref.id;
+		const link = obj?.fields?.agent_id;
+		const targetId = link?.linkValue?.targetId ?? link?.targetId;
+		if (targetId === agentId) return ref.id;
 	}
 	return null;
 }
@@ -667,6 +669,7 @@ async function doSetup(opts: SetupOpts, ctx: ProgramContext): Promise<SetupResul
 	// non-deleted agent's record (you can't have it both ways).
 	let agentId = await findAgentByName(ctx, agentName);
 	let createdAgent = false;
+	let agentUuid: string | undefined;
 	if (!agentId) {
 		// Belt-and-suspenders: a peer with kind=agent but a different
 		// (orphaned) agent_id under this name would also create chat
@@ -680,24 +683,29 @@ async function doSetup(opts: SetupOpts, ctx: ProgramContext): Promise<SetupResul
 		}
 		const system = opts.systemPrompt ?? renderDefaultSystemPrompt({ agentName, principalName });
 		const model = opts.model ?? DEFAULT_MODEL;
+		agentUuid = randomUUID();
 		const fieldsJson = JSON.stringify({
 			name: stringVal(agentName),
 			model: stringVal(model),
 			system: stringVal(system),
+			agent_uuid: stringVal(agentUuid),
 		});
 		agentId = (await store.create("agent", fieldsJson)) as string;
 		createdAgent = true;
+	} else {
+		// Existing agent — read its agent_uuid (back-patch if missing).
+		const existing = await store.get(agentId);
+		agentUuid = extractString(existing?.fields?.agent_uuid);
+		if (!agentUuid) {
+			agentUuid = randomUUID();
+			const agentActor = client.objectActor.getOrCreate([agentId]);
+			await agentActor.setField("agent_uuid", JSON.stringify(stringVal(agentUuid)));
+		}
 	}
 
 	// Self peer (the principal): reuse any peer with kind=self, else create.
-	// Wire the wallet's default Ed25519 pubkey as the principal's chain
-	// identity so peer records have a stable identity_pubkey for dedup.
-	let walletPubkey: string | undefined;
-	try {
-		const wInfo = await ctx.dispatchProgram("/wallet", "show", ["default"]) as { pubkey?: string } | null;
-		walletPubkey = wInfo?.pubkey;
-	} catch { /* no wallet program (unusual) — proceed without identity */ }
-
+	// The principal is identified by discord_id for routing; cross-glon
+	// dedup of humans happens implicitly via that Discord identity.
 	let principalPeerId = await findSelfPeer(ctx);
 	let createdPeer = false;
 	if (!principalPeerId) {
@@ -706,20 +714,10 @@ async function doSetup(opts: SetupOpts, ctx: ProgramContext): Promise<SetupResul
 			kind: stringVal("self"),
 			trust_level: stringVal("self"),
 		};
-		if (walletPubkey) peerFields.identity_pubkey = stringVal(walletPubkey);
 		if (opts.principalDiscordId) peerFields.discord_id = stringVal(opts.principalDiscordId);
 		if (opts.principalEmail) peerFields.email = stringVal(opts.principalEmail);
 		principalPeerId = (await store.create("peer", JSON.stringify(peerFields))) as string;
 		createdPeer = true;
-	} else if (walletPubkey) {
-		// Back-patch identity_pubkey onto an older self peer that pre-dates
-		// wallet auto-create. Idempotent: setField writes the same value
-		// each call until the key rotates.
-		const existing = await store.get(principalPeerId);
-		if (!extractString(existing?.fields?.identity_pubkey)) {
-			const peerActor = client.objectActor.getOrCreate([principalPeerId]);
-			await peerActor.setField("identity_pubkey", JSON.stringify(stringVal(walletPubkey)));
-		}
 	}
 
 	// Link agent → principal peer (graph relation for future queries).
@@ -729,19 +727,27 @@ async function doSetup(opts: SetupOpts, ctx: ProgramContext): Promise<SetupResul
 	}
 
 	// Create a peer record for the AGENT ITSELF so sibling agents on this
-	// machine can address it via /peer-chat. identity_pubkey is the
-	// synthetic "local:<agentId>" marker — /peer-chat recognizes this
-	// prefix and routes in-process instead of going over Hyperswarm.
+	// machine can address it via /peer-chat. agent_uuid is the global
+	// identifier carried in A2A envelopes; agent_id is a graph link to
+	// the local /agent object so handleA2A can dispatch /agent.ask.
 	const agentPeerId = await findAgentPeer(ctx, agentId);
 	if (!agentPeerId) {
 		const agentPeerFields: Record<string, unknown> = {
 			display_name: stringVal(agentName),
 			kind: stringVal("agent"),
 			trust_level: stringVal("family"),
-			identity_pubkey: stringVal(`local:${agentId}`),
+			agent_uuid: stringVal(agentUuid),
 			agent_id: linkVal(agentId, "agent"),
 		};
 		await store.create("peer", JSON.stringify(agentPeerFields));
+	} else {
+		// Back-patch agent_uuid onto an older /peer record that pre-dates
+		// the cleanup. Idempotent: setField just rewrites the same value.
+		const existing = await store.get(agentPeerId);
+		if (!extractString(existing?.fields?.agent_uuid) && agentUuid) {
+			const peerActor = client.objectActor.getOrCreate([agentPeerId]);
+			await peerActor.setField("agent_uuid", JSON.stringify(stringVal(agentUuid)));
+		}
 	}
 
 	const { wired, skipped, pruned } = await autoWireTools(agentId, ctx);

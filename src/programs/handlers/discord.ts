@@ -163,7 +163,7 @@ async function fetchPeersWithDiscord(ctx: ProgramContext): Promise<PeerSnapshot[
 // Inter-glon agent communication runs over admin-bot-managed channels
 // in a single Discord guild. The bot creates a dedicated category and
 // one channel per agent-pair, named deterministically from the two
-// identity pubkeys (sorted) so both sides converge on the same channel.
+// agent UUIDs (sorted) so both sides converge on the same channel.
 //
 // Env:
 //   GLON_A2A_DISCORD_GUILD     — target guild id (required)
@@ -191,14 +191,13 @@ function a2aCategoryName(): string {
 }
 
 /** Deterministic Discord-safe channel name for an unordered pair of
- *  identity pubkeys (or any identity strings, including "local:<agentId>").
- *  Hashes each input to 16 hex chars and sorts so both daemons compute
- *  the same name. Discord channel names allow [a-z0-9_-] only, which
- *  hex satisfies. */
+ *  agent UUIDs. Hashes each input to 16 hex chars and sorts so both
+ *  daemons compute the same name. Discord channel names allow [a-z0-9_-]
+ *  only, which hex satisfies. */
 export function pairChannelName(idA: string, idB: string): string {
 	const a = String(idA ?? "");
 	const b = String(idB ?? "");
-	if (!a || !b) throw new Error("pairChannelName: both identity pubkeys required");
+	if (!a || !b) throw new Error("pairChannelName: both agent_uuids required");
 	const hash = (s: string) => createHash("sha256").update(s.toLowerCase()).digest("hex").slice(0, 16);
 	const ha = hash(a);
 	const hb = hash(b);
@@ -247,8 +246,8 @@ async function doEnsurePairCategory(state: Record<string, any>): Promise<EnsureC
 }
 
 interface EnsurePairChannelInput {
-	peer_a_identity_pubkey: string;
-	peer_b_identity_pubkey: string;
+	peer_a_agent_uuid: string;
+	peer_b_agent_uuid: string;
 }
 
 interface EnsurePairChannelResult {
@@ -259,12 +258,12 @@ interface EnsurePairChannelResult {
 }
 
 async function doEnsurePairChannel(state: Record<string, any>, input: EnsurePairChannelInput): Promise<EnsurePairChannelResult> {
-	if (!input?.peer_a_identity_pubkey || !input?.peer_b_identity_pubkey) {
-		throw new Error("discord.ensurePairChannel: peer_a_identity_pubkey and peer_b_identity_pubkey required");
+	if (!input?.peer_a_agent_uuid || !input?.peer_b_agent_uuid) {
+		throw new Error("discord.ensurePairChannel: peer_a_agent_uuid and peer_b_agent_uuid required");
 	}
 	const guildId = a2aGuildId();
 	const cat = await doEnsurePairCategory(state);
-	const name = pairChannelName(input.peer_a_identity_pubkey, input.peer_b_identity_pubkey);
+	const name = pairChannelName(input.peer_a_agent_uuid, input.peer_b_agent_uuid);
 
 	state.a2aPairChannel = state.a2aPairChannel ?? {} as Record<string, string>;
 	const cacheKey = `${guildId}:${name}`;
@@ -282,7 +281,7 @@ async function doEnsurePairChannel(state: Record<string, any>, input: EnsurePair
 		name,
 		type: DISCORD_CHANNEL_TYPE_TEXT,
 		parent_id: cat.category_id,
-		topic: `glon A2A channel · ${input.peer_a_identity_pubkey.slice(0, 24)} ↔ ${input.peer_b_identity_pubkey.slice(0, 24)}`,
+		topic: `glon A2A channel · ${input.peer_a_agent_uuid.slice(0, 24)} ↔ ${input.peer_b_agent_uuid.slice(0, 24)}`,
 	});
 	if (!created?.id) throw new Error("Discord did not return a channel id when creating pair channel");
 	state.a2aPairChannel[cacheKey] = created.id as string;
@@ -305,12 +304,10 @@ export interface A2AEnvelope {
 	msg_id: string;
 	conversation_id: string;
 	kind: "text" | "done";
-	from_identity_pubkey: string;
-	from_agent_id?: string;
-	from_display_name?: string;
-	to_identity_pubkey: string;
-	to_agent_id?: string;
-	to_display_name?: string;
+	from_agent_uuid: string;
+	from_display_name: string;
+	to_agent_uuid: string;
+	to_display_name: string;
 	body: unknown;
 	in_reply_to: string | null;
 	sent_at: number;
@@ -318,8 +315,8 @@ export interface A2AEnvelope {
 }
 
 export function formatA2AMessage(env: A2AEnvelope): string {
-	const sender = env.from_display_name || env.from_agent_id || "agent";
-	const target = env.to_display_name || env.to_agent_id || "agent";
+	const sender = env.from_display_name || env.from_agent_uuid.slice(0, 8) || "agent";
+	const target = env.to_display_name || env.to_agent_uuid.slice(0, 8) || "agent";
 	const convShort = (env.conversation_id || "").slice(0, 12);
 	const goalSnippet = env.goal ? ` · "${String(env.goal).slice(0, 60)}"` : "";
 	const bodyText = env.kind === "text" ? String(env.body ?? "") : `[${env.kind}]`;
@@ -345,8 +342,8 @@ export function parseA2AMessage(content: string): A2AEnvelope | null {
 }
 
 interface PostA2AInput {
-	peer_a_identity_pubkey: string;
-	peer_b_identity_pubkey: string;
+	peer_a_agent_uuid: string;
+	peer_b_agent_uuid: string;
 	envelope: A2AEnvelope;
 }
 
@@ -359,8 +356,8 @@ interface PostA2AResult {
 async function doPostA2A(state: Record<string, any>, input: PostA2AInput): Promise<PostA2AResult> {
 	if (!input?.envelope) throw new Error("discord.postA2A: envelope required");
 	const ch = await doEnsurePairChannel(state, {
-		peer_a_identity_pubkey: input.peer_a_identity_pubkey,
-		peer_b_identity_pubkey: input.peer_b_identity_pubkey,
+		peer_a_agent_uuid: input.peer_a_agent_uuid,
+		peer_b_agent_uuid: input.peer_b_agent_uuid,
 	});
 	const body = formatA2AMessage(input.envelope);
 	const message_ids = await postMessage(ch.channel_id, body);
@@ -1207,7 +1204,7 @@ const actorDef: ProgramActorDef = {
 			return await doEnsurePairCategory(ctx.state);
 		},
 
-		/** Idempotently ensure a pair channel exists for two identity pubkeys.
+		/** Idempotently ensure a pair channel exists for two agent UUIDs.
 		 *  Channel name is deterministic: pair-<short_lo>-<short_hi> so both
 		 *  sides converge. */
 		ensurePairChannel: async (ctx: ProgramContext, input: string | EnsurePairChannelInput) => {

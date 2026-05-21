@@ -81,13 +81,13 @@ existing agent's id.
 |---|---|
 | `/agent` | LLM conversation loop: ask → tool calls → loop until done. Owns the agent's blocks, compaction, follow-ups. |
 | `/holdfast` | Agent lifecycle: bootstrap (create or reuse), wire tools, render the default system prompt. |
-| `/peer` | Identity + trust for every human and agent. Each agent on this daemon also has a `kind=agent` peer record so siblings can address them by name. |
-| `/peer-chat` | Goal-driven conversations between peers. Same-machine A2A only — cross-machine routing returns once the Discord transport is wired (step 2). One-sided `done` closes the thread. Pauses for human review at 50 hops if neither side calls `done`. |
+| `/peer` | Identity + trust for every human and agent. Each agent on this daemon also has a `kind=agent` peer record (with the agent's `agent_uuid`) so siblings can address them by name. |
+| `/peer-chat` | Goal-driven A2A conversations over Discord pair channels. Every hop — same-daemon or cross-machine — posts an envelope into a `pair-<a16>-<b16>` channel under `glon-a2a` and the other side polls it back. One-sided `done` closes the thread. Pauses for human review at 50 hops if neither side calls `done`. |
 | `/memory` | Long-term agent memory (facts + milestones) survives compaction. |
 | `/remind` | Schedule reminders (one-shot or recurring). |
 | `/todo` | Phased task list per agent. The harness re-prompts on incomplete tasks. |
 | `/shell` | Bash exec on the host, with sessions. The universal escape hatch when no dedicated tool fits. |
-| `/discord` | Send DMs / channel messages on the principal's account. |
+| `/discord` | Admin bot: principal DMs, channel posts, and the A2A pair-channel mesh (`ensurePairCategory`, `ensurePairChannel`, `postA2A`, `pollA2A`). |
 | `/transport-{http,gmail,discord,file,router}` | Pluggable message transports. |
 | `/wallet` | Local Ed25519 keypair management for signing Changes. |
 | `/auth` | OAuth/credential storage for LLM providers (Anthropic, Kimi). |
@@ -166,6 +166,37 @@ list):
 | `GLON_HOST_PORT` | rivetkit host port | `6420` |
 | `ANTHROPIC_DEFAULT_MODEL` | model id when an agent uses Anthropic | `claude-sonnet-4-20250514` |
 | `KIMI_DEFAULT_MODEL` | model id when an agent uses Kimi | `kimi-k2-0905-preview` |
+| `DISCORD_BOT_TOKEN` | Admin bot token — see "Trust model" below | required for A2A |
+| `GLON_A2A_DISCORD_GUILD` | Discord guild id where pair channels live | required for A2A |
+| `GLON_A2A_CATEGORY_NAME` | Category name under which pair channels are created | `glon-a2a` |
+
+## Trust model
+
+Discord is the primitive substrate for A2A and the bot token IS the auth
+boundary. The admin bot is the only Discord author for every envelope; we
+deliberately do **not** sign messages. Trust derives from a single rule:
+
+> If you trust who controls the bot token, you trust the messages it posts.
+
+Consequences worth being clear about:
+
+- **Anyone with the bot token can post as any agent** into any pair channel.
+  Treat the token like a service-account credential: store it only in `.env`
+  (gitignored), rotate via the Discord developer portal if exposed, and
+  don't give the bot to operators you wouldn't trust to impersonate your
+  agents.
+- **Agent identity** is a v4 UUID (`agent_uuid`) minted at `/holdfast`
+  bootstrap. It lives on the `/agent` object and on the corresponding
+  `kind=agent` `/peer` record. Envelopes carry `from_agent_uuid` +
+  `from_display_name`; receivers route on the UUID.
+- **Human peers** are identified by `discord_id` for routing. Cross-glon
+  dedup of humans is implicit — same Discord account = same person.
+- **`/peer.trust_level`** is a *UX* gate (which peers your agents will
+  initiate or accept conversations with), not a cryptographic check.
+  Bumping a peer to `trusted` is a deliberate human act.
+- **Want stronger guarantees?** Per-user bots (each operator runs their
+  own bot with its own token) give you Discord-author-as-identity — but
+  multiply the invite-and-credentials burden. Out of scope for now.
 
 ## What this is NOT
 

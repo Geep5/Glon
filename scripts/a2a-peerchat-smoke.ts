@@ -8,19 +8,48 @@
 // Run: npx tsx scripts/a2a-peerchat-smoke.ts
 
 import "../src/env.js";
+import { randomUUID } from "node:crypto";
 
 const discordModule: any = await import("../src/programs/handlers/discord.js");
 const peerChatModule: any = await import("../src/programs/handlers/peer-chat.js");
 const discordProgram = discordModule.default;
 const peerChatProgram = peerChatModule.default;
 
-const MIKEY_AGENT_ID = "mikey-smoke";
-const TARZAN_AGENT_ID = "tarzan-smoke";
+// Two local agents. Each has:
+//   - peer_id: the /peer record id (would be an opaque store id; pick something readable)
+//   - agent_object_id: the local rivetkit /agent id (passed as from_agent_id by tools)
+//   - agent_uuid: the globally unique v4 carried in envelopes
+//   - display_name
+const MIKEY = {
+	peer_id: "peer-mikey",
+	agent_object_id: "agent-mikey-obj",
+	agent_uuid: randomUUID(),
+	display_name: "Mikey",
+};
+const TARZAN = {
+	peer_id: "peer-tarzan",
+	agent_object_id: "agent-tarzan-obj",
+	agent_uuid: randomUUID(),
+	display_name: "Tarzan",
+};
 
-// In-memory /peer store. Two pre-trusted local agents.
 const peers: any[] = [
-	{ id: "peer-mikey", display_name: "Mikey", kind: "agent", trust_level: "trusted", identity_pubkey: `local:${MIKEY_AGENT_ID}` },
-	{ id: "peer-tarzan", display_name: "Tarzan", kind: "agent", trust_level: "trusted", identity_pubkey: `local:${TARZAN_AGENT_ID}` },
+	{
+		id: MIKEY.peer_id,
+		display_name: MIKEY.display_name,
+		kind: "agent",
+		trust_level: "trusted",
+		agent_uuid: MIKEY.agent_uuid,
+		agent_object_id: MIKEY.agent_object_id,
+	},
+	{
+		id: TARZAN.peer_id,
+		display_name: TARZAN.display_name,
+		kind: "agent",
+		trust_level: "trusted",
+		agent_uuid: TARZAN.agent_uuid,
+		agent_object_id: TARZAN.agent_object_id,
+	},
 ];
 
 const peerChatState: Record<string, any> = { conversations: {} };
@@ -74,13 +103,10 @@ async function dispatchProgram(prefix: string, action: string, args: any[]): Pro
 		return await callActor(peerChatProgram, action, input, peerChatState);
 	}
 	if (prefix === "/agent") {
-		// Auto-trigger calls /agent ask; we silently no-op since this is just
-		// a plumbing test (no model in the loop).
+		// Auto-trigger calls /agent ask; no-op since we don't have an LLM here.
 		return { finalText: "[mock agent — no LLM in smoke test]" };
 	}
-	if (prefix === "/user-chat") {
-		return null;
-	}
+	if (prefix === "/user-chat") return null;
 	throw new Error(`smoke dispatch: unknown program ${prefix}`);
 }
 
@@ -90,12 +116,12 @@ function dump(label: string, val: unknown) {
 }
 
 async function main() {
-	console.log("[smoke] Mikey opens a conversation with Tarzan…");
+	console.log(`[smoke] Mikey (${MIKEY.agent_uuid.slice(0, 8)}…) opens a conversation with Tarzan (${TARZAN.agent_uuid.slice(0, 8)}…)…`);
 	const start = await dispatchProgram("/peer-chat", "startConversation", [{
-		from_agent_id: MIKEY_AGENT_ID,
+		from_agent_id: MIKEY.agent_object_id,
 		display_name: "Tarzan",
-		goal: "Discord A2A smoke test",
-		text: "Hey Tarzan! This message rode over Discord to reach you.",
+		goal: "Discord A2A smoke test (agent_uuid edition)",
+		text: "Hey Tarzan! Riding the new agent_uuid envelope through Discord.",
 	}]);
 	dump("startConversation result", start);
 
@@ -107,7 +133,7 @@ async function main() {
 	const poll1 = await dispatchProgram("/discord", "pollA2A", [{}]);
 	dump("pollA2A #1", poll1);
 
-	const tarzanView = await dispatchProgram("/peer-chat", "listConversations", [{ from_agent_id: TARZAN_AGENT_ID }]);
+	const tarzanView = await dispatchProgram("/peer-chat", "listConversations", [{ from_agent_id: TARZAN.agent_object_id }]);
 	dump("Tarzan's conversations after poll #1", tarzanView);
 	if (!Array.isArray(tarzanView) || tarzanView.length === 0) {
 		console.error("[smoke] FAIL: Tarzan did not receive Mikey's opening message");
@@ -120,9 +146,9 @@ async function main() {
 
 	console.log("\n[smoke] Tarzan replies to Mikey…");
 	const reply = await dispatchProgram("/peer-chat", "send", [{
-		from_agent_id: TARZAN_AGENT_ID,
+		from_agent_id: TARZAN.agent_object_id,
 		conversation_id: conversationId,
-		text: "Got it — Tarzan here. The Discord pipe works.",
+		text: "Got it — Tarzan here. agent_uuid renames work end-to-end.",
 	}]);
 	dump("Tarzan send result", reply);
 
@@ -133,7 +159,7 @@ async function main() {
 	dump("pollA2A #2", poll2);
 
 	const mikeyMessages = await dispatchProgram("/peer-chat", "listMessages", [{
-		from_agent_id: MIKEY_AGENT_ID,
+		from_agent_id: MIKEY.agent_object_id,
 		conversation_id: conversationId,
 	}]);
 	dump("Mikey's messages after poll #2", mikeyMessages);

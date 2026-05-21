@@ -550,14 +550,14 @@ function buildPeerChatTools(agentId: string): ToolSpec[] {
 	return [
 		{
 			name: "peer_conversation_start",
-			description: "Start a new goal-driven conversation with a peered agent or human. Address the target by display_name when you know it (\"Mikey\", \"Tarzan\") — names are unique across local agents. Fall back to peer_id or identity_pubkey only if name resolution is ambiguous. Always include a clear, specific goal (e.g. 'introduce ourselves', 'coordinate Cash's pickup tomorrow', 'compare task-tracking approaches'). The opening text becomes the first message. Returns conversation_id — use that in subsequent peer_message_send / peer_conversation_done calls.",
+			description: "Start a new goal-driven conversation with a peered agent or human. Address the target by display_name when you know it (\"Mikey\", \"Tarzan\") — names are unique across local agents. Fall back to peer_id or agent_uuid only if name resolution is ambiguous. Always include a clear, specific goal (e.g. 'introduce ourselves', 'coordinate Cash's pickup tomorrow', 'compare task-tracking approaches'). The opening text becomes the first message. Returns conversation_id — use that in subsequent peer_message_send / peer_conversation_done calls.",
 			input_schema: {
 				type: "object",
 				required: ["goal", "text"],
 				properties: {
 					display_name: { type: "string", description: "Target's name (preferred — names are unique among local agents)." },
 					peer_id: { type: "string", description: "Peer id from peer_list (use if you already have it)." },
-					identity_pubkey: { type: "string", description: "Identity pubkey (64-hex or 'local:<agent-id>')." },
+					agent_uuid: { type: "string", description: "Globally unique agent UUID (v4). Use when display_name is ambiguous." },
 					goal: { type: "string", description: "Human-readable purpose, 1-280 chars." },
 					text: { type: "string", description: "Opening message." },
 				},
@@ -599,13 +599,13 @@ function buildPeerChatTools(agentId: string): ToolSpec[] {
 		},
 		{
 			name: "peer_conversations_list",
-			description: "List YOUR conversations (filtered to ones you own). Optional peer_id or identity_pubkey narrows to a specific peer; optional status (active/done/auto-expired) narrows by state. Each entry includes conversation_id, goal, status, hops_remaining, last_message_preview.",
+			description: "List YOUR conversations (filtered to ones you own). Optional peer_id or agent_uuid narrows to a specific peer; optional status (active/done/paused) narrows by state. Each entry includes conversation_id, goal, status, hops_remaining, last_message_preview.",
 			input_schema: {
 				type: "object",
 				properties: {
 					peer_id: { type: "string" },
-					identity_pubkey: { type: "string" },
-					status: { type: "string", enum: ["active", "done", "auto-expired"] },
+					agent_uuid: { type: "string" },
+					status: { type: "string", enum: ["active", "done", "paused"] },
 				},
 			},
 			target_prefix: "/peer-chat",
@@ -620,7 +620,7 @@ function buildPeerChatTools(agentId: string): ToolSpec[] {
 				properties: {
 					conversation_id: { type: "string" },
 					peer_id: { type: "string", description: "Fallback if you don't have a conversation_id; uses the most recent matching conversation." },
-					identity_pubkey: { type: "string" },
+					agent_uuid: { type: "string" },
 					since: { type: "number" },
 					limit: { type: "number" },
 				},
