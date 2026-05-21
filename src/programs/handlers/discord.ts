@@ -204,6 +204,40 @@ function operatorUserIds(): string[] {
 	return raw.split(",").map((s) => s.trim()).filter(Boolean);
 }
 
+/** Permission overwrite array that opens a channel to the whole guild for
+ *  read + reply-in-threads, while leaving thread-creation and channel
+ *  management to the bot. Used for the #roster forum so any server member
+ *  can click on an agent's post and chat with them, but nobody else can
+ *  fabricate new agent cards.
+ *
+ *    @everyone : VIEW + READ_HISTORY + SEND_MESSAGES_IN_THREADS
+ *    bot       : full manage (view, send, history, manage_channels,
+ *                manage_threads, create_public_threads, send_in_threads)
+ *    operators : view + send + history + send_in_threads + manage_threads
+ */
+function buildPublicRosterOverwrites(guildId: string, botUserId: string): Array<{ id: string; type: number; allow: string; deny: string }> {
+	const botAllow = (
+		PERM_VIEW_CHANNEL | PERM_SEND_MESSAGES | PERM_READ_MESSAGE_HISTORY
+		| PERM_MANAGE_CHANNELS | PERM_MANAGE_THREADS
+		| PERM_CREATE_PUBLIC_THREADS | PERM_SEND_MESSAGES_IN_THREADS
+	).toString();
+	const everyoneAllow = (
+		PERM_VIEW_CHANNEL | PERM_READ_MESSAGE_HISTORY | PERM_SEND_MESSAGES_IN_THREADS
+	).toString();
+	const operatorAllow = (
+		PERM_VIEW_CHANNEL | PERM_SEND_MESSAGES | PERM_READ_MESSAGE_HISTORY
+		| PERM_SEND_MESSAGES_IN_THREADS | PERM_MANAGE_THREADS
+	).toString();
+	const overwrites: Array<{ id: string; type: number; allow: string; deny: string }> = [
+		{ id: guildId, type: PERM_OVERWRITE_TYPE_ROLE, allow: everyoneAllow, deny: "0" },
+		{ id: botUserId, type: PERM_OVERWRITE_TYPE_MEMBER, allow: botAllow, deny: "0" },
+	];
+	for (const opId of operatorUserIds()) {
+		overwrites.push({ id: opId, type: PERM_OVERWRITE_TYPE_MEMBER, allow: operatorAllow, deny: "0" });
+	}
+	return overwrites;
+}
+
 /** Permission overwrite array that hides a channel from @everyone but
  *  grants the bot user explicit view/send/history/manage/threads, plus
  *  the same (minus manage) for each operator listed in
@@ -892,9 +926,12 @@ async function doEnsureRosterForum(state: Record<string, any>): Promise<EnsureRo
 			name: wantName,
 			type: DISCORD_CHANNEL_TYPE_FORUM,
 			parent_id: cat.category_id,
-			topic: "glon agent roster · one forum post per agent (status via tags)",
+			topic: "glon agent roster · one forum post per agent · click any to chat",
 			default_auto_archive_duration: ROSTER_AUTO_ARCHIVE_MINUTES,
-			permission_overwrites: buildPrivateA2AOverwrites(guildId, botUserId),
+			// Public to the whole guild for read + reply-in-thread, but only the
+			// bot can create new agent cards (forum posts). See
+			// buildPublicRosterOverwrites for the full breakdown.
+			permission_overwrites: buildPublicRosterOverwrites(guildId, botUserId),
 			available_tags: [
 				{ name: "online", emoji_name: "🟢", moderated: false },
 				{ name: "offline", emoji_name: "⚫", moderated: false },
@@ -1146,6 +1183,182 @@ async function doListRosterPosts(state: Record<string, any>, input?: { include_a
 		});
 	}
 	return out;
+}
+
+// ── Roster forum H2A chat (humans → agents in their roster threads) ──
+// When a human posts in an agent's #roster forum post, the daemon polls
+// it, looks up the agent (via the card on the starter message), and
+// dispatches the human's message to that agent's /agent.ask loop. The
+// agent's final text gets posted back into the same thread with a
+// **<AgentName>:** prefix and message_reference for native Discord
+// reply rendering. Each roster thread is a permanent open-ended chat
+// room — no goal, no done, no locking. Discord auto-archive eventually
+// closes idle threads; humans posting un-archives them.
+
+const ROSTER_CHAT_POLL_BATCH = 20;
+
+async function pollRosterForumThreads(state: Record<string, any>, ctx: ProgramContext): Promise<number> {
+	if (!process.env.GLON_A2A_DISCORD_GUILD) return 0;
+	let total = 0;
+	try {
+		const forum = await doEnsureRosterForum(state);
+		const guildId = a2aGuildId();
+		const allActive = await discord("GET", `/guilds/${guildId}/threads/active`);
+		const list: any[] = Array.isArray(allActive) ? allActive : (allActive?.threads ?? []);
+		const rosterThreads = list
+			.filter((t) => String(t.parent_id) === forum.forum_channel_id)
+			.map(threadFromRaw);
+
+		state.rosterChatWatermarks = state.rosterChatWatermarks ?? {} as Record<string, string>;
+		for (const t of rosterThreads) {
+			try {
+				total += await pollRosterThread(t, state, ctx);
+			} catch (err: any) {
+				if (err?.rateLimited) {
+					const wait = Math.max(1, Number(err.retryAfter ?? 1));
+					state.a2aNextPollAt = Date.now() + Math.round(wait * 1000) + 500;
+					ctx.print(dim(`  [discord] roster chat rate-limited; backing off ${wait.toFixed(1)}s`));
+					return total;
+				}
+				ctx.print(dim(`  [discord] roster thread poll error for ${t.name}: ${err?.message ?? String(err)}`));
+			}
+		}
+	} catch (err: any) {
+		ctx.print(dim(`  [discord] roster chat poll setup failed: ${err?.message ?? String(err)}`));
+	}
+	return total;
+}
+
+async function pollRosterThread(thread: ThreadSummary, state: Record<string, any>, ctx: ProgramContext): Promise<number> {
+	const watermarks = state.rosterChatWatermarks as Record<string, string>;
+	const watermark = watermarks[thread.thread_id];
+	const isFirstPoll = !watermark;
+
+	if (!isFirstPoll && thread.last_message_id && thread.last_message_id <= watermark) return 0;
+
+	const qs = isFirstPoll ? `?limit=${ROSTER_CHAT_POLL_BATCH}` : `?limit=${ROSTER_CHAT_POLL_BATCH}&after=${watermark}`;
+	const rawMessages = await discord("GET", `/channels/${thread.thread_id}/messages${qs}`);
+	if (!Array.isArray(rawMessages) || rawMessages.length === 0) {
+		if (isFirstPoll) watermarks[thread.thread_id] = "0";
+		return 0;
+	}
+	const sorted = [...rawMessages].sort((a: any, b: any) => String(a.id).localeCompare(String(b.id)));
+	const newest = String(sorted[sorted.length - 1].id);
+	if (!watermark || newest > watermark) watermarks[thread.thread_id] = newest;
+
+	const botUserId = await getBotUserId(state);
+	let sawEmptyHumanContent = false;
+
+	// Find the index of the most recent bot message — anything after it is
+	// "unanswered" human chatter that needs handling. This is the right cut
+	// for roster threads (permanent chat rooms): on a first poll after a
+	// daemon restart, we don't want to drop old human messages just because
+	// they're older than a recency window — they're real questions the
+	// agent hasn't answered yet. The post-watermark `after=` query keeps
+	// subsequent polls cheap.
+	let lastBotIdx = -1;
+	for (let i = sorted.length - 1; i >= 0; i--) {
+		const m: any = sorted[i];
+		if (m.author?.id === botUserId && String(m.id) !== thread.thread_id) { lastBotIdx = i; break; }
+	}
+	const afterLastBot = lastBotIdx >= 0 ? sorted.slice(lastBotIdx + 1) : sorted;
+
+	const eligible = afterLastBot.filter((m: any) => {
+		if (String(m.id) === thread.thread_id) return false; // starter message = agent card, not a chat
+		if (m.author?.id === botUserId) return false;        // bot's own posts (shouldn't appear after the last-bot cut, but defensive)
+		const content = String(m.content ?? "").trim();
+		if (!content) {
+			if (!m.author?.bot) sawEmptyHumanContent = true;
+			return false;
+		}
+		return true;
+	});
+	if (sawEmptyHumanContent && !state._warnedAboutMessageContent) {
+		ctx.print(red(`  [discord] saw human messages with empty content — enable MESSAGE CONTENT INTENT for the bot at https://discord.com/developers/applications, then re-post`));
+		state._warnedAboutMessageContent = true;
+	}
+	if (eligible.length === 0) return 0;
+
+	// Resolve which agent this thread belongs to via the starter message's card.
+	let agentUuid: string | null = null;
+	try {
+		const starter = await discord("GET", `/channels/${thread.thread_id}/messages/${thread.thread_id}`);
+		const card = parseRosterCard(String(starter?.content ?? ""));
+		if (card) agentUuid = card.agent_uuid;
+	} catch {
+		return 0;
+	}
+	if (!agentUuid) return 0;
+
+	let processed = 0;
+	for (const m of eligible) {
+		try {
+			await routeRosterChatMessage(thread, m, agentUuid, ctx);
+			processed++;
+		} catch (err: any) {
+			ctx.print(dim(`  [discord] roster chat dispatch failed (thread ${thread.thread_id}, msg ${m.id}): ${err?.message ?? String(err)}`));
+		}
+	}
+	return processed;
+}
+
+async function routeRosterChatMessage(
+	thread: ThreadSummary,
+	message: any,
+	agentUuid: string,
+	ctx: ProgramContext,
+): Promise<void> {
+	// Find the local agent whose roster thread this is.
+	const allPeers = await ctx.dispatchProgram("/peer", "list", [{}]) as Array<any>;
+	const peers = Array.isArray(allPeers) ? allPeers : [];
+	const agentPeer = peers.find((p) =>
+		p.kind === "agent"
+		&& (p.agent_uuid ?? "").toLowerCase() === agentUuid.toLowerCase()
+		&& p.agent_object_id,
+	);
+	if (!agentPeer) return; // not one of our agents (cross-daemon roster post)
+
+	// Find or create a /peer record for the human poster.
+	const humanDiscordId = String(message.author?.id ?? "");
+	const humanUsername = String(message.author?.global_name ?? message.author?.username ?? `discord:${humanDiscordId}`);
+	if (!humanDiscordId) return;
+	const ensureRes = await ctx.dispatchProgram("/peer", "findOrCreate", [{
+		external_key: "discord_id",
+		external_value: humanDiscordId,
+		defaults: { display_name: humanUsername, kind: "human", trust_level: "trusted" },
+	}]) as { id: string; created: boolean };
+
+	// Format the prompt similar to /holdfast's formatIngestPrompt and dispatch
+	// to /agent.ask directly (so we can target THIS agent, not the harness
+	// default that /holdfast.ingest is wired to).
+	const content = String(message.content ?? "").trim();
+	const prompt = `[from ${humanUsername} on discord-roster, trust=trusted] ${content}`;
+	const result = await ctx.dispatchProgram("/agent", "ask", [
+		agentPeer.agent_object_id,
+		prompt,
+	]) as { finalText?: string };
+
+	const reply = (result?.finalText ?? "").trim();
+	if (!reply) return;
+
+	// Post back to the thread with **<AgentName>:** preamble + native reply.
+	const agentName = String(agentPeer.display_name ?? "agent");
+	const body = `**${agentName}:** ${reply}`;
+	// Discord caps content at 2000 chars; split if needed
+	const chunks = splitMessage(body, MESSAGE_MAX_LEN);
+	for (let i = 0; i < chunks.length; i++) {
+		const payload: Record<string, unknown> = { content: chunks[i] };
+		if (i === 0) {
+			payload.message_reference = { message_id: String(message.id), fail_if_not_exists: false };
+		}
+		await discord("POST", `/channels/${thread.thread_id}/messages`, payload);
+	}
+	// Touch the human's peer record's last_seen so the UX can sort by recency.
+	if (ensureRes?.id) {
+		try {
+			await ctx.dispatchProgram("/peer", "setField", [ensureRes.id, "last_seen", new Date().toISOString()]);
+		} catch { /* best-effort */ }
+	}
 }
 
 // Heartbeat: bumps the updated_at on every local agent's roster card so
@@ -1466,9 +1679,16 @@ async function runPoll(state: Record<string, any>, ctx: ProgramContext): Promise
 	}
 
 	const a2a = await pollA2AGuild(state, ctx);
-	// Roster heartbeat runs on the same tick but throttled separately.
+	// Poll for humans chatting with agents in their roster threads (H2A).
+	let rosterChat = 0;
+	try {
+		rosterChat = await pollRosterForumThreads(state, ctx);
+	} catch (err: any) {
+		ctx.print(dim(`  [discord] roster chat tick error: ${err?.message ?? String(err)}`));
+	}
+	// Roster card heartbeat (separate throttle).
 	await maybeHeartbeatRoster(state, ctx);
-	return { peers: peers.length, processed, bridges, a2a };
+	return { peers: peers.length, processed, bridges, a2a, rosterChat } as any;
 }
 
 // ── Core: Gateway (presence / "online" status) ─────────────────
@@ -2085,6 +2305,26 @@ const actorDef: ProgramActorDef = {
 		 *  most recently updated. Idempotent — no-op once each agent has one. */
 		pruneDuplicateRosterPosts: async (ctx: ProgramContext) => {
 			return await doPruneDuplicateRosterPosts(ctx.state);
+		},
+
+		/** Force a roster-chat poll cycle. Useful for tests/manual triggers
+		 *  that don't want to wait for the 3s tick. */
+		pollRosterChat: async (ctx: ProgramContext) => {
+			return { processed: await pollRosterForumThreads(ctx.state, ctx) };
+		},
+
+		/** Flip the roster forum's permission overrides from private to
+		 *  public — anyone in the guild can view + reply in existing agent
+		 *  threads. The bot still owns thread creation; humans can't
+		 *  fabricate fake agent cards. Idempotent. */
+		makeRosterPublic: async (ctx: ProgramContext) => {
+			const guildId = a2aGuildId();
+			const botUserId = await getBotUserId(ctx.state);
+			const forum = await doEnsureRosterForum(ctx.state);
+			const overwrites = buildPublicRosterOverwrites(guildId, botUserId);
+			await discord("PATCH", `/channels/${forum.forum_channel_id}`, { permission_overwrites: overwrites });
+			ctx.state.rosterForumByGuild = {};
+			return { ok: true, forum_channel_id: forum.forum_channel_id };
 		},
 
 		/** Retrofit existing A2A category + pair channels + roster forum with
