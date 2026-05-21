@@ -175,23 +175,40 @@ async function fetchPeersWithDiscord(ctx: ProgramContext): Promise<PeerSnapshot[
 const A2A_CATEGORY_NAME_DEFAULT = "glon-a2a";
 const DISCORD_CHANNEL_TYPE_CATEGORY = 4;
 const DISCORD_CHANNEL_TYPE_TEXT = 0;
+const DISCORD_CHANNEL_TYPE_PUBLIC_THREAD = 11;
 
 // Discord permission bit flags — see https://discord.com/developers/docs/topics/permissions
 const PERM_MANAGE_CHANNELS = 1n << 4n;
 const PERM_VIEW_CHANNEL = 1n << 10n;
 const PERM_SEND_MESSAGES = 1n << 11n;
 const PERM_READ_MESSAGE_HISTORY = 1n << 16n;
+const PERM_MANAGE_THREADS = 1n << 34n;
+const PERM_CREATE_PUBLIC_THREADS = 1n << 35n;
+const PERM_SEND_MESSAGES_IN_THREADS = 1n << 38n;
 const PERM_OVERWRITE_TYPE_ROLE = 0;
 const PERM_OVERWRITE_TYPE_MEMBER = 1;
 
+// Thread auto-archive duration (minutes). Discord allowed values: 60, 1440, 4320, 10080.
+// We pick 7 days so paused-for-review conversations have plenty of slack before Discord
+// hides the thread. A future post in an archived thread auto-unarchives it.
+const A2A_THREAD_AUTO_ARCHIVE_MINUTES = Number(process.env.GLON_A2A_THREAD_AUTO_ARCHIVE_MINUTES ?? 10080);
+
 /** Permission overwrite array that hides a channel from @everyone but
- *  grants the bot user explicit view/send/history/manage. Discord's
+ *  grants the bot user explicit view/send/history/manage/threads. Discord's
  *  permission system: channel-level overwrites trump role-level grants,
  *  so denying @everyone (which the bot is in) requires an explicit
  *  member-level allow for the bot to keep posting. The server owner
  *  retains access through implicit admin. */
 function buildPrivateA2AOverwrites(guildId: string, botUserId: string): Array<{ id: string; type: number; allow: string; deny: string }> {
-	const botAllow = (PERM_VIEW_CHANNEL | PERM_SEND_MESSAGES | PERM_READ_MESSAGE_HISTORY | PERM_MANAGE_CHANNELS).toString();
+	const botAllow = (
+		PERM_VIEW_CHANNEL
+		| PERM_SEND_MESSAGES
+		| PERM_READ_MESSAGE_HISTORY
+		| PERM_MANAGE_CHANNELS
+		| PERM_MANAGE_THREADS
+		| PERM_CREATE_PUBLIC_THREADS
+		| PERM_SEND_MESSAGES_IN_THREADS
+	).toString();
 	return [
 		{
 			id: guildId,                         // @everyone role's id == guild id
@@ -213,6 +230,7 @@ interface DiscordChannelSummary {
 	name: string;
 	type: number;
 	parent_id?: string | null;
+	topic?: string | null;
 }
 
 function a2aGuildId(): string {
@@ -223,6 +241,23 @@ function a2aGuildId(): string {
 
 function a2aCategoryName(): string {
 	return process.env.GLON_A2A_CATEGORY_NAME ?? A2A_CATEGORY_NAME_DEFAULT;
+}
+
+/** Structured topic string for a pair channel, embedding both agent_uuids
+ *  in a machine-parseable form. Other helpers can recover the participants
+ *  from the channel topic without round-tripping back to /peer. */
+const PAIR_TOPIC_PREFIX = "glon-a2a:v1";
+export function formatPairChannelTopic(uuidA: string, uuidB: string): string {
+	const [lo, hi] = uuidA.toLowerCase() < uuidB.toLowerCase() ? [uuidA, uuidB] : [uuidB, uuidA];
+	return `${PAIR_TOPIC_PREFIX} | ${lo} ↔ ${hi}`;
+}
+
+const PAIR_TOPIC_RE = /^glon-a2a:v1\s*\|\s*([0-9a-f-]+)\s*↔\s*([0-9a-f-]+)/i;
+export function parsePairChannelTopic(topic: string | null | undefined): { peer_a_agent_uuid: string; peer_b_agent_uuid: string } | null {
+	if (!topic) return null;
+	const m = PAIR_TOPIC_RE.exec(topic.trim());
+	if (!m) return null;
+	return { peer_a_agent_uuid: m[1].toLowerCase(), peer_b_agent_uuid: m[2].toLowerCase() };
 }
 
 /** Deterministic Discord-safe channel name for an unordered pair of
@@ -248,6 +283,7 @@ async function listGuildChannels(guildId: string): Promise<DiscordChannelSummary
 		name: String(c.name ?? ""),
 		type: Number(c.type ?? 0),
 		parent_id: c.parent_id ?? null,
+		topic: c.topic ?? null,
 	}));
 }
 
@@ -311,6 +347,19 @@ async function doEnsurePairChannel(state: Record<string, any>, input: EnsurePair
 	const existing = channels.find((c) => c.type === DISCORD_CHANNEL_TYPE_TEXT && c.parent_id === cat.category_id && c.name.toLowerCase() === name.toLowerCase());
 	if (existing) {
 		state.a2aPairChannel[cacheKey] = existing.id;
+		// Back-patch the topic if it doesn't match the structured format —
+		// older channels (pre-cleanup) had a different topic, which breaks
+		// participant lookup via listPairChannels.
+		const wantTopic = formatPairChannelTopic(input.peer_a_agent_uuid, input.peer_b_agent_uuid);
+		if (!parsePairChannelTopic(existing.topic)) {
+			try {
+				await discord("PATCH", `/channels/${existing.id}`, { topic: wantTopic });
+			} catch (err: any) {
+				// Topic update isn't critical — the channel still works for posting.
+				// listPairChannels will skip it until updated, which only affects
+				// conversation listing.
+			}
+		}
 		return { channel_id: existing.id, name: existing.name, created: false, category_id: cat.category_id };
 	}
 
@@ -319,7 +368,7 @@ async function doEnsurePairChannel(state: Record<string, any>, input: EnsurePair
 		name,
 		type: DISCORD_CHANNEL_TYPE_TEXT,
 		parent_id: cat.category_id,
-		topic: `glon A2A channel · ${input.peer_a_agent_uuid.slice(0, 24)} ↔ ${input.peer_b_agent_uuid.slice(0, 24)}`,
+		topic: formatPairChannelTopic(input.peer_a_agent_uuid, input.peer_b_agent_uuid),
 		permission_overwrites: buildPrivateA2AOverwrites(guildId, botUserId),
 	});
 	if (!created?.id) throw new Error("Discord did not return a channel id when creating pair channel");
@@ -327,41 +376,39 @@ async function doEnsurePairChannel(state: Record<string, any>, input: EnsurePair
 	return { channel_id: created.id as string, name: created.name as string, created: true, category_id: cat.category_id };
 }
 
-// ── A2A envelope wire format ─────────────────────────────────────
-// Discord messages in pair channels carry a human-readable preamble
-// (so the channel reads naturally) plus a fenced code block containing
-// the machine-parsable JSON envelope. The fence tag distinguishes glon
-// protocol messages from arbitrary human chatter that may live in the
-// same channel.
+// ── A2A wire format (Discord-as-truth, threads-per-conversation) ──
+//
+// A conversation = a Discord thread inside a pair channel.
+//   - Thread name = goal (set at peer_conversation_start, immutable)
+//   - Thread id = the conversation_id surfaced to agents
+//   - Thread locked = conversation is done
+//   - Thread archived = conversation paused / idle (Discord auto-archives
+//     after the configured duration; sending a new message un-archives)
+//
+// A message in a thread carries a minimal JSON envelope inside a fenced
+// glon-msg code block. Everything else (msg_id, sent_at, in_reply_to,
+// conversation_id, goal) is derived from the Discord message + thread.
 
 const A2A_ENVELOPE_FENCE = "glon-msg";
 const A2A_FENCE_RE = new RegExp("```\\s*" + A2A_ENVELOPE_FENCE + "\\s*\\n([\\s\\S]*?)\\n```", "i");
-const A2A_POLL_BATCH = 25;
+const A2A_POLL_BATCH = 50;
 
 export interface A2AEnvelope {
 	v: 1;
-	msg_id: string;
-	conversation_id: string;
-	kind: "text" | "done";
 	from_agent_uuid: string;
 	from_display_name: string;
 	to_agent_uuid: string;
 	to_display_name: string;
 	body: unknown;
-	in_reply_to: string | null;
-	sent_at: number;
-	goal?: string;
 }
 
 export function formatA2AMessage(env: A2AEnvelope): string {
 	const sender = env.from_display_name || env.from_agent_uuid.slice(0, 8) || "agent";
 	const target = env.to_display_name || env.to_agent_uuid.slice(0, 8) || "agent";
-	const convShort = (env.conversation_id || "").slice(0, 12);
-	const goalSnippet = env.goal ? ` · "${String(env.goal).slice(0, 60)}"` : "";
-	const bodyText = env.kind === "text" ? String(env.body ?? "") : `[${env.kind}]`;
+	const bodyText = String(env.body ?? "");
 	const bodyPreview = bodyText.length > 1500 ? bodyText.slice(0, 1500) + "…" : bodyText;
 	const quoted = bodyPreview.split("\n").map((line) => `> ${line}`).join("\n");
-	const preamble = `**${sender} → ${target}** · \`${convShort}\`${goalSnippet}\n${quoted}`;
+	const preamble = `**${sender} → ${target}**\n${quoted}`;
 	const jsonBlock = "```" + A2A_ENVELOPE_FENCE + "\n" + JSON.stringify(env) + "\n```";
 	return `${preamble}\n${jsonBlock}`;
 }
@@ -373,110 +420,239 @@ export function parseA2AMessage(content: string): A2AEnvelope | null {
 		const parsed = JSON.parse(m[1]);
 		if (!parsed || typeof parsed !== "object") return null;
 		if (parsed.v !== 1) return null;
-		if (typeof parsed.msg_id !== "string" || typeof parsed.conversation_id !== "string") return null;
-		return parsed as A2AEnvelope;
+		if (typeof parsed.from_agent_uuid !== "string" || typeof parsed.to_agent_uuid !== "string") return null;
+		return {
+			v: 1,
+			from_agent_uuid: String(parsed.from_agent_uuid),
+			from_display_name: String(parsed.from_display_name ?? ""),
+			to_agent_uuid: String(parsed.to_agent_uuid),
+			to_display_name: String(parsed.to_display_name ?? ""),
+			body: parsed.body,
+		};
 	} catch {
 		return null;
 	}
 }
 
-interface PostA2AInput {
-	peer_a_agent_uuid: string;
-	peer_b_agent_uuid: string;
-	envelope: A2AEnvelope;
+// ── Threads: create / post / list / message-iterate / archive ────
+
+interface ThreadSummary {
+	thread_id: string;
+	name: string;
+	parent_id: string;
+	archived: boolean;
+	locked: boolean;
+	message_count: number;
+	last_message_id?: string | null;
+	auto_archive_minutes: number;
 }
 
-interface PostA2AResult {
-	channel_id: string;
-	channel_name: string;
-	message_ids: string[];
+function threadFromRaw(raw: any): ThreadSummary {
+	return {
+		thread_id: String(raw.id),
+		name: String(raw.name ?? ""),
+		parent_id: String(raw.parent_id ?? ""),
+		archived: !!raw.thread_metadata?.archived,
+		locked: !!raw.thread_metadata?.locked,
+		message_count: Number(raw.message_count ?? 0),
+		last_message_id: raw.last_message_id ?? null,
+		auto_archive_minutes: Number(raw.thread_metadata?.auto_archive_duration ?? A2A_THREAD_AUTO_ARCHIVE_MINUTES),
+	};
 }
 
-async function doPostA2A(state: Record<string, any>, input: PostA2AInput): Promise<PostA2AResult> {
-	if (!input?.envelope) throw new Error("discord.postA2A: envelope required");
-	const ch = await doEnsurePairChannel(state, {
-		peer_a_agent_uuid: input.peer_a_agent_uuid,
-		peer_b_agent_uuid: input.peer_b_agent_uuid,
+interface EnsureThreadInput {
+	pair_channel_id: string;
+	name: string;                       // goal — becomes the thread title
+}
+
+interface EnsureThreadResult {
+	thread_id: string;
+	name: string;
+	created: boolean;
+}
+
+async function doEnsureConversationThread(input: EnsureThreadInput): Promise<EnsureThreadResult> {
+	if (!input?.pair_channel_id) throw new Error("ensureConversationThread: pair_channel_id required");
+	if (!input?.name) throw new Error("ensureConversationThread: name required");
+	const trimmedName = input.name.trim().slice(0, 100); // Discord limit
+	// Always create a new thread — caller (peer-chat) generates one per
+	// conversation_start. If they want to reuse an existing thread they
+	// can address it directly by thread_id.
+	const created = await discord("POST", `/channels/${input.pair_channel_id}/threads`, {
+		name: trimmedName,
+		type: DISCORD_CHANNEL_TYPE_PUBLIC_THREAD,
+		auto_archive_duration: A2A_THREAD_AUTO_ARCHIVE_MINUTES,
 	});
-	const body = formatA2AMessage(input.envelope);
-	const message_ids = await postMessage(ch.channel_id, body);
-	return { channel_id: ch.channel_id, channel_name: ch.name, message_ids };
+	if (!created?.id) throw new Error("Discord did not return a thread id");
+	return { thread_id: String(created.id), name: String(created.name ?? trimmedName), created: true };
 }
 
-/** Poll one A2A pair channel for new envelopes. Unlike pollBridgeChannel,
- *  the bot itself is the only Discord author — we still ingest every
- *  message but filter to those carrying a glon-msg fenced block. The
- *  recipient's daemon picks up envelopes addressed to its local agents;
- *  the sender's daemon naturally ignores its own outbound because
- *  to_agent_id will name the peer, not anyone local. */
-async function pollA2APairChannel(channelId: string, state: Record<string, any>, ctx: ProgramContext): Promise<number> {
-	state.a2aWatermarks = state.a2aWatermarks ?? {};
-	const watermark = state.a2aWatermarks[channelId] as string | undefined;
-	const isFirstPoll = !watermark;
+interface PostToThreadInput {
+	thread_id: string;
+	envelope: A2AEnvelope;
+	reply_to_discord_id?: string;
+}
 
-	const qs = isFirstPoll ? `?limit=${A2A_POLL_BATCH}` : `?limit=${A2A_POLL_BATCH}&after=${watermark}`;
-	const msgs = await discord("GET", `/channels/${channelId}/messages${qs}`) as DiscordMessage[] | null;
-	if (!msgs || msgs.length === 0) {
-		if (isFirstPoll) state.a2aWatermarks[channelId] = "0";
-		return 0;
+interface PostToThreadResult {
+	thread_id: string;
+	message_id: string;
+}
+
+async function doPostToThread(input: PostToThreadInput): Promise<PostToThreadResult> {
+	if (!input?.thread_id) throw new Error("postToThread: thread_id required");
+	if (!input?.envelope) throw new Error("postToThread: envelope required");
+	const body = formatA2AMessage(input.envelope);
+	// Use the raw Discord endpoint so we can include message_reference for
+	// reply chains (postMessage helper would chunk and we want one message
+	// per envelope). Envelopes are bounded — if a single body exceeds the
+	// 2000-char limit, we let Discord reject it.
+	const payload: Record<string, unknown> = { content: body };
+	if (input.reply_to_discord_id) {
+		payload.message_reference = {
+			message_id: input.reply_to_discord_id,
+			fail_if_not_exists: false,
+		};
 	}
-	const sorted = [...msgs].sort((a, b) => a.id.localeCompare(b.id));
-	const newest = sorted[sorted.length - 1].id;
-	if (!watermark || newest > watermark) state.a2aWatermarks[channelId] = newest;
+	const msg = await discord("POST", `/channels/${input.thread_id}/messages`, payload);
+	if (!msg?.id) throw new Error("Discord did not return a message id when posting to thread");
+	return { thread_id: input.thread_id, message_id: String(msg.id) };
+}
 
-	const now = Date.now();
-	const eligible = isFirstPoll
-		? sorted.filter((m) => now - snowflakeTimestampMs(m.id) <= FIRST_POLL_RECENCY_MS)
-		: sorted;
+async function listActiveThreads(pairChannelId: string): Promise<ThreadSummary[]> {
+	// Per Discord docs, /channels/{id}/threads/active is removed; use the
+	// guild-wide endpoint and filter by parent_id.
+	const guildId = a2aGuildId();
+	const raw = await discord("GET", `/guilds/${guildId}/threads/active`);
+	const list: any[] = Array.isArray(raw) ? raw : (raw?.threads ?? []);
+	return list.map(threadFromRaw).filter((t) => t.parent_id === pairChannelId);
+}
 
-	let processed = 0;
-	for (const m of eligible) {
+async function listArchivedThreads(pairChannelId: string): Promise<ThreadSummary[]> {
+	const raw = await discord("GET", `/channels/${pairChannelId}/threads/archived/public?limit=50`);
+	const list: any[] = raw?.threads ?? [];
+	return list.map(threadFromRaw);
+}
+
+interface ListConversationThreadsInput {
+	pair_channel_id: string;
+	include_archived?: boolean;
+}
+
+async function doListConversationThreads(input: ListConversationThreadsInput): Promise<ThreadSummary[]> {
+	if (!input?.pair_channel_id) throw new Error("listConversationThreads: pair_channel_id required");
+	const active = await listActiveThreads(input.pair_channel_id);
+	if (!input.include_archived) return active;
+	const archived = await listArchivedThreads(input.pair_channel_id);
+	return [...active, ...archived];
+}
+
+interface ListThreadMessagesInput {
+	thread_id: string;
+	after?: string;       // discord snowflake
+	limit?: number;
+}
+
+interface ParsedThreadMessage {
+	message_id: string;
+	envelope: A2AEnvelope;
+	in_reply_to_message_id: string | null;
+	sent_at: number;
+	raw_content: string;
+}
+
+async function doListThreadMessages(input: ListThreadMessagesInput): Promise<ParsedThreadMessage[]> {
+	if (!input?.thread_id) throw new Error("listThreadMessages: thread_id required");
+	const limit = input.limit && input.limit > 0 ? Math.min(input.limit, 100) : 100;
+	const qs = input.after ? `?limit=${limit}&after=${input.after}` : `?limit=${limit}`;
+	const raw = await discord("GET", `/channels/${input.thread_id}/messages${qs}`);
+	if (!Array.isArray(raw)) return [];
+	const sorted = [...raw].sort((a: any, b: any) => String(a.id).localeCompare(String(b.id)));
+	const out: ParsedThreadMessage[] = [];
+	for (const m of sorted) {
 		const env = parseA2AMessage(m.content ?? "");
 		if (!env) continue;
-		processed++;
-		try {
-			await ctx.dispatchProgram("/peer-chat", "handleA2A", [{
-				envelope: env,
-				channel_id: channelId,
-				discord_message_id: m.id,
-			}]);
-		} catch (err: any) {
-			ctx.print(dim(`  [discord] A2A dispatch failed (channel ${channelId}, msg ${m.id}): ${err?.message ?? String(err)}`));
-		}
+		out.push({
+			message_id: String(m.id),
+			envelope: env,
+			in_reply_to_message_id: m.message_reference?.message_id ? String(m.message_reference.message_id) : null,
+			sent_at: snowflakeTimestampMs(String(m.id)),
+			raw_content: String(m.content ?? ""),
+		});
 	}
-	return processed;
+	return out;
+}
+
+interface ArchiveThreadInput {
+	thread_id: string;
+	locked?: boolean;
+}
+
+async function doArchiveThread(input: ArchiveThreadInput): Promise<{ ok: true }> {
+	if (!input?.thread_id) throw new Error("archiveThread: thread_id required");
+	await discord("PATCH", `/channels/${input.thread_id}`, {
+		archived: true,
+		locked: input.locked ?? true,
+	});
+	return { ok: true };
+}
+
+async function doUnarchiveThread(input: { thread_id: string }): Promise<{ ok: true }> {
+	if (!input?.thread_id) throw new Error("unarchiveThread: thread_id required");
+	await discord("PATCH", `/channels/${input.thread_id}`, { archived: false, locked: false });
+	return { ok: true };
+}
+
+interface ListPairChannelsResult {
+	channel_id: string;
+	name: string;
+	peer_a_agent_uuid: string;
+	peer_b_agent_uuid: string;
+}
+
+async function doListPairChannels(state: Record<string, any>): Promise<ListPairChannelsResult[]> {
+	const cat = await doEnsurePairCategory(state);
+	const channels = await listGuildChannels(a2aGuildId());
+	const out: ListPairChannelsResult[] = [];
+	for (const c of channels) {
+		if (c.type !== DISCORD_CHANNEL_TYPE_TEXT) continue;
+		if (c.parent_id !== cat.category_id) continue;
+		if (!c.name.startsWith("pair-")) continue;
+		const parsed = parsePairChannelTopic(c.topic);
+		if (!parsed) continue;
+		out.push({
+			channel_id: c.id,
+			name: c.name,
+			peer_a_agent_uuid: parsed.peer_a_agent_uuid,
+			peer_b_agent_uuid: parsed.peer_b_agent_uuid,
+		});
+	}
+	return out;
 }
 
 // A2A poll cadence + caching:
 // - pollA2AGuild is invoked from the actor tick (every 3s) but actually
 //   touches Discord only every A2A_POLL_INTERVAL_MS (default 15s).
-// - Channel listing is cached for A2A_CHANNEL_CACHE_TTL_MS so we don't
-//   re-list every poll cycle — new pair channels still get noticed
-//   when the cache expires, just not instantly.
+// - Pair-channel list cached for A2A_CHANNEL_CACHE_TTL_MS.
 // - On a 429, we honour the server's retry_after and skip A2A polls
 //   until that deadline (plus a small buffer).
 const A2A_POLL_INTERVAL_MS = Number(process.env.GLON_A2A_POLL_INTERVAL_MS ?? 15_000);
 const A2A_CHANNEL_CACHE_TTL_MS = Number(process.env.GLON_A2A_CHANNEL_CACHE_TTL_MS ?? 60_000);
 
-/** Enumerate pair channels under the A2A category and poll each. Throttled
- *  so we don't hammer Discord. Returns total envelopes processed (or 0 if
- *  we're skipping this cycle). */
+/** Poll all threads in all pair channels for new envelopes; dispatch each
+ *  to /peer-chat handleA2A. Throttled per A2A_POLL_INTERVAL_MS; honours
+ *  Discord 429 retry_after. Returns total envelopes processed. */
 async function pollA2AGuild(state: Record<string, any>, ctx: ProgramContext): Promise<number> {
 	if (!process.env.GLON_A2A_DISCORD_GUILD) return 0;
-
 	const now = Date.now();
-	if (typeof state.a2aNextPollAt === "number" && now < state.a2aNextPollAt) {
-		return 0; // throttled or rate-limited
-	}
-	// Schedule the next poll up front; on success we may extend it normally,
-	// on 429 we extend by the retry_after instead.
+	if (typeof state.a2aNextPollAt === "number" && now < state.a2aNextPollAt) return 0;
 	state.a2aNextPollAt = now + A2A_POLL_INTERVAL_MS;
 
 	let total = 0;
 	try {
 		const cat = await doEnsurePairCategory(state);
 
-		// Cache the pair-channel list so we don't list-channels every poll.
+		// Cache the pair-channel list — new pair channels show up within
+		// A2A_CHANNEL_CACHE_TTL_MS.
 		const cachedAt = typeof state.a2aChannelsCachedAt === "number" ? state.a2aChannelsCachedAt : 0;
 		let pairChannels: DiscordChannelSummary[];
 		if (Array.isArray(state.a2aChannelsCache) && now - cachedAt < A2A_CHANNEL_CACHE_TTL_MS) {
@@ -492,17 +668,32 @@ async function pollA2AGuild(state: Record<string, any>, ctx: ProgramContext): Pr
 			state.a2aChannelsCachedAt = now;
 		}
 
+		// One guild-level active-threads call covers all our pair channels.
+		const allActive = await discord("GET", `/guilds/${a2aGuildId()}/threads/active`);
+		const activeList: any[] = Array.isArray(allActive) ? allActive : (allActive?.threads ?? []);
+		const threadsByChannel: Map<string, ThreadSummary[]> = new Map();
+		for (const t of activeList) {
+			const summary = threadFromRaw(t);
+			if (!threadsByChannel.has(summary.parent_id)) threadsByChannel.set(summary.parent_id, []);
+			threadsByChannel.get(summary.parent_id)!.push(summary);
+		}
+
+		state.a2aThreadWatermarks = state.a2aThreadWatermarks ?? {};
+
 		for (const ch of pairChannels) {
-			try {
-				total += await pollA2APairChannel(ch.id, state, ctx);
-			} catch (err: any) {
-				if (err?.rateLimited) {
-					const wait = Math.max(1, Number(err.retryAfter ?? 1));
-					state.a2aNextPollAt = Date.now() + Math.round(wait * 1000) + 500;
-					ctx.print(dim(`  [discord] A2A rate-limited; backing off ${wait.toFixed(1)}s`));
-					return total;
+			const threads = threadsByChannel.get(ch.id) ?? [];
+			for (const t of threads) {
+				try {
+					total += await pollA2AThread(t, state, ctx);
+				} catch (err: any) {
+					if (err?.rateLimited) {
+						const wait = Math.max(1, Number(err.retryAfter ?? 1));
+						state.a2aNextPollAt = Date.now() + Math.round(wait * 1000) + 500;
+						ctx.print(dim(`  [discord] A2A rate-limited; backing off ${wait.toFixed(1)}s`));
+						return total;
+					}
+					ctx.print(dim(`  [discord] A2A thread poll error for ${t.name}: ${err?.message ?? String(err)}`));
 				}
-				ctx.print(dim(`  [discord] A2A poll error for ${ch.name}: ${err?.message ?? String(err)}`));
 			}
 		}
 	} catch (err: any) {
@@ -515,6 +706,56 @@ async function pollA2AGuild(state: Record<string, any>, ctx: ProgramContext): Pr
 		}
 	}
 	return total;
+}
+
+async function pollA2AThread(thread: ThreadSummary, state: Record<string, any>, ctx: ProgramContext): Promise<number> {
+	if (thread.locked) return 0; // conversation is done — no new envelopes will be accepted
+
+	const watermarks = state.a2aThreadWatermarks as Record<string, string>;
+	const watermark = watermarks[thread.thread_id];
+	const isFirstPoll = !watermark;
+
+	// Snowflake comparison: thread.last_message_id older than or equal to
+	// our watermark means there's nothing new — skip the message fetch.
+	if (!isFirstPoll && thread.last_message_id && thread.last_message_id <= watermark) return 0;
+
+	const qs = isFirstPoll ? `?limit=${A2A_POLL_BATCH}` : `?limit=${A2A_POLL_BATCH}&after=${watermark}`;
+	const rawMessages = await discord("GET", `/channels/${thread.thread_id}/messages${qs}`);
+	if (!Array.isArray(rawMessages) || rawMessages.length === 0) {
+		if (isFirstPoll) watermarks[thread.thread_id] = "0";
+		return 0;
+	}
+	const sorted = [...rawMessages].sort((a: any, b: any) => String(a.id).localeCompare(String(b.id)));
+	const newest = String(sorted[sorted.length - 1].id);
+	if (!watermark || newest > watermark) watermarks[thread.thread_id] = newest;
+
+	const now = Date.now();
+	const eligible = isFirstPoll
+		? sorted.filter((m: any) => now - snowflakeTimestampMs(String(m.id)) <= FIRST_POLL_RECENCY_MS)
+		: sorted;
+
+	let processed = 0;
+	for (const m of eligible) {
+		const envelope = parseA2AMessage(String(m.content ?? ""));
+		if (!envelope) continue;
+		processed++;
+		try {
+			await ctx.dispatchProgram("/peer-chat", "handleA2A", [{
+				envelope,
+				thread_id: thread.thread_id,
+				thread_name: thread.name,
+				channel_id: thread.parent_id,
+				discord_message_id: String(m.id),
+				in_reply_to_discord_id: m.message_reference?.message_id ? String(m.message_reference.message_id) : null,
+				sent_at: snowflakeTimestampMs(String(m.id)),
+				thread_archived: thread.archived,
+				thread_locked: thread.locked,
+			}]);
+		} catch (err: any) {
+			ctx.print(dim(`  [discord] A2A dispatch failed (thread ${thread.thread_id}, msg ${m.id}): ${err?.message ?? String(err)}`));
+		}
+	}
+	return processed;
 }
 
 // ── Core: sending ────────────────────────────────────────────────
@@ -1295,12 +1536,50 @@ const actorDef: ProgramActorDef = {
 			return await doEnsurePairChannel(ctx.state, args);
 		},
 
-		/** Post a glon-msg envelope into the pair channel for two identity
-		 *  pubkeys. Creates the channel if absent. Used by /peer-chat to
-		 *  push outbound A2A traffic onto Discord. */
-		postA2A: async (ctx: ProgramContext, input: string | PostA2AInput) => {
+		/** Idempotently ensure a Discord thread exists inside a pair channel
+		 *  to host one goal-driven conversation. The thread name == the goal.
+		 *  Returns the thread id (used by peer-chat as conversation_id). */
+		ensureConversationThread: async (_ctx: ProgramContext, input: string | EnsureThreadInput) => {
 			const args = typeof input === "string" ? JSON.parse(input) : input;
-			return await doPostA2A(ctx.state, args);
+			return await doEnsureConversationThread(args);
+		},
+
+		/** Post a glon-msg envelope into a conversation thread. */
+		postToThread: async (_ctx: ProgramContext, input: string | PostToThreadInput) => {
+			const args = typeof input === "string" ? JSON.parse(input) : input;
+			return await doPostToThread(args);
+		},
+
+		/** List threads (active by default; pass include_archived for paused ones too). */
+		listConversationThreads: async (_ctx: ProgramContext, input: string | ListConversationThreadsInput) => {
+			const args = typeof input === "string" ? JSON.parse(input) : input;
+			return await doListConversationThreads(args);
+		},
+
+		/** Fetch parsed envelopes from a thread. */
+		listThreadMessages: async (_ctx: ProgramContext, input: string | ListThreadMessagesInput) => {
+			const args = typeof input === "string" ? JSON.parse(input) : input;
+			return await doListThreadMessages(args);
+		},
+
+		/** Archive (+ optionally lock) a thread — peer-chat uses this for
+		 *  peer_conversation_done. Locked threads reject new messages. */
+		archiveThread: async (_ctx: ProgramContext, input: string | ArchiveThreadInput) => {
+			const args = typeof input === "string" ? JSON.parse(input) : input;
+			return await doArchiveThread(args);
+		},
+
+		/** Unarchive and unlock a thread — peer-chat uses this for
+		 *  peer_conversation_resume. */
+		unarchiveThread: async (_ctx: ProgramContext, input: string | { thread_id: string }) => {
+			const args = typeof input === "string" ? JSON.parse(input) : input;
+			return await doUnarchiveThread(args);
+		},
+
+		/** Enumerate pair channels under the A2A category with parsed
+		 *  participant agent_uuids from each channel's topic. */
+		listPairChannels: async (ctx: ProgramContext) => {
+			return await doListPairChannels(ctx.state);
 		},
 
 		/** Force an A2A poll cycle. Useful for tests that don't want to wait

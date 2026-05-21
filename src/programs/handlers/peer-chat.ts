@@ -1,157 +1,77 @@
-// peer-chat — agent-to-agent text messaging over Discord pair channels.
+// peer-chat — agent-to-agent text messaging over Discord threads.
 //
-// Every conversation hop — same-daemon or cross-daemon — rides on a Discord
-// pair channel managed by the admin bot in /discord. There is no in-process
-// shortcut for local-to-local A2A; even Mikey ↔ Holdfast on the same daemon
-// round-trips through Discord. This keeps the data model uniform: one
-// channel per pair, one envelope per message, both perspectives
-// reconstructed from the same Discord history.
+// Discord is the truth. Every conversation is a thread inside a pair
+// channel; the thread's name is the goal; the thread's locked/archived
+// flags are the conversation's lifecycle. This actor stores no
+// conversation state of its own — every read fetches from Discord on
+// demand, and every write is a thin wrapper over /discord.
 //
-// Identity model:
-//   - Each agent has a globally unique `agent_uuid` (v4, minted at
-//     /holdfast bootstrap) and a `display_name`. Both ride in every
-//     envelope. The pair channel name is derived by hashing the two
-//     agent_uuids and sorting deterministically.
-//   - On the local daemon, /peer.agent_object_id maps a local agent's
-//     UUID back to its rivetkit /agent object id so handleA2A can
-//     dispatch /agent.ask when an inbound message lands.
+// Identity:
+//   - agent_uuid identifies an agent globally (v4, minted at bootstrap)
+//   - display_name is human-readable, may collide across daemons
+//   - On THIS daemon, /peer.agent_object_id maps a local agent's UUID
+//     back to its rivetkit /agent id so handleA2A can dispatch agent.ask
 //
-// Trust model: the Discord bot token IS the auth boundary. Anyone with
-// the token can post as any agent. /peer.trust_level is a UX gate on
-// "who is this agent allowed to initiate / receive A2A with", not a
-// cryptographic check. peer-chat enforces the gate on both ends.
+// Trust: the Discord bot token IS the auth boundary. /peer.trust_level
+// gates which peers can initiate / receive A2A; peer-chat enforces it
+// on both ends.
 //
-// Conversation identity: `conversation_id` is the thread id, generated
-// by the sender. It rides in every envelope and is the same on both
-// sides of a thread. In actor state, conversations are keyed by
-// `${owner_agent_object_id}::${conversation_id}` so both perspectives
-// of a thread can coexist on the same daemon.
+// Wire envelope (v1):
+//   { v, from_agent_uuid, from_display_name, to_agent_uuid, to_display_name, body }
+// Everything else is derived from the surrounding Discord message + thread.
 
 import type { ProgramDef, ProgramContext, ProgramActorDef } from "../runtime.js";
 import { dim, bold, cyan, green, red, yellow } from "../shared.js";
-import { randomUUID } from "node:crypto";
 
 const PEER_TRUSTED_LEVELS = new Set(["trusted", "friend", "family", "self"]);
 function isPeered(trust_level: string | undefined | null): boolean {
 	return !!trust_level && PEER_TRUSTED_LEVELS.has(trust_level);
 }
 
-// ── Constants ────────────────────────────────────────────────────
-
-const PERSISTED_STATE_FIELD = "persisted_state";
-const MAX_MESSAGES_PER_CONVERSATION = 2000;
 const MAX_BODY_LEN = 8000;
+const MAX_GOAL_LEN = 100; // Discord thread name limit
 
-const PAUSE_FOR_REVIEW_AT_HOPS = 50;
+// ── Types (return-only — no persisted state) ────────────────────
 
-// Bumped 4 → 5 alongside the agent_uuid migration. Old persisted state
-// (identity_pubkey-based) is wiped on first load.
-const STATE_VERSION = 5;
-
-// ── Types ────────────────────────────────────────────────────────
+interface A2AEnvelope {
+	v: 1;
+	from_agent_uuid: string;
+	from_display_name: string;
+	to_agent_uuid: string;
+	to_display_name: string;
+	body: unknown;
+}
 
 export interface PeerMessage {
-	msg_id: string;
-	conversation_id: string;
+	msg_id: string;                      // Discord message id (snowflake)
+	conversation_id: string;             // = thread id
 	direction: "in" | "out";
-	kind: string;
-	in_reply_to: string | null;
+	in_reply_to: string | null;          // Discord message id or null
 	body: unknown;
-	sent_at: number;
+	sent_at: number;                     // derived from snowflake
+	from_agent_uuid: string;
+	from_display_name: string;
 }
 
 export type ConversationStatus = "active" | "done" | "paused";
 
 export interface Conversation {
-	id: string;                            // conversation_id (thread id)
+	conversation_id: string;             // = thread id
+	goal: string;                         // = thread name
 	peer_agent_uuid: string;
 	peer_display_name: string;
-	peer_object_id?: string;               // /peer record id
-	goal: string;
+	owner_agent_object_id: string;       // local agent that owns this view
 	status: ConversationStatus;
-	started_at: number;
-	started_by_agent_object_id?: string;
-	owner_agent_object_id: string;         // local rivetkit id of the agent that owns this view
-	hop_cap: number;
-	ended_at?: number;
-	ended_reason?: string;
-	ended_by_agent_object_id?: string;
-	paused_at?: number;
-	resumed_count?: number;
-	messages: PeerMessage[];
-	last_message_at: number;
-	unread_count: number;
-	last_discord_message_id?: string;
+	message_count: number;
+	last_message_at: number | null;
 }
 
-interface PersistedChatState {
-	version: number;
-	conversations: Record<string, Conversation>;
-}
-
-// ── Persistence ─────────────────────────────────────────────────
-
-function snapshotState(state: Record<string, any>): string {
-	return JSON.stringify({ version: STATE_VERSION, conversations: state.conversations ?? {} });
-}
-
-async function restoreState(state: Record<string, any>, ctx: ProgramContext) {
-	if (!ctx.programId) return;
-	try {
-		const obj = await (ctx.store as any).get(ctx.programId);
-		const field = obj?.fields?.[PERSISTED_STATE_FIELD];
-		const raw = typeof field === "string" ? field : field?.stringValue;
-		if (!raw) return;
-		const parsed = JSON.parse(raw) as PersistedChatState;
-		if (parsed.version !== STATE_VERSION) {
-			ctx.print?.(dim(`  [peer-chat] resetting state (version ${parsed.version ?? "?"} → ${STATE_VERSION})`));
-			state.conversations = {};
-			state._lastPersistedSnapshot = snapshotState(state);
-			return;
-		}
-		if (parsed.conversations) state.conversations = parsed.conversations;
-		state._lastPersistedSnapshot = snapshotState(state);
-	} catch (err: any) {
-		ctx.print?.(dim(`  [peer-chat] restore failed: ${err?.message ?? String(err)}`));
-	}
-}
-
-async function persistIfChanged(state: Record<string, any>, ctx: ProgramContext) {
-	if (!ctx.programId) return;
-	const snap = snapshotState(state);
-	if (state._lastPersistedSnapshot === snap) return;
-	try {
-		const actor = ctx.objectActor(ctx.programId) as any;
-		if (typeof actor?.setField !== "function") return;
-		await actor.setField(PERSISTED_STATE_FIELD, JSON.stringify(ctx.stringVal(snap)));
-		state._lastPersistedSnapshot = snap;
-	} catch (err: any) {
-		ctx.print?.(dim(`  [peer-chat] persist failed: ${err?.message ?? String(err)}`));
-	}
-}
-
-// ── State key helpers ────────────────────────────────────────────
-
-function convKey(ownerAgentObjectId: string, conversationId: string): string {
-	return `${ownerAgentObjectId}::${conversationId}`;
-}
-
-function lookupConv(state: Record<string, any>, ownerAgentObjectId: string, conversationId: string): Conversation | null {
-	const conversations = (state.conversations ?? {}) as Record<string, Conversation>;
-	return conversations[convKey(ownerAgentObjectId, conversationId)] ?? null;
-}
-
-function storeConv(state: Record<string, any>, conv: Conversation) {
-	state.conversations = state.conversations ?? {};
-	state.conversations[convKey(conv.owner_agent_object_id, conv.id)] = conv;
-}
-
-// ── Agent / peer lookups ─────────────────────────────────────────
+// ── Local agent / peer lookups (still needed for routing) ────────
 
 interface LocalAgentPeer {
 	peer_id: string;
-	agent_object_id: string;     // local rivetkit object id (= /agent id)
-	agent_uuid: string;          // globally unique v4
+	agent_object_id: string;
+	agent_uuid: string;
 	display_name: string;
 }
 
@@ -163,13 +83,8 @@ async function listLocalAgentPeers(ctx: ProgramContext): Promise<LocalAgentPeer[
 		if (p.kind !== "agent") continue;
 		const uuid = p.agent_uuid;
 		const obj = p.agent_object_id;
-		if (!uuid || !obj) continue; // not a local-on-this-daemon agent record
-		out.push({
-			peer_id: p.id,
-			agent_object_id: obj,
-			agent_uuid: uuid,
-			display_name: p.display_name ?? obj,
-		});
+		if (!uuid || !obj) continue;
+		out.push({ peer_id: p.id, agent_object_id: obj, agent_uuid: uuid, display_name: p.display_name ?? obj });
 	}
 	return out;
 }
@@ -191,15 +106,12 @@ interface ResolvedPeer {
 	display_name: string;
 }
 
-/** Resolve a peer-chat target by peer_id / agent_uuid / display_name.
- *  Refuses non-peered or non-agent targets (peer-chat is agent-to-agent only). */
 async function resolvePeerForChat(
 	ctx: ProgramContext,
 	ref: { peer_id?: string; agent_uuid?: string; display_name?: string },
 ): Promise<ResolvedPeer> {
 	const all = await ctx.dispatchProgram("/peer", "list", [{}]) as Array<any>;
 	const peers = Array.isArray(all) ? all : [];
-
 	const candidates = peers.filter((p) => {
 		if (p.kind !== "agent") return false;
 		if (ref.peer_id && p.id === ref.peer_id) return true;
@@ -207,15 +119,8 @@ async function resolvePeerForChat(
 		if (ref.display_name && (p.display_name ?? "").toLowerCase() === ref.display_name.toLowerCase()) return true;
 		return false;
 	});
-
-	const match = candidates.slice().sort((a, b) => {
-		const aP = isPeered(a.trust_level) ? 1 : 0;
-		const bP = isPeered(b.trust_level) ? 1 : 0;
-		return bP - aP;
-	})[0];
-
+	const match = candidates.slice().sort((a, b) => (isPeered(b.trust_level) ? 1 : 0) - (isPeered(a.trust_level) ? 1 : 0))[0];
 	if (!match) throw new Error(`peer-chat: no agent peer matches ${JSON.stringify(ref)}`);
-
 	let effectiveTrust = match.trust_level;
 	if (!isPeered(effectiveTrust) && match.host_peer_id) {
 		const host = peers.find((p) => p.id === match.host_peer_id);
@@ -224,80 +129,18 @@ async function resolvePeerForChat(
 	if (!isPeered(effectiveTrust)) {
 		throw new Error(`peer-chat: peer "${match.display_name}" is at trust=${match.trust_level}; need a peered trust level.`);
 	}
-	if (!match.agent_uuid) {
-		throw new Error(`peer-chat: peer "${match.display_name}" has no agent_uuid on record (re-bootstrap may be needed)`);
-	}
-
-	return {
-		peer_id: match.id,
-		agent_uuid: match.agent_uuid,
-		display_name: match.display_name ?? match.id,
-	};
+	if (!match.agent_uuid) throw new Error(`peer-chat: peer "${match.display_name}" has no agent_uuid (re-bootstrap may be needed)`);
+	return { peer_id: match.id, agent_uuid: match.agent_uuid, display_name: match.display_name ?? match.id };
 }
 
-// ── Conversation helpers ─────────────────────────────────────────
-
-function newConversationId(): string {
-	return `c_${randomUUID().replace(/-/g, "").slice(0, 12)}`;
+async function getDisplayNameForUuid(ctx: ProgramContext, agentUuid: string): Promise<string> {
+	const all = await ctx.dispatchProgram("/peer", "list", [{}]) as Array<any>;
+	const peers = Array.isArray(all) ? all : [];
+	const match = peers.find((p) => p.kind === "agent" && (p.agent_uuid ?? "").toLowerCase() === agentUuid.toLowerCase());
+	return match?.display_name ?? agentUuid.slice(0, 8);
 }
 
-function appendMessageToConversation(state: Record<string, any>, conv: Conversation, msg: PeerMessage): { pausedNow: boolean; appended: boolean } {
-	if (conv.messages.some((m) => m.msg_id === msg.msg_id)) return { pausedNow: false, appended: false };
-	conv.messages.push(msg);
-	if (conv.messages.length > MAX_MESSAGES_PER_CONVERSATION) {
-		conv.messages = conv.messages.slice(-MAX_MESSAGES_PER_CONVERSATION);
-	}
-	conv.last_message_at = msg.sent_at;
-	if (msg.direction === "in") conv.unread_count += 1;
-
-	let pausedNow = false;
-	const cap = conv.hop_cap ?? PAUSE_FOR_REVIEW_AT_HOPS;
-	if (conv.status === "active" && conv.messages.length >= cap) {
-		conv.status = "paused";
-		conv.paused_at = msg.sent_at;
-		pausedNow = true;
-	}
-	storeConv(state, conv);
-	return { pausedNow, appended: true };
-}
-
-async function notifyPauseForReview(ctx: ProgramContext, conv: Conversation): Promise<void> {
-	try {
-		const peerName = conv.peer_display_name || "(peer)";
-		const hops = conv.messages.length;
-		const text = `peer-chat: "${conv.goal}" with ${peerName} hit ${hops} hops — continue or stop?`;
-		await ctx.dispatchProgram("/user-chat", "notify", [{ text, urgency: "normal", source: "peer-chat" }]);
-	} catch { /* best-effort */ }
-}
-
-// ── Envelope construction ───────────────────────────────────────
-
-interface A2AEnvelope {
-	v: 1;
-	msg_id: string;
-	conversation_id: string;
-	kind: "text" | "done";
-	from_agent_uuid: string;
-	from_display_name: string;
-	to_agent_uuid: string;
-	to_display_name: string;
-	body: unknown;
-	in_reply_to: string | null;
-	sent_at: number;
-	goal?: string;
-}
-
-async function dispatchPostA2A(ctx: ProgramContext, envelope: A2AEnvelope): Promise<{ channel_id: string }> {
-	const res = await ctx.dispatchProgram("/discord", "postA2A", [{
-		peer_a_agent_uuid: envelope.from_agent_uuid,
-		peer_b_agent_uuid: envelope.to_agent_uuid,
-		envelope,
-	}]) as { channel_id: string };
-	if (!res?.channel_id) throw new Error("peer-chat: /discord postA2A returned no channel_id");
-	return res;
-}
-
-// ── startConversation ────────────────────────────────────────────
+// ── Action: startConversation ────────────────────────────────────
 
 interface StartConversationInput {
 	peer_id?: string;
@@ -305,87 +148,74 @@ interface StartConversationInput {
 	display_name?: string;
 	goal: string;
 	text: string;
-	from_agent_id?: string;        // bound by holdfast-tools — local rivetkit object id
+	from_agent_id?: string;
 }
 
 interface StartConversationResult {
 	conversation_id: string;
 	msg_id: string;
-	discord_channel_id: string;
+	channel_id: string;
+	thread_id: string;
 }
 
 async function doStartConversation(ctx: ProgramContext, input: StartConversationInput): Promise<StartConversationResult> {
-	if (typeof input?.goal !== "string" || input.goal.trim().length === 0) {
-		throw new Error("peer-chat startConversation: `goal` is required and must be a non-empty string");
+	if (typeof input?.goal !== "string" || !input.goal.trim()) {
+		throw new Error("peer-chat startConversation: `goal` is required");
 	}
-	if (input.goal.length > 280) {
-		throw new Error(`peer-chat startConversation: goal too long (${input.goal.length} > 280)`);
+	if (input.goal.length > MAX_GOAL_LEN) {
+		throw new Error(`peer-chat startConversation: goal too long (${input.goal.length} > ${MAX_GOAL_LEN})`);
 	}
-	if (typeof input?.text !== "string" || input.text.length === 0) {
-		throw new Error("peer-chat startConversation: `text` is required (the opening message)");
+	if (typeof input?.text !== "string" || !input.text.length) {
+		throw new Error("peer-chat startConversation: `text` is required");
 	}
 	if (input.text.length > MAX_BODY_LEN) {
 		throw new Error(`peer-chat startConversation: text too long (${input.text.length} > ${MAX_BODY_LEN})`);
 	}
 	if (!input.from_agent_id) {
-		throw new Error("peer-chat startConversation: from_agent_id is required (the sender agent's local rivetkit id)");
+		throw new Error("peer-chat startConversation: from_agent_id is required");
 	}
 
 	const sender = await findLocalAgentByObjectId(ctx, input.from_agent_id);
-	if (!sender) {
-		throw new Error(`peer-chat startConversation: no local agent with object id ${input.from_agent_id} (missing /peer record with agent_uuid + agent_id link)`);
-	}
-
+	if (!sender) throw new Error(`peer-chat startConversation: no local agent with object id ${input.from_agent_id}`);
 	const peer = await resolvePeerForChat(ctx, input);
 
-	const state = ctx.state;
-	const now = Date.now();
-	const conversation_id = newConversationId();
-	const msg_id = randomUUID().replace(/-/g, "").slice(0, 16);
+	// 1. Ensure the pair channel for these two agents
+	const pair = await ctx.dispatchProgram("/discord", "ensurePairChannel", [{
+		peer_a_agent_uuid: sender.agent_uuid,
+		peer_b_agent_uuid: peer.agent_uuid,
+	}]) as { channel_id: string };
+	if (!pair?.channel_id) throw new Error("peer-chat startConversation: /discord ensurePairChannel returned no channel_id");
 
+	// 2. Create a fresh thread for this conversation (name = goal)
+	const thread = await ctx.dispatchProgram("/discord", "ensureConversationThread", [{
+		pair_channel_id: pair.channel_id,
+		name: input.goal.trim(),
+	}]) as { thread_id: string; name: string };
+	if (!thread?.thread_id) throw new Error("peer-chat startConversation: /discord ensureConversationThread returned no thread_id");
+
+	// 3. Post the opening envelope inside the thread
 	const envelope: A2AEnvelope = {
 		v: 1,
-		msg_id,
-		conversation_id,
-		kind: "text",
 		from_agent_uuid: sender.agent_uuid,
 		from_display_name: sender.display_name,
 		to_agent_uuid: peer.agent_uuid,
 		to_display_name: peer.display_name,
 		body: input.text,
-		in_reply_to: null,
-		sent_at: now,
-		goal: input.goal.trim(),
 	};
+	const posted = await ctx.dispatchProgram("/discord", "postToThread", [{
+		thread_id: thread.thread_id,
+		envelope,
+	}]) as { message_id: string };
 
-	const posted = await dispatchPostA2A(ctx, envelope);
-
-	const conv: Conversation = {
-		id: conversation_id,
-		peer_agent_uuid: peer.agent_uuid,
-		peer_display_name: peer.display_name,
-		peer_object_id: peer.peer_id,
-		goal: input.goal.trim(),
-		status: "active",
-		started_at: now,
-		started_by_agent_object_id: sender.agent_object_id,
-		owner_agent_object_id: sender.agent_object_id,
-		hop_cap: PAUSE_FOR_REVIEW_AT_HOPS,
-		messages: [],
-		last_message_at: 0,
-		unread_count: 0,
+	return {
+		conversation_id: thread.thread_id,
+		msg_id: posted.message_id,
+		channel_id: pair.channel_id,
+		thread_id: thread.thread_id,
 	};
-	storeConv(state, conv);
-	appendMessageToConversation(state, conv, {
-		msg_id, conversation_id, direction: "out", kind: "text",
-		in_reply_to: null, body: input.text, sent_at: now,
-	});
-	await persistIfChanged(state, ctx);
-
-	return { conversation_id, msg_id, discord_channel_id: posted.channel_id };
 }
 
-// ── send ────────────────────────────────────────────────────────
+// ── Action: send ─────────────────────────────────────────────────
 
 interface SendInput {
 	conversation_id: string;
@@ -395,57 +225,37 @@ interface SendInput {
 }
 
 async function doSend(ctx: ProgramContext, input: SendInput): Promise<{ msg_id: string }> {
-	if (typeof input?.text !== "string" || input.text.length === 0) {
-		throw new Error("peer-chat send: `text` is required");
-	}
-	if (input.text.length > MAX_BODY_LEN) {
-		throw new Error(`peer-chat send: message too long (${input.text.length} > ${MAX_BODY_LEN})`);
-	}
-	if (typeof input?.conversation_id !== "string" || !input.conversation_id) {
-		throw new Error("peer-chat send: `conversation_id` is required");
-	}
-	if (!input.from_agent_id) {
-		throw new Error("peer-chat send: from_agent_id is required");
-	}
-
-	const state = ctx.state;
-	const conv = lookupConv(state, input.from_agent_id, input.conversation_id);
-	if (!conv) throw new Error(`peer-chat send: conversation ${input.conversation_id} not found for agent ${input.from_agent_id}`);
-	if (conv.status !== "active") {
-		throw new Error(`peer-chat send: conversation ${input.conversation_id} is ${conv.status} — start a new one to continue.`);
-	}
+	if (typeof input?.text !== "string" || !input.text.length) throw new Error("peer-chat send: `text` is required");
+	if (input.text.length > MAX_BODY_LEN) throw new Error(`peer-chat send: message too long`);
+	if (!input?.conversation_id) throw new Error("peer-chat send: conversation_id is required");
+	if (!input?.from_agent_id) throw new Error("peer-chat send: from_agent_id is required");
 
 	const sender = await findLocalAgentByObjectId(ctx, input.from_agent_id);
 	if (!sender) throw new Error(`peer-chat send: no local agent with object id ${input.from_agent_id}`);
 
-	const msg_id = randomUUID().replace(/-/g, "").slice(0, 16);
-	const sent_at = Date.now();
+	// Look up the thread + its current message_count etc. via a list call.
+	// We also need to know who the OTHER participant is — derived from the
+	// thread's parent pair channel.
+	const { peer_agent_uuid, peer_display_name } = await getPeerForThread(ctx, input.conversation_id, sender.agent_uuid);
 
 	const envelope: A2AEnvelope = {
 		v: 1,
-		msg_id,
-		conversation_id: conv.id,
-		kind: "text",
 		from_agent_uuid: sender.agent_uuid,
 		from_display_name: sender.display_name,
-		to_agent_uuid: conv.peer_agent_uuid,
-		to_display_name: conv.peer_display_name,
+		to_agent_uuid: peer_agent_uuid,
+		to_display_name: peer_display_name,
 		body: input.text,
-		in_reply_to: input.in_reply_to ?? null,
-		sent_at,
 	};
-	await dispatchPostA2A(ctx, envelope);
+	const posted = await ctx.dispatchProgram("/discord", "postToThread", [{
+		thread_id: input.conversation_id,
+		envelope,
+		reply_to_discord_id: input.in_reply_to ?? undefined,
+	}]) as { message_id: string };
 
-	const result = appendMessageToConversation(state, conv, {
-		msg_id, conversation_id: conv.id, direction: "out", kind: "text",
-		in_reply_to: input.in_reply_to ?? null, body: input.text, sent_at,
-	});
-	await persistIfChanged(state, ctx);
-	if (result.pausedNow) await notifyPauseForReview(ctx, conv);
-	return { msg_id };
+	return { msg_id: posted.message_id };
 }
 
-// ── endConversation ─────────────────────────────────────────────
+// ── Action: endConversation ──────────────────────────────────────
 
 interface EndConversationInput {
 	conversation_id: string;
@@ -454,140 +264,78 @@ interface EndConversationInput {
 }
 
 async function doEndConversation(ctx: ProgramContext, input: EndConversationInput): Promise<{ ok: true }> {
-	if (typeof input?.conversation_id !== "string" || !input.conversation_id) {
-		throw new Error("peer-chat endConversation: `conversation_id` is required");
-	}
-	if (!input.from_agent_id) {
-		throw new Error("peer-chat endConversation: from_agent_id is required");
-	}
-
-	const state = ctx.state;
-	const conv = lookupConv(state, input.from_agent_id, input.conversation_id);
-	if (!conv) throw new Error(`peer-chat endConversation: conversation ${input.conversation_id} not found for agent ${input.from_agent_id}`);
-	if (conv.status === "done") return { ok: true };
+	if (!input?.conversation_id) throw new Error("peer-chat endConversation: conversation_id is required");
+	if (!input?.from_agent_id) throw new Error("peer-chat endConversation: from_agent_id is required");
 
 	const sender = await findLocalAgentByObjectId(ctx, input.from_agent_id);
 	if (!sender) throw new Error(`peer-chat endConversation: no local agent with object id ${input.from_agent_id}`);
 
-	const now = Date.now();
+	// Post a final message stating the reason (so the human transcript
+	// reads naturally), then lock+archive the thread.
 	const reason = (input.reason ?? "").toString().slice(0, 200) || "no reason given";
-
-	const msg_id = randomUUID().replace(/-/g, "").slice(0, 16);
-	const envelope: A2AEnvelope = {
-		v: 1,
-		msg_id,
-		conversation_id: conv.id,
-		kind: "done",
-		from_agent_uuid: sender.agent_uuid,
-		from_display_name: sender.display_name,
-		to_agent_uuid: conv.peer_agent_uuid,
-		to_display_name: conv.peer_display_name,
-		body: reason,
-		in_reply_to: null,
-		sent_at: now,
-	};
 	try {
-		await dispatchPostA2A(ctx, envelope);
+		const { peer_agent_uuid, peer_display_name } = await getPeerForThread(ctx, input.conversation_id, sender.agent_uuid);
+		await ctx.dispatchProgram("/discord", "postToThread", [{
+			thread_id: input.conversation_id,
+			envelope: {
+				v: 1,
+				from_agent_uuid: sender.agent_uuid,
+				from_display_name: sender.display_name,
+				to_agent_uuid: peer_agent_uuid,
+				to_display_name: peer_display_name,
+				body: `[conversation done] ${reason}`,
+			},
+		}]);
 	} catch (err: any) {
-		ctx.print?.(dim(`[peer-chat] end-conversation envelope send failed: ${err?.message ?? err}`));
+		ctx.print?.(dim(`[peer-chat] endConversation: final-message post failed (${err?.message ?? err}); locking anyway`));
 	}
 
-	conv.status = "done";
-	conv.ended_at = now;
-	conv.ended_reason = reason;
-	conv.ended_by_agent_object_id = sender.agent_object_id;
-	storeConv(state, conv);
-	await persistIfChanged(state, ctx);
+	await ctx.dispatchProgram("/discord", "archiveThread", [{
+		thread_id: input.conversation_id,
+		locked: true,
+	}]);
 	return { ok: true };
 }
 
-// ── resumeConversation ─────────────────────────────────────────
+// ── Action: resumeConversation ──────────────────────────────────
 
 interface ResumeConversationInput {
 	conversation_id: string;
-	from_agent_id?: string;
+	from_agent_id?: string;   // not strictly required since this only un-archives
 }
 
-async function doResumeConversation(ctx: ProgramContext, input: ResumeConversationInput): Promise<{ ok: true; new_hop_cap: number }> {
-	if (typeof input?.conversation_id !== "string" || !input.conversation_id) {
-		throw new Error("peer-chat resumeConversation: `conversation_id` is required");
-	}
-	if (!input.from_agent_id) {
-		throw new Error("peer-chat resumeConversation: from_agent_id is required");
-	}
-	const state = ctx.state;
-	const conv = lookupConv(state, input.from_agent_id, input.conversation_id);
-	if (!conv) throw new Error(`peer-chat resumeConversation: conversation ${input.conversation_id} not found for agent ${input.from_agent_id}`);
-	if (conv.status === "done") {
-		throw new Error("peer-chat resumeConversation: conversation is done — start a new one to continue.");
-	}
-	conv.hop_cap = conv.messages.length + PAUSE_FOR_REVIEW_AT_HOPS;
-	conv.status = "active";
-	conv.resumed_count = (conv.resumed_count ?? 0) + 1;
-	conv.paused_at = undefined;
-	storeConv(state, conv);
-	await persistIfChanged(state, ctx);
-	const last = conv.messages[conv.messages.length - 1];
-	if (last?.direction === "in") void maybeAutoTrigger(ctx, conv);
-	return { ok: true, new_hop_cap: conv.hop_cap };
-}
-
-// ── Auto-trigger ─────────────────────────────────────────────────
-
-async function maybeAutoTrigger(ctx: ProgramContext, conv: Conversation): Promise<void> {
-	try {
-		if (conv.status !== "active") return;
-		const last = conv.messages[conv.messages.length - 1];
-		if (!last || last.direction !== "in") return;
-		const goalPreview = conv.goal ? conv.goal.slice(0, 200) : "(no goal stated)";
-		const bodyPreview = String(last.body ?? "").slice(0, 1500);
-		const prompt = [
-			`You have a new peer-chat message in an active conversation.`,
-			`Conversation id: ${conv.id}`,
-			`Goal: ${goalPreview}`,
-			`From: ${conv.peer_display_name}`,
-			`Message: ${bodyPreview}`,
-			``,
-			`If the goal is achieved or further reply would not add value, call peer_conversation_done with a short reason. Otherwise, call peer_message_send with this conversation_id to reply. Do NOT ask the human user — this is autonomous A2A.`,
-		].join("\n");
-		await ctx.dispatchProgram("/agent", "ask", [conv.owner_agent_object_id, prompt]);
-	} catch (err: any) {
-		ctx.print?.(dim(`  [peer-chat] auto-trigger failed for ${conv.owner_agent_object_id}/${conv.id}: ${err?.message ?? err}`));
-	}
+async function doResumeConversation(ctx: ProgramContext, input: ResumeConversationInput): Promise<{ ok: true }> {
+	if (!input?.conversation_id) throw new Error("peer-chat resumeConversation: conversation_id is required");
+	await ctx.dispatchProgram("/discord", "unarchiveThread", [{ thread_id: input.conversation_id }]);
+	return { ok: true };
 }
 
 // ── handleA2A: inbound envelope from /discord poll ──────────────
 
 interface HandleA2AInput {
 	envelope: A2AEnvelope;
-	channel_id?: string;
-	discord_message_id?: string;
+	thread_id: string;
+	thread_name: string;
+	channel_id: string;
+	discord_message_id: string;
+	in_reply_to_discord_id?: string | null;
+	sent_at?: number;
+	thread_archived?: boolean;
+	thread_locked?: boolean;
 }
 
 async function doHandleA2A(ctx: ProgramContext, input: HandleA2AInput): Promise<{ processed: boolean; reason?: string }> {
 	const env = input?.envelope;
 	if (!env || typeof env !== "object") return { processed: false, reason: "no envelope" };
-	if (env.v !== 1 || typeof env.msg_id !== "string" || typeof env.conversation_id !== "string") {
-		return { processed: false, reason: "envelope shape invalid" };
-	}
-	if (!env.to_agent_uuid || !env.from_agent_uuid) {
-		return { processed: false, reason: "envelope missing agent_uuids" };
-	}
-	if (env.kind === "text") {
-		if (typeof env.body !== "string") return { processed: false, reason: "text body not string" };
-		if ((env.body as string).length > MAX_BODY_LEN) return { processed: false, reason: "text body too long" };
-	}
+	if (env.v !== 1) return { processed: false, reason: `unknown version ${env.v}` };
+	if (!env.from_agent_uuid || !env.to_agent_uuid) return { processed: false, reason: "missing agent_uuids" };
+	if (input.thread_locked) return { processed: false, reason: "thread locked (conversation done)" };
 
-	// Is the recipient a LOCAL agent on this daemon?
+	// Recipient must be a local agent on this daemon
 	const recipient = await findLocalAgentByUuid(ctx, env.to_agent_uuid);
-	if (!recipient) {
-		// Either our own outbound being polled back (we're the sender, not the
-		// recipient) or the envelope targets a different daemon's agent.
-		return { processed: false, reason: "no local recipient" };
-	}
+	if (!recipient) return { processed: false, reason: "no local recipient" };
 
-	// Trust gate: the sender's /peer record must be peered (directly or via
-	// host inheritance for cross-daemon agents).
+	// Trust gate on sender
 	const allPeers = await ctx.dispatchProgram("/peer", "list", [{}]) as Array<any>;
 	const senderPeer = (Array.isArray(allPeers) ? allPeers : [])
 		.find((p) => p.kind === "agent" && (p.agent_uuid ?? "").toLowerCase() === env.from_agent_uuid.toLowerCase());
@@ -605,179 +353,164 @@ async function doHandleA2A(ctx: ProgramContext, input: HandleA2AInput): Promise<
 		return { processed: false, reason: "sender not peered" };
 	}
 
-	const state = ctx.state;
-	let conv = lookupConv(state, recipient.agent_object_id, env.conversation_id);
-
-	if (env.kind === "done") {
-		if (conv && conv.status !== "done") {
-			conv.status = "done";
-			conv.ended_at = env.sent_at;
-			conv.ended_reason = String(env.body ?? "remote closed");
-			storeConv(state, conv);
-			await persistIfChanged(state, ctx);
-		}
-		return { processed: true };
+	// Auto-trigger the recipient agent's loop with the message + thread context
+	const goal = (input.thread_name || "(no goal)").slice(0, 200);
+	const bodyPreview = String(env.body ?? "").slice(0, 1500);
+	const prompt = [
+		`You have a new peer-chat message in an active conversation.`,
+		`Conversation id: ${input.thread_id}`,
+		`Goal: ${goal}`,
+		`From: ${env.from_display_name || env.from_agent_uuid.slice(0, 8)}`,
+		`Message: ${bodyPreview}`,
+		``,
+		`If the goal is achieved or further reply would not add value, call peer_conversation_done with a short reason (this locks the thread). Otherwise, call peer_message_send with conversation_id=${input.thread_id} to reply. Do NOT ask the human user — this is autonomous A2A.`,
+	].join("\n");
+	try {
+		await ctx.dispatchProgram("/agent", "ask", [recipient.agent_object_id, prompt]);
+	} catch (err: any) {
+		ctx.print?.(dim(`  [peer-chat] auto-trigger failed for ${recipient.agent_object_id}/${input.thread_id}: ${err?.message ?? err}`));
 	}
-
-	if (!conv) {
-		conv = {
-			id: env.conversation_id,
-			peer_agent_uuid: env.from_agent_uuid,
-			peer_display_name: env.from_display_name || senderPeer.display_name || "(unknown)",
-			peer_object_id: senderPeer.id,
-			goal: env.goal ?? "(no goal in envelope)",
-			status: "active",
-			started_at: env.sent_at,
-			started_by_agent_object_id: undefined,
-			owner_agent_object_id: recipient.agent_object_id,
-			hop_cap: PAUSE_FOR_REVIEW_AT_HOPS,
-			messages: [],
-			last_message_at: 0,
-			unread_count: 0,
-			last_discord_message_id: input.discord_message_id,
-		};
-	} else if (input.discord_message_id) {
-		conv.last_discord_message_id = input.discord_message_id;
-	}
-
-	const result = appendMessageToConversation(state, conv, {
-		msg_id: env.msg_id,
-		conversation_id: conv.id,
-		direction: "in",
-		kind: env.kind ?? "text",
-		in_reply_to: env.in_reply_to ?? null,
-		body: env.body,
-		sent_at: env.sent_at,
-	});
-	await persistIfChanged(state, ctx);
-
-	if (!result.appended) return { processed: false, reason: "duplicate msg_id" };
-
-	if (conv.status === "active") void maybeAutoTrigger(ctx, conv);
-	if (result.pausedNow) await notifyPauseForReview(ctx, conv);
 	return { processed: true };
 }
 
-// ── Read actions ─────────────────────────────────────────────────
+// ── Read actions (everything fetches from Discord on demand) ────
+
+async function getPeerForThread(ctx: ProgramContext, threadId: string, selfAgentUuid: string): Promise<{ peer_agent_uuid: string; peer_display_name: string }> {
+	// Look up which pair channel the thread lives in. We don't have a
+	// direct channels-by-thread index — easiest path: scan known pair
+	// channels from /discord and ask each for its threads. Caching is in
+	// /discord's actor state.
+	const pairs = await ctx.dispatchProgram("/discord", "listPairChannels", []) as Array<{ channel_id: string; peer_a_agent_uuid: string; peer_b_agent_uuid: string }>;
+	for (const pc of pairs) {
+		// Skip pair channels we're not in
+		const selfLower = selfAgentUuid.toLowerCase();
+		if (pc.peer_a_agent_uuid !== selfLower && pc.peer_b_agent_uuid !== selfLower) continue;
+		const threads = await ctx.dispatchProgram("/discord", "listConversationThreads", [{ pair_channel_id: pc.channel_id, include_archived: true }]) as Array<{ thread_id: string }>;
+		if (threads.some((t) => t.thread_id === threadId)) {
+			const peerUuid = pc.peer_a_agent_uuid === selfLower ? pc.peer_b_agent_uuid : pc.peer_a_agent_uuid;
+			const peerName = await getDisplayNameForUuid(ctx, peerUuid);
+			return { peer_agent_uuid: peerUuid, peer_display_name: peerName };
+		}
+	}
+	throw new Error(`peer-chat: could not locate the pair channel hosting thread ${threadId}`);
+}
 
 interface ListConversationsInput {
 	peer_id?: string;
 	agent_uuid?: string;
 	status?: ConversationStatus;
-	from_agent_id?: string;        // local rivetkit id
+	from_agent_id?: string;
+	include_archived?: boolean;
 }
 
-async function doListConversations(ctx: ProgramContext, input?: ListConversationsInput) {
-	const state = ctx.state;
-	const conversations = (state.conversations ?? {}) as Record<string, Conversation>;
+async function doListConversations(ctx: ProgramContext, input?: ListConversationsInput): Promise<Conversation[]> {
 	const i = input ?? {};
-	return Object.values(conversations)
-		.filter((c) => {
-			if (i.peer_id && c.peer_object_id !== i.peer_id) return false;
-			if (i.status && c.status !== i.status) return false;
-			if (i.agent_uuid && c.peer_agent_uuid.toLowerCase() !== i.agent_uuid.toLowerCase()) return false;
-			if (i.from_agent_id && c.owner_agent_object_id !== i.from_agent_id) return false;
-			return true;
-		})
-		.sort((a, b) => b.last_message_at - a.last_message_at)
-		.map((c) => ({
-			conversation_id: c.id,
-			peer_agent_uuid: c.peer_agent_uuid,
-			peer_display_name: c.peer_display_name,
-			peer_object_id: c.peer_object_id,
-			goal: c.goal,
-			status: c.status,
-			started_at: c.started_at,
-			owner_agent_object_id: c.owner_agent_object_id,
-			ended_at: c.ended_at,
-			ended_reason: c.ended_reason,
-			last_message_at: c.last_message_at,
-			unread_count: c.unread_count,
-			message_count: c.messages.length,
-			hop_cap: c.hop_cap ?? PAUSE_FOR_REVIEW_AT_HOPS,
-			hops_remaining: Math.max(0, (c.hop_cap ?? PAUSE_FOR_REVIEW_AT_HOPS) - c.messages.length),
-			paused_at: c.paused_at,
-			resumed_count: c.resumed_count ?? 0,
-			last_message_preview: c.messages.length > 0 ? String(c.messages[c.messages.length - 1].body ?? "").slice(0, 120) : "",
-		}));
+	const pairs = await ctx.dispatchProgram("/discord", "listPairChannels", []) as Array<{ channel_id: string; peer_a_agent_uuid: string; peer_b_agent_uuid: string }>;
+
+	let scopeAgent: LocalAgentPeer | null = null;
+	if (i.from_agent_id) {
+		scopeAgent = await findLocalAgentByObjectId(ctx, i.from_agent_id);
+		if (!scopeAgent) return [];
+	}
+
+	const out: Conversation[] = [];
+	for (const pc of pairs) {
+		if (scopeAgent) {
+			const self = scopeAgent.agent_uuid.toLowerCase();
+			if (pc.peer_a_agent_uuid !== self && pc.peer_b_agent_uuid !== self) continue;
+		}
+		const threads = await ctx.dispatchProgram("/discord", "listConversationThreads", [{
+			pair_channel_id: pc.channel_id,
+			include_archived: i.include_archived ?? true,
+		}]) as Array<{ thread_id: string; name: string; archived: boolean; locked: boolean; message_count: number; last_message_id: string | null }>;
+
+		for (const t of threads) {
+			const status: ConversationStatus = t.locked ? "done" : (t.archived ? "paused" : "active");
+			if (i.status && i.status !== status) continue;
+			// Which side is "me" for this pair? If no scope, render from peer_a's perspective.
+			const myUuid = scopeAgent ? scopeAgent.agent_uuid.toLowerCase() : pc.peer_a_agent_uuid;
+			const ownerObjId = scopeAgent ? scopeAgent.agent_object_id : "";
+			const peerUuid = pc.peer_a_agent_uuid === myUuid ? pc.peer_b_agent_uuid : pc.peer_a_agent_uuid;
+			if (i.agent_uuid && peerUuid.toLowerCase() !== i.agent_uuid.toLowerCase()) continue;
+			const peerName = await getDisplayNameForUuid(ctx, peerUuid);
+			out.push({
+				conversation_id: t.thread_id,
+				goal: t.name,
+				peer_agent_uuid: peerUuid,
+				peer_display_name: peerName,
+				owner_agent_object_id: ownerObjId,
+				status,
+				message_count: t.message_count,
+				last_message_at: t.last_message_id ? snowflakeTimestampMs(t.last_message_id) : null,
+			});
+		}
+	}
+	return out.sort((a, b) => (b.last_message_at ?? 0) - (a.last_message_at ?? 0));
 }
 
 interface ListMessagesInput {
-	conversation_id?: string;
-	peer_id?: string;
-	agent_uuid?: string;
+	conversation_id: string;
 	from_agent_id?: string;
-	since?: number;
+	since?: number;          // ms epoch; filter to messages after this
 	limit?: number;
 }
 
-async function doListMessages(ctx: ProgramContext, input: ListMessagesInput) {
-	const state = ctx.state;
-	const conversations = (state.conversations ?? {}) as Record<string, Conversation>;
-	let conv: Conversation | null = null;
-	if (input.conversation_id && input.from_agent_id) {
-		conv = lookupConv(state, input.from_agent_id, input.conversation_id);
-	} else if (input.agent_uuid || input.peer_id) {
-		const matches = Object.values(conversations).filter((c) => {
-			if (input.agent_uuid && c.peer_agent_uuid.toLowerCase() !== input.agent_uuid.toLowerCase()) return false;
-			if (input.peer_id && c.peer_object_id !== input.peer_id) return false;
-			if (input.from_agent_id && c.owner_agent_object_id !== input.from_agent_id) return false;
-			return true;
-		}).sort((a, b) => b.last_message_at - a.last_message_at);
-		conv = matches[0] ?? null;
+async function doListMessages(ctx: ProgramContext, input: ListMessagesInput): Promise<PeerMessage[]> {
+	if (!input?.conversation_id) return [];
+	const fetched = await ctx.dispatchProgram("/discord", "listThreadMessages", [{
+		thread_id: input.conversation_id,
+		limit: input.limit && input.limit > 0 ? Math.min(input.limit, 100) : 100,
+	}]) as Array<{ message_id: string; envelope: A2AEnvelope; in_reply_to_message_id: string | null; sent_at: number }>;
+
+	// Determine "my" agent_uuid for direction labeling
+	let myUuid: string | null = null;
+	if (input.from_agent_id) {
+		const me = await findLocalAgentByObjectId(ctx, input.from_agent_id);
+		myUuid = me?.agent_uuid?.toLowerCase() ?? null;
 	}
-	if (!conv) return [];
+
 	const since = typeof input.since === "number" ? input.since : 0;
-	const limit = typeof input.limit === "number" && input.limit > 0 ? input.limit : 500;
-	return conv.messages.filter((m) => m.sent_at > since).slice(-limit);
+	const out: PeerMessage[] = [];
+	for (const m of fetched) {
+		if (m.sent_at <= since) continue;
+		const direction: "in" | "out" = myUuid && m.envelope.from_agent_uuid.toLowerCase() === myUuid ? "out" : "in";
+		out.push({
+			msg_id: m.message_id,
+			conversation_id: input.conversation_id,
+			direction,
+			in_reply_to: m.in_reply_to_message_id,
+			body: m.envelope.body,
+			sent_at: m.sent_at,
+			from_agent_uuid: m.envelope.from_agent_uuid,
+			from_display_name: m.envelope.from_display_name,
+		});
+	}
+	return out;
 }
 
-interface MarkReadInput {
-	conversation_id?: string;
-	peer_id?: string;
-	agent_uuid?: string;
-	from_agent_id?: string;
+async function doStatus(ctx: ProgramContext): Promise<{ pair_channels: number; conversations: number; active: number; done: number; paused: number }> {
+	const pairs = await ctx.dispatchProgram("/discord", "listPairChannels", []) as Array<any>;
+	let active = 0, done = 0, paused = 0;
+	for (const pc of pairs) {
+		const threads = await ctx.dispatchProgram("/discord", "listConversationThreads", [{ pair_channel_id: pc.channel_id, include_archived: true }]) as Array<{ archived: boolean; locked: boolean }>;
+		for (const t of threads) {
+			if (t.locked) done++;
+			else if (t.archived) paused++;
+			else active++;
+		}
+	}
+	return { pair_channels: pairs.length, conversations: active + done + paused, active, done, paused };
 }
 
-async function doMarkRead(ctx: ProgramContext, input: MarkReadInput) {
-	const state = ctx.state;
-	const conversations = (state.conversations ?? {}) as Record<string, Conversation>;
-	let conv: Conversation | null = null;
-	if (input.conversation_id && input.from_agent_id) {
-		conv = lookupConv(state, input.from_agent_id, input.conversation_id);
-	} else {
-		const matches = Object.values(conversations).filter((c) =>
-			(input.agent_uuid && c.peer_agent_uuid.toLowerCase() === input.agent_uuid.toLowerCase()) ||
-			(input.peer_id && c.peer_object_id === input.peer_id),
-		);
-		conv = matches[0] ?? null;
+// snowflakeTimestampMs: tiny re-implementation so peer-chat doesn't need
+// to import from /discord. Discord epoch = 2015-01-01.
+const DISCORD_EPOCH_MS = 1420070400000;
+function snowflakeTimestampMs(snowflake: string): number {
+	try {
+		return Number(BigInt(snowflake) >> 22n) + DISCORD_EPOCH_MS;
+	} catch {
+		return 0;
 	}
-	if (!conv) return { ok: true };
-	if (conv.unread_count !== 0) {
-		conv.unread_count = 0;
-		await persistIfChanged(state, ctx);
-	}
-	return { ok: true };
-}
-
-async function doStatus(ctx: ProgramContext) {
-	const state = ctx.state;
-	const conversations = (state.conversations ?? {}) as Record<string, Conversation>;
-	let in_count = 0, out_count = 0, unread = 0, active = 0, done = 0, paused = 0;
-	for (const c of Object.values(conversations)) {
-		unread += c.unread_count;
-		for (const m of c.messages) (m.direction === "in" ? in_count++ : out_count++);
-		if (c.status === "active") active++;
-		else if (c.status === "done") done++;
-		else if (c.status === "paused") paused++;
-	}
-	return {
-		conversations: Object.keys(conversations).length,
-		active, done, paused,
-		messages_in: in_count,
-		messages_out: out_count,
-		unread,
-	};
 }
 
 // ── CLI handler ─────────────────────────────────────────────────
@@ -787,42 +520,37 @@ const handler = async (cmd: string, _args: string[], ctx: ProgramContext) => {
 	if (cmd === "status") {
 		const s = await doStatus(ctx);
 		print(bold("  peer-chat"));
-		print(dim(`    conversations: ${s.conversations} (active ${s.active}, done ${s.done}, paused ${s.paused})`));
-		print(dim(`    messages in:   ${s.messages_in}`));
-		print(dim(`    messages out:  ${s.messages_out}`));
-		print(dim(`    unread:        ${s.unread}`));
+		print(dim(`    pair channels: ${s.pair_channels}`));
+		print(dim(`    conversations: ${s.conversations} (active ${s.active}, paused ${s.paused}, done ${s.done})`));
 		return;
 	}
 	if (cmd === "list") {
 		const convs = await doListConversations(ctx, {});
-		if (convs.length === 0) { print(dim("(no conversations yet)")); return; }
+		if (convs.length === 0) { print(dim("(no conversations)")); return; }
 		for (const c of convs) {
-			const age = Math.round((Date.now() - c.last_message_at) / 1000);
-			const unread = c.unread_count > 0 ? red(` (${c.unread_count} unread)`) : "";
 			const statusTag = c.status === "active" ? green("●") : c.status === "done" ? dim("✓") : yellow("⌛");
-			print(`  ${statusTag} ${cyan(c.peer_display_name)} ${dim(`[owner ${c.owner_agent_object_id.slice(0, 8)}]`)}  ${dim(`"${(c.goal || "").slice(0, 40)}"`)}  ${dim(`${c.message_count} msgs, ${age}s ago`)}${unread}`);
+			const age = c.last_message_at ? `${Math.round((Date.now() - c.last_message_at) / 1000)}s ago` : "never";
+			print(`  ${statusTag} ${cyan(c.peer_display_name)}  ${dim(`"${c.goal.slice(0, 40)}"`)}  ${dim(`${c.message_count} msgs, ${age}`)}`);
 		}
 		return;
 	}
 	print([
-		bold("  peer-chat") + dim(" — agent-to-agent messaging over Discord pair channels"),
-		`    ${cyan("/peer-chat list")}            list conversations`,
-		`    ${cyan("/peer-chat status")}          counters`,
-		dim("    Every message rides on a Discord pair channel under the glon-a2a category."),
-		dim("    Set GLON_A2A_DISCORD_GUILD to the target guild (the admin bot manages channels)."),
+		bold("  peer-chat") + dim(" — agent-to-agent messaging over Discord threads"),
+		`    ${cyan("/peer-chat list")}    list conversations`,
+		`    ${cyan("/peer-chat status")}  counters`,
+		dim("    Every conversation is a Discord thread under glon-a2a/. The thread's"),
+		dim("    name is the goal; locked == done; archived == paused. Discord is the truth."),
 	].join("\n"));
+	void red;
 };
 
 // ── Actor ───────────────────────────────────────────────────────
 
 const actorDef: ProgramActorDef = {
-	createState: () => ({ conversations: {} }),
-	onCreate: async (ctx) => {
-		await restoreState(ctx.state, ctx);
-	},
+	createState: () => ({}),
 	typedActions: {
 		startConversation: {
-			description: "Start a new goal-driven A2A conversation. Requires goal (1-280 chars), opening text, and from_agent_id (the sender agent's local rivetkit id). Posts the opening envelope into the pair channel under GLON_A2A_DISCORD_GUILD and returns conversation_id.",
+			description: "Start a new goal-driven A2A conversation. Creates a Discord thread named after the goal in the pair channel for sender↔target, then posts the opening message. Returns conversation_id (= thread id).",
 			inputSchema: {
 				type: "object",
 				required: ["goal", "text"],
@@ -838,7 +566,7 @@ const actorDef: ProgramActorDef = {
 			handler: async (ctx, input: StartConversationInput) => doStartConversation(ctx, input),
 		},
 		send: {
-			description: "Send a message into an existing active conversation. Requires conversation_id + from_agent_id. Posts an envelope to the pair channel.",
+			description: "Send a message into an existing conversation (Discord thread). Requires conversation_id + from_agent_id.",
 			inputSchema: {
 				type: "object",
 				required: ["conversation_id", "text"],
@@ -852,7 +580,7 @@ const actorDef: ProgramActorDef = {
 			handler: async (ctx, input: SendInput) => doSend(ctx, input),
 		},
 		endConversation: {
-			description: "Close a conversation. Posts a kind:done envelope so the remote closes too.",
+			description: "Close the conversation — posts a final message with the reason, then locks + archives the thread. Discord rejects further posts to a locked thread.",
 			inputSchema: {
 				type: "object",
 				required: ["conversation_id"],
@@ -865,7 +593,7 @@ const actorDef: ProgramActorDef = {
 			handler: async (ctx, input: EndConversationInput) => doEndConversation(ctx, input),
 		},
 		resumeConversation: {
-			description: "Resume a paused conversation (extends hop cap, re-fires auto-trigger if waiting on a reply).",
+			description: "Unarchive a paused thread so agents can post again.",
 			inputSchema: {
 				type: "object",
 				required: ["conversation_id"],
@@ -877,7 +605,7 @@ const actorDef: ProgramActorDef = {
 			handler: async (ctx, input: ResumeConversationInput) => doResumeConversation(ctx, input),
 		},
 		listConversations: {
-			description: "List conversations. Pass from_agent_id to filter to a single agent's view.",
+			description: "List conversations (threads) across pair channels. Pass from_agent_id to filter to one local agent's perspective.",
 			inputSchema: {
 				type: "object",
 				properties: {
@@ -885,44 +613,45 @@ const actorDef: ProgramActorDef = {
 					agent_uuid: { type: "string" },
 					status: { type: "string", enum: ["active", "done", "paused"] },
 					from_agent_id: { type: "string" },
+					include_archived: { type: "boolean" },
 				},
 			},
 			handler: async (ctx, input: ListConversationsInput) => doListConversations(ctx, input ?? {}),
 		},
 		listMessages: {
-			description: "Return messages in a conversation. Prefer conversation_id + from_agent_id; agent_uuid/peer_id falls back to most-recent matching.",
+			description: "Fetch messages in a conversation (thread) from Discord. Pass from_agent_id to label direction (in/out).",
 			inputSchema: {
 				type: "object",
+				required: ["conversation_id"],
 				properties: {
 					conversation_id: { type: "string" },
-					peer_id: { type: "string" },
-					agent_uuid: { type: "string" },
 					from_agent_id: { type: "string" },
 					since: { type: "number" },
 					limit: { type: "number" },
 				},
 			},
-			handler: async (ctx, input: ListMessagesInput) => doListMessages(ctx, input ?? {}),
-		},
-		markRead: {
-			description: "Reset unread_count for a conversation.",
-			inputSchema: { type: "object", properties: { conversation_id: { type: "string" }, peer_id: { type: "string" }, agent_uuid: { type: "string" }, from_agent_id: { type: "string" } } },
-			handler: async (ctx, input: MarkReadInput) => doMarkRead(ctx, input ?? {}),
+			handler: async (ctx, input: ListMessagesInput) => doListMessages(ctx, input),
 		},
 		status: {
-			description: "Conversation counters across all local agents.",
+			description: "Counters: pair channels + conversations by status.",
 			inputSchema: { type: "object", properties: {} },
 			handler: async (ctx) => doStatus(ctx),
 		},
 		handleA2A: {
-			description: "Process an inbound A2A envelope from /discord's pair-channel poll. Called by /discord, not by agents.",
+			description: "Process an inbound A2A envelope from /discord's thread poll. Called by /discord, not by agents.",
 			inputSchema: {
 				type: "object",
-				required: ["envelope"],
+				required: ["envelope", "thread_id", "thread_name", "channel_id", "discord_message_id"],
 				properties: {
 					envelope: { type: "object" },
+					thread_id: { type: "string" },
+					thread_name: { type: "string" },
 					channel_id: { type: "string" },
 					discord_message_id: { type: "string" },
+					in_reply_to_discord_id: { type: ["string", "null"] },
+					sent_at: { type: "number" },
+					thread_archived: { type: "boolean" },
+					thread_locked: { type: "boolean" },
 				},
 			},
 			handler: async (ctx, input: HandleA2AInput) => doHandleA2A(ctx, input),
@@ -935,6 +664,5 @@ export default program;
 
 export const __test = {
 	doStartConversation, doSend, doEndConversation, doResumeConversation,
-	doHandleA2A, doListConversations, doListMessages,
-	convKey, lookupConv,
+	doHandleA2A, doListConversations, doListMessages, doStatus,
 };

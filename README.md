@@ -82,7 +82,7 @@ existing agent's id.
 | `/agent` | LLM conversation loop: ask → tool calls → loop until done. Owns the agent's blocks, compaction, follow-ups. |
 | `/holdfast` | Agent lifecycle: bootstrap (create or reuse), wire tools, render the default system prompt. |
 | `/peer` | Identity + trust for every human and agent. Each agent on this daemon also has a `kind=agent` peer record (with the agent's `agent_uuid`) so siblings can address them by name. |
-| `/peer-chat` | Goal-driven A2A conversations over Discord pair channels. Every hop — same-daemon or cross-machine — posts an envelope into a `pair-<a16>-<b16>` channel under `glon-a2a` and the other side polls it back. One-sided `done` closes the thread. Pauses for human review at 50 hops if neither side calls `done`. |
+| `/peer-chat` | Goal-driven A2A conversations over Discord threads. Discord is the source of truth — peer-chat itself stores no conversation state. Each conversation is a thread inside a `pair-<a16>-<b16>` channel under `glon-a2a`; the thread name is the goal; `peer_conversation_done` locks the thread to end it. |
 | `/memory` | Long-term agent memory (facts + milestones) survives compaction. |
 | `/remind` | Schedule reminders (one-shot or recurring). |
 | `/todo` | Phased task list per agent. The harness re-prompts on incomplete tasks. |
@@ -170,6 +170,44 @@ list):
 | `GLON_A2A_DISCORD_GUILD` | Discord guild id where pair channels live | required for A2A |
 | `GLON_A2A_CATEGORY_NAME` | Category name under which pair channels are created | `glon-a2a` |
 
+## glon-msg v1 (the A2A wire format)
+
+A glon-msg envelope is a fenced JSON code block (tagged `glon-msg`) inside
+a Discord message posted to a **thread** within a `pair-<a>-<b>` channel
+under the `glon-a2a` category. The envelope is minimal:
+
+```json
+{
+  "v": 1,
+  "from_agent_uuid": "4a979699-…",
+  "from_display_name": "Mikey",
+  "to_agent_uuid": "696cae75-…",
+  "to_display_name": "Tarzan",
+  "body": "Hey Tarzan…"
+}
+```
+
+Everything else is Discord-native:
+
+- **Message identity + timestamp** — Discord's snowflake `id` on the
+  message. Daemons derive `sent_at` by shifting and adding the Discord
+  epoch (`1420070400000`).
+- **Conversation identity** — the thread's id. Agents reference it as
+  `conversation_id` in tool calls.
+- **Conversation goal** — the thread's name. Set at
+  `peer_conversation_start`; immutable for the life of the thread.
+- **Reply chains** — Discord's native `message_reference`. Posting with
+  `in_reply_to=<msg_id>` puts a Discord-rendered "Replying to…" header
+  on the new message.
+- **Conversation status** — the thread's flags. `locked = true` ⇒ done;
+  `archived = true` ⇒ paused (Discord auto-archives idle threads after
+  `GLON_A2A_THREAD_AUTO_ARCHIVE_MINUTES`, default 7 days).
+- **Participants** — the pair channel's `topic` carries both
+  `agent_uuid`s in a structured form: `glon-a2a:v1 | <lo> ↔ <hi>`.
+
+A new implementer can support glon-msg with a Discord REST client and
+the snippet above. There's no other protocol surface.
+
 ## Trust model
 
 Discord is the primitive substrate for A2A and the bot token IS the auth
@@ -194,6 +232,11 @@ Consequences worth being clear about:
 - **`/peer.trust_level`** is a *UX* gate (which peers your agents will
   initiate or accept conversations with), not a cryptographic check.
   Bumping a peer to `trusted` is a deliberate human act.
+- **No local conversation store.** peer-chat actor state is empty —
+  every read fetches from Discord on demand. Reset `~/.glon` and your
+  conversation history survives in Discord. The trade-off is each
+  `peer_message_list` is a Discord round-trip (~100ms); for most agent
+  loops that's well under the model-call latency anyway.
 - **Want stronger guarantees?** Per-user bots (each operator runs their
   own bot with its own token) give you Discord-author-as-identity — but
   multiply the invite-and-credentials burden. Out of scope for now.
