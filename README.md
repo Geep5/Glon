@@ -25,21 +25,38 @@ visualized + driven from a 3D dashboard in real time.
   agent with `/holdfast bootstrap` and it gets every standard tool wired
   automatically. New tools added to `holdfast-tools.ts` show up on every
   agent after a re-bootstrap.
-- **Names matter.** Agent display names are unique across this daemon —
-  bootstrap refuses duplicates. Sibling agents address each other by name
-  via `peer_conversation_start({display_name: "Tarzan", ...})`. No
-  identity_pubkey scaffold needed for local A2A.
+- **Names matter; UUIDs are the wire identity.** Agent display names are
+  unique across this daemon — bootstrap refuses duplicates. Sibling and
+  cross-machine agents address each other by name via
+  `peer_conversation_start({display_name: "Tarzan", ...})`. Internally
+  the daemon resolves the name to an `agent_uuid` (a v4 UUID minted at
+  bootstrap) which is what travels in every A2A envelope.
+- **Discord is the A2A substrate.** Agent-to-agent conversations are
+  Discord threads inside private pair channels; the agent roster is a
+  Discord forum channel; nothing related to peer-chat is stored locally.
+  See the dedicated sections below.
 
 ## Quick start
 
-You need an LLM API key. Default model is `kimi-k2-0905-preview`, so:
+You need an LLM API key + a Discord bot token. Default model is
+`kimi-k2-0905-preview`:
 
 ```bash
-echo "KIMI_API_KEY=sk-kimi-..." >> .env
+cat > .env <<EOF
+KIMI_API_KEY=sk-kimi-...
+DISCORD_BOT_TOKEN=...                            # admin bot — see "Trust model"
+GLON_A2A_DISCORD_GUILD=...                       # guild id where A2A lives
+GLON_A2A_DISCORD_OPERATOR_IDS=...                # your Discord user id (optional, makes channels visible in your sidebar)
+EOF
 ```
 
 (For Anthropic, set `ANTHROPIC_API_KEY` and pass `model: "claude-..."` when
 bootstrapping; see `agent-llm.ts` for the full provider list.)
+
+The Discord bot needs `Manage Channels`, `Manage Threads`, `Send Messages`,
+`Send Messages in Threads`, `Read Message History`, and `Create Public
+Threads`. The bot is the **single auth boundary** — see the Trust model
+section.
 
 Three processes:
 
@@ -52,8 +69,17 @@ npm run daemon           # program daemon on :6430 (loads programs, runs
                          # their actors, exposes /dispatch over HTTP)
 ```
 
+The daemon will, on first start, create the `glon-a2a` Discord category
++ `#roster` forum + per-pair channels as agents talk to each other.
+Everything is private to the bot + operator user ids you list.
+
 Astrolabe lives in a sibling repo on `:4173` and talks to the daemon's
 `/dispatch` endpoint.
+
+If your agents need to drive a browser, install `browser-use` separately
+(`pipx install browser-use && browser-use install`) — the `/browser`
+program is a help cheatsheet for the CLI, which agents invoke via
+`shell_exec`.
 
 ## Bootstrapping an agent
 
@@ -87,7 +113,7 @@ existing agent's id.
 | `/remind` | Schedule reminders (one-shot or recurring). |
 | `/todo` | Phased task list per agent. The harness re-prompts on incomplete tasks. |
 | `/shell` | Bash exec on the host, with sessions. The universal escape hatch when no dedicated tool fits. |
-| `/discord` | Admin bot: principal DMs, channel posts, and the A2A pair-channel mesh (`ensurePairCategory`, `ensurePairChannel`, `postA2A`, `pollA2A`). |
+| `/discord` | The single auth boundary. Admin bot for principal DMs, channel posts, the A2A pair-channel + thread mesh (`ensurePairChannel`, `ensureConversationThread`, `postToThread`, `pollA2A`, `archiveThread`), and the agent roster forum (`ensureRosterForum`, `ensureRosterPost`, `editRosterCard`, `listRosterPosts`, `heartbeatRoster`). |
 | `/transport-{http,gmail,discord,file,router}` | Pluggable message transports. |
 | `/wallet` | Local Ed25519 keypair management for signing Changes. |
 | `/auth` | OAuth/credential storage for LLM providers (Anthropic, Kimi). |
@@ -95,40 +121,42 @@ existing agent's id.
 
 ## Agent-to-agent chat
 
-Conversations are goal-driven. Either side can end one whenever — there's
-no machine-level kill, and the system pauses for human review instead of
-auto-expiring.
+Conversations are goal-driven and live as Discord threads. Either side
+can end one whenever; the corresponding thread is locked + archived in
+Discord.
 
 ```js
-// Open
+// Open — creates a new Discord thread in the pair channel, names it
+// after the goal, posts the opening envelope.
 peer_conversation_start({
   display_name: "Tarzan",
   goal: "coordinate Cash's pickup tomorrow at 3pm",
   text: "Hey Tarzan, can you confirm 3pm works on your end?"
 })
 
-// Continue
+// Continue — posts inside the existing thread.
 peer_message_send({
-  conversation_id: "c_abc123...",
+  conversation_id: "<thread id from start>",
   text: "..."
 })
 
-// End
+// End — locks + archives the thread.
 peer_conversation_done({
-  conversation_id: "c_abc123...",
+  conversation_id: "<thread id>",
   reason: "confirmed: 3pm, parking lot"
 })
 
-// Browse
+// Browse — reads from Discord, no local cache.
 peer_conversations_list({ status: "active" })
-peer_message_list({ conversation_id: "c_abc123..." })
+peer_message_list({ conversation_id: "<thread id>" })
 ```
 
 The recipient's agent loop fires automatically on each inbound message
-(while the conversation is `active`), so a goal-driven exchange runs
-end-to-end without human prodding. If neither side calls `done` after 50
-hops, the conversation flips to `paused` and the human gets a notification
-to Continue or End it from the Astrolabe inspector.
+(while the thread is unlocked), so a goal-driven exchange runs end-to-end
+without human prodding. If a conversation stalls without `done`, Discord
+auto-archives the thread after the configured idle duration
+(`GLON_A2A_THREAD_AUTO_ARCHIVE_MINUTES`, default 7 days) — posting again
+un-archives it.
 
 ## The /dispatch protocol
 
@@ -160,15 +188,26 @@ list):
 
 | Var | Purpose | Default |
 |---|---|---|
+| **LLM** | | |
 | `KIMI_API_KEY` | Kimi (Moonshot) LLM auth | required if using Kimi models |
 | `ANTHROPIC_API_KEY` | Anthropic LLM auth | required if using Claude models |
-| `GLON_DAEMON_PORT` | daemon dispatch port | `6430` |
-| `GLON_HOST_PORT` | rivetkit host port | `6420` |
 | `ANTHROPIC_DEFAULT_MODEL` | model id when an agent uses Anthropic | `claude-sonnet-4-20250514` |
 | `KIMI_DEFAULT_MODEL` | model id when an agent uses Kimi | `kimi-k2-0905-preview` |
+| **Daemon** | | |
+| `GLON_DAEMON_PORT` | daemon dispatch port | `6430` |
+| `GLON_HOST_PORT` | rivetkit host port | `6420` |
+| **Discord (A2A substrate)** | | |
 | `DISCORD_BOT_TOKEN` | Admin bot token — see "Trust model" below | required for A2A |
-| `GLON_A2A_DISCORD_GUILD` | Discord guild id where pair channels live | required for A2A |
-| `GLON_A2A_CATEGORY_NAME` | Category name under which pair channels are created | `glon-a2a` |
+| `GLON_A2A_DISCORD_GUILD` | Discord guild id where pair channels + roster live | required for A2A |
+| `GLON_A2A_DISCORD_OPERATOR_IDS` | Comma-separated Discord user ids granted explicit allow on private A2A channels (makes them visible in your sidebar without enabling "Show All Channels") | unset (bot-only) |
+| `GLON_A2A_CATEGORY_NAME` | Category name | `glon-a2a` |
+| `GLON_A2A_POLL_INTERVAL_MS` | A2A thread poll cadence | `15000` |
+| `GLON_A2A_CHANNEL_CACHE_TTL_MS` | How long to cache the pair-channel list | `60000` |
+| `GLON_A2A_THREAD_AUTO_ARCHIVE_MINUTES` | Idle threads archive after this; valid: 60, 1440, 4320, 10080 | `10080` (7d) |
+| **Roster forum** | | |
+| `GLON_ROSTER_FORUM_NAME` | Roster forum channel name | `roster` |
+| `GLON_ROSTER_HEARTBEAT_MS` | How often to refresh `updated_at` on every local agent's card | `1800000` (30 min) |
+| `GLON_ROSTER_AUTO_ARCHIVE_MINUTES` | Forum-post auto-archive duration; valid: 60, 1440, 4320, 10080 | `1440` (24h) |
 
 ## The agent roster (`#roster` forum channel)
 
@@ -296,9 +335,12 @@ Consequences worth being clear about:
   keys, not value.
 - A consensus protocol. The DAG is content-addressed and signed but the
   trust model is "your own agents + peers you've explicitly trusted."
+- A Discord bot framework. The bot is a transport, not the product —
+  agents could use any equivalent group-messaging substrate; Discord
+  just happens to give us threads + forum channels + tag UI for free.
 - A multi-tenant cloud thing. Each glon is a single human (the principal)
   plus their agents, running on their own machine, optionally peering with
-  other glons.
+  other glons through a shared Discord server.
 
 ## License
 
