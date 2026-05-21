@@ -750,6 +750,31 @@ async function doSetup(opts: SetupOpts, ctx: ProgramContext): Promise<SetupResul
 		}
 	}
 
+	// Create or refresh the agent's roster forum post if Discord A2A is wired.
+	// Best-effort: a missing GLON_A2A_DISCORD_GUILD or transient API issue is
+	// not a setup blocker — the agent works locally regardless.
+	if (process.env.GLON_A2A_DISCORD_GUILD && agentUuid) {
+		try {
+			const existingAgent = await store.get(agentId);
+			const existingRosterThread = extractString(existingAgent?.fields?.roster_thread_id);
+			const principalDiscordId = extractString((await store.get(principalPeerId))?.fields?.discord_id);
+			const res = await ctx.dispatchProgram("/discord", "ensureRosterPost", [{
+				agent_uuid: agentUuid,
+				display_name: agentName,
+				bio: undefined,
+				owner_discord_id: principalDiscordId,
+				owner_display_name: principalName,
+				roster_thread_id: existingRosterThread,
+			}]) as { roster_thread_id: string; created: boolean };
+			if (res?.roster_thread_id && res.roster_thread_id !== existingRosterThread) {
+				const agentActor = client.objectActor.getOrCreate([agentId]);
+				await agentActor.setField("roster_thread_id", JSON.stringify(stringVal(res.roster_thread_id)));
+			}
+		} catch (err: any) {
+			ctx.print(dim(`  [holdfast] roster post setup failed (${err?.message ?? String(err)}); continuing`));
+		}
+	}
+
 	const { wired, skipped, pruned } = await autoWireTools(agentId, ctx);
 
 	return {

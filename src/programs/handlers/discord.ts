@@ -758,6 +758,344 @@ async function pollA2AThread(thread: ThreadSummary, state: Record<string, any>, 
 	return processed;
 }
 
+// ── Agent roster (Discord forum channel, one post per agent) ─────
+//
+// The roster is a forum channel under glon-a2a. Each agent has one
+// forum post (Discord thread); the post's starter message holds the
+// agent's status card; the post's applied_tags encode online state.
+//
+// Lifecycle:
+//   - bootstrap → ensureRosterPost creates the post, tags it 🟢 online,
+//     stores the thread_id on the /agent object
+//   - heartbeat (every GLON_ROSTER_HEARTBEAT_MS, default 30 min) →
+//     editRosterCard re-writes the starter message, bumping updated_at
+//   - graceful shutdown → archiveRosterPost (tag ⚫ offline, archive)
+//   - unclean exit → Discord auto-archives after the auto_archive
+//     duration (default 1 day = 1440 min); the archived state IS the
+//     stale signal — no prune script needed
+//
+// Each agent's roster_thread_id is stored on its /agent object so a
+// daemon restart finds and updates the existing post instead of creating
+// duplicates.
+
+const ROSTER_FORUM_NAME_DEFAULT = "roster";
+const ROSTER_CARD_FENCE = "glon-card";
+const ROSTER_CARD_FENCE_RE = new RegExp("```\\s*" + ROSTER_CARD_FENCE + "\\s*\\n([\\s\\S]*?)\\n```", "i");
+const ROSTER_HEARTBEAT_INTERVAL_MS = Number(process.env.GLON_ROSTER_HEARTBEAT_MS ?? 30 * 60 * 1000);
+const ROSTER_AUTO_ARCHIVE_MINUTES = Number(process.env.GLON_ROSTER_AUTO_ARCHIVE_MINUTES ?? 1440);
+const DISCORD_CHANNEL_TYPE_FORUM = 15;
+
+interface RosterTagSet {
+	online: string;       // tag id
+	offline: string;
+}
+
+interface RosterCard {
+	v: 1;
+	agent_uuid: string;
+	display_name: string;
+	owner_discord_id?: string;
+	owner_display_name?: string;
+	bio?: string;
+	status_text?: string;
+	updated_at: number;
+}
+
+function rosterForumName(): string {
+	return process.env.GLON_ROSTER_FORUM_NAME ?? ROSTER_FORUM_NAME_DEFAULT;
+}
+
+function formatRosterCard(card: RosterCard, statusLabel: string): string {
+	const name = card.display_name || card.agent_uuid.slice(0, 8);
+	const owner = card.owner_display_name ? ` · ${card.owner_display_name}` : "";
+	const bio = card.bio ? `\n${card.bio}` : "";
+	const status = card.status_text ? `\n_"${card.status_text}"_` : "";
+	const updatedRelative = `_updated ${new Date(card.updated_at).toISOString()}_`;
+	const preamble = `**${name}**${owner} · ${statusLabel}${bio}${status}\n${updatedRelative}`;
+	const jsonBlock = "```" + ROSTER_CARD_FENCE + "\n" + JSON.stringify(card) + "\n```";
+	return `${preamble}\n${jsonBlock}`;
+}
+
+function parseRosterCard(content: string): RosterCard | null {
+	const m = ROSTER_CARD_FENCE_RE.exec(content ?? "");
+	if (!m) return null;
+	try {
+		const parsed = JSON.parse(m[1]);
+		if (!parsed || typeof parsed !== "object") return null;
+		if (parsed.v !== 1) return null;
+		if (typeof parsed.agent_uuid !== "string") return null;
+		return {
+			v: 1,
+			agent_uuid: String(parsed.agent_uuid),
+			display_name: String(parsed.display_name ?? ""),
+			owner_discord_id: parsed.owner_discord_id ? String(parsed.owner_discord_id) : undefined,
+			owner_display_name: parsed.owner_display_name ? String(parsed.owner_display_name) : undefined,
+			bio: parsed.bio ? String(parsed.bio) : undefined,
+			status_text: parsed.status_text ? String(parsed.status_text) : undefined,
+			updated_at: Number(parsed.updated_at ?? 0),
+		};
+	} catch {
+		return null;
+	}
+}
+
+interface EnsureRosterForumResult {
+	forum_channel_id: string;
+	created: boolean;
+	tags: RosterTagSet;
+}
+
+async function doEnsureRosterForum(state: Record<string, any>): Promise<EnsureRosterForumResult> {
+	const guildId = a2aGuildId();
+	const wantName = rosterForumName();
+	state.rosterForumByGuild = state.rosterForumByGuild ?? {} as Record<string, { forum_channel_id: string; tags: RosterTagSet }>;
+	const cached = state.rosterForumByGuild[guildId];
+	if (cached?.forum_channel_id && cached.tags?.online && cached.tags?.offline) {
+		return { forum_channel_id: cached.forum_channel_id, created: false, tags: cached.tags };
+	}
+
+	const cat = await doEnsurePairCategory(state);
+	const channels = await listGuildChannels(guildId);
+	const existing = channels.find((c) => c.type === DISCORD_CHANNEL_TYPE_FORUM && c.parent_id === cat.category_id && c.name.toLowerCase() === wantName.toLowerCase());
+
+	let forumChannelId: string;
+	let created = false;
+	if (existing) {
+		forumChannelId = existing.id;
+	} else {
+		const botUserId = await getBotUserId(state);
+		const createBody = {
+			name: wantName,
+			type: DISCORD_CHANNEL_TYPE_FORUM,
+			parent_id: cat.category_id,
+			topic: "glon agent roster · one forum post per agent (status via tags)",
+			default_auto_archive_duration: ROSTER_AUTO_ARCHIVE_MINUTES,
+			permission_overwrites: buildPrivateA2AOverwrites(guildId, botUserId),
+			available_tags: [
+				{ name: "online", emoji_name: "🟢", moderated: false },
+				{ name: "offline", emoji_name: "⚫", moderated: false },
+			],
+		};
+		const createdForum = await discord("POST", `/guilds/${guildId}/channels`, createBody);
+		if (!createdForum?.id) throw new Error("Discord did not return a channel id when creating roster forum");
+		forumChannelId = String(createdForum.id);
+		created = true;
+	}
+
+	// Discover the tag ids (whether we just created them or they pre-existed).
+	const channelInfo = await discord("GET", `/channels/${forumChannelId}`);
+	const availableTags: Array<any> = channelInfo?.available_tags ?? [];
+	const onlineTag = availableTags.find((t) => String(t.name ?? "").toLowerCase() === "online");
+	const offlineTag = availableTags.find((t) => String(t.name ?? "").toLowerCase() === "offline");
+	if (!onlineTag?.id || !offlineTag?.id) {
+		throw new Error("roster forum is missing the online/offline tags — add them in Discord settings or recreate the channel");
+	}
+	const tags: RosterTagSet = { online: String(onlineTag.id), offline: String(offlineTag.id) };
+	state.rosterForumByGuild[guildId] = { forum_channel_id: forumChannelId, tags };
+	return { forum_channel_id: forumChannelId, created, tags };
+}
+
+interface EnsureRosterPostInput {
+	agent_uuid: string;
+	display_name: string;
+	bio?: string;
+	owner_discord_id?: string;
+	owner_display_name?: string;
+	status_text?: string;
+	roster_thread_id?: string;   // if known from prior creation
+}
+
+interface EnsureRosterPostResult {
+	roster_thread_id: string;
+	starter_message_id: string;
+	created: boolean;
+}
+
+async function doEnsureRosterPost(state: Record<string, any>, input: EnsureRosterPostInput): Promise<EnsureRosterPostResult> {
+	if (!input?.agent_uuid) throw new Error("ensureRosterPost: agent_uuid required");
+	if (!input?.display_name) throw new Error("ensureRosterPost: display_name required");
+	const forum = await doEnsureRosterForum(state);
+	const card: RosterCard = {
+		v: 1,
+		agent_uuid: input.agent_uuid,
+		display_name: input.display_name,
+		bio: input.bio,
+		owner_discord_id: input.owner_discord_id,
+		owner_display_name: input.owner_display_name,
+		status_text: input.status_text,
+		updated_at: Date.now(),
+	};
+
+	// If caller knows the thread_id, edit it in place. Same with our daemon
+	// state cache from earlier creations.
+	state.rosterPostByUuid = state.rosterPostByUuid ?? {} as Record<string, string>;
+	const knownId = input.roster_thread_id ?? state.rosterPostByUuid[input.agent_uuid];
+	if (knownId) {
+		try {
+			await doEditRosterCard({ thread_id: knownId, card, status: "online", forum_tags: forum.tags });
+			return { roster_thread_id: knownId, starter_message_id: knownId, created: false };
+		} catch (err: any) {
+			// Post may have been deleted manually; fall through to recreate.
+			state.rosterPostByUuid[input.agent_uuid] = "";
+		}
+	}
+
+	// Fresh create.
+	const created = await discord("POST", `/channels/${forum.forum_channel_id}/threads`, {
+		name: (input.display_name).slice(0, 100),
+		applied_tags: [forum.tags.online],
+		auto_archive_duration: ROSTER_AUTO_ARCHIVE_MINUTES,
+		message: { content: formatRosterCard(card, "🟢 online") },
+	});
+	if (!created?.id) throw new Error("Discord did not return a thread id when creating roster post");
+	state.rosterPostByUuid[input.agent_uuid] = String(created.id);
+	return { roster_thread_id: String(created.id), starter_message_id: String(created.id), created: true };
+}
+
+interface EditRosterCardInput {
+	thread_id: string;
+	card: RosterCard;
+	status: "online" | "offline";
+	forum_tags?: RosterTagSet;
+}
+
+async function doEditRosterCard(input: EditRosterCardInput): Promise<{ ok: true }> {
+	if (!input?.thread_id) throw new Error("editRosterCard: thread_id required");
+	if (!input?.card) throw new Error("editRosterCard: card required");
+	const statusLabel = input.status === "online" ? "🟢 online" : "⚫ offline";
+	const content = formatRosterCard(input.card, statusLabel);
+
+	// The starter message of a forum post has the same id as the thread.
+	// Edit it in place. If Discord rejects (thread archived but not locked),
+	// editing un-archives automatically.
+	await discord("PATCH", `/channels/${input.thread_id}/messages/${input.thread_id}`, { content });
+
+	// Apply tags if provided.
+	if (input.forum_tags) {
+		const tagId = input.status === "online" ? input.forum_tags.online : input.forum_tags.offline;
+		try {
+			await discord("PATCH", `/channels/${input.thread_id}`, { applied_tags: [tagId] });
+		} catch {
+			// Tag update is best-effort; the card edit is the source of truth.
+		}
+	}
+	return { ok: true };
+}
+
+interface ArchiveRosterPostInput {
+	thread_id: string;
+	final_card?: RosterCard;    // optional: rewrite the card before archiving
+}
+
+async function doArchiveRosterPost(state: Record<string, any>, input: ArchiveRosterPostInput): Promise<{ ok: true }> {
+	if (!input?.thread_id) throw new Error("archiveRosterPost: thread_id required");
+	const forum = await doEnsureRosterForum(state);
+	if (input.final_card) {
+		try {
+			await doEditRosterCard({ thread_id: input.thread_id, card: input.final_card, status: "offline", forum_tags: forum.tags });
+		} catch {
+			// best-effort
+		}
+	} else {
+		// Just flip the tag.
+		try {
+			await discord("PATCH", `/channels/${input.thread_id}`, { applied_tags: [forum.tags.offline] });
+		} catch { /* best-effort */ }
+	}
+	await discord("PATCH", `/channels/${input.thread_id}`, { archived: true });
+	return { ok: true };
+}
+
+interface RosterEntry {
+	roster_thread_id: string;
+	archived: boolean;
+	tag_status: "online" | "offline" | "unknown";
+	card: RosterCard;
+}
+
+async function doListRosterPosts(state: Record<string, any>, input?: { include_archived?: boolean }): Promise<RosterEntry[]> {
+	const forum = await doEnsureRosterForum(state);
+	const includeArchived = !!input?.include_archived;
+
+	// Active threads first (via guild-wide endpoint, filter by parent).
+	const guildId = a2aGuildId();
+	const activeRaw = await discord("GET", `/guilds/${guildId}/threads/active`);
+	const activeList: any[] = Array.isArray(activeRaw) ? activeRaw : (activeRaw?.threads ?? []);
+	const active = activeList.filter((t) => String(t.parent_id) === forum.forum_channel_id);
+
+	let archivedList: any[] = [];
+	if (includeArchived) {
+		const archivedRaw = await discord("GET", `/channels/${forum.forum_channel_id}/threads/archived/public?limit=50`);
+		archivedList = archivedRaw?.threads ?? [];
+	}
+
+	const all = [...active, ...archivedList];
+	const out: RosterEntry[] = [];
+	for (const t of all) {
+		const threadId = String(t.id);
+		// The starter message of a forum post has the same id as the thread.
+		let starter: any = null;
+		try {
+			starter = await discord("GET", `/channels/${threadId}/messages/${threadId}`);
+		} catch {
+			continue;
+		}
+		const card = parseRosterCard(String(starter?.content ?? ""));
+		if (!card) continue;
+		const appliedTags: string[] = Array.isArray(t.applied_tags) ? t.applied_tags.map(String) : [];
+		const tagStatus: "online" | "offline" | "unknown" =
+			appliedTags.includes(forum.tags.online) ? "online" :
+			appliedTags.includes(forum.tags.offline) ? "offline" :
+			"unknown";
+		out.push({
+			roster_thread_id: threadId,
+			archived: !!t.thread_metadata?.archived,
+			tag_status: tagStatus,
+			card,
+		});
+	}
+	return out;
+}
+
+// Heartbeat: bumps the updated_at on every local agent's roster card so
+// idle daemons still appear online (until auto-archive eventually closes
+// them after ROSTER_AUTO_ARCHIVE_MINUTES of no edits).
+async function heartbeatRosterPosts(state: Record<string, any>, ctx: ProgramContext): Promise<{ heartbeated: number }> {
+	if (!process.env.GLON_A2A_DISCORD_GUILD) return { heartbeated: 0 };
+	const allPeers = await ctx.dispatchProgram("/peer", "list", [{}]) as Array<any>;
+	const localAgents = (Array.isArray(allPeers) ? allPeers : []).filter((p) =>
+		p.kind === "agent" && p.agent_uuid && p.agent_object_id,
+	);
+	if (localAgents.length === 0) return { heartbeated: 0 };
+
+	state.rosterPostByUuid = state.rosterPostByUuid ?? {};
+	let count = 0;
+	for (const peer of localAgents) {
+		const card: RosterCard = {
+			v: 1,
+			agent_uuid: String(peer.agent_uuid),
+			display_name: String(peer.display_name ?? peer.agent_uuid),
+			bio: peer.notes ? String(peer.notes) : undefined,
+			updated_at: Date.now(),
+		};
+		const knownThreadId: string | undefined = state.rosterPostByUuid[card.agent_uuid] || undefined;
+		try {
+			const res = await doEnsureRosterPost(state, {
+				agent_uuid: card.agent_uuid,
+				display_name: card.display_name,
+				bio: card.bio,
+				status_text: undefined,
+				roster_thread_id: knownThreadId,
+			});
+			state.rosterPostByUuid[card.agent_uuid] = res.roster_thread_id;
+			count++;
+		} catch (err: any) {
+			ctx.print(dim(`  [discord] roster heartbeat failed for ${card.display_name}: ${err?.message ?? String(err)}`));
+		}
+	}
+	return { heartbeated: count };
+}
+
 // ── Core: sending ────────────────────────────────────────────────
 
 async function doSend(peerId: string, text: string, state: Record<string, any>, ctx: ProgramContext): Promise<{ channel_id: string; message_ids: string[] }> {
@@ -1002,6 +1340,19 @@ async function pollBridgeChannel(channelId: string, state: Record<string, any>, 
 }
 
 
+async function maybeHeartbeatRoster(state: Record<string, any>, ctx: ProgramContext): Promise<void> {
+	if (!process.env.GLON_A2A_DISCORD_GUILD) return;
+	const now = Date.now();
+	const next = typeof state.rosterNextHeartbeatAt === "number" ? state.rosterNextHeartbeatAt : 0;
+	if (now < next) return;
+	state.rosterNextHeartbeatAt = now + ROSTER_HEARTBEAT_INTERVAL_MS;
+	try {
+		await heartbeatRosterPosts(state, ctx);
+	} catch (err: any) {
+		ctx.print(dim(`  [discord] roster heartbeat tick error: ${err?.message ?? String(err)}`));
+	}
+}
+
 async function runPoll(state: Record<string, any>, ctx: ProgramContext): Promise<{ peers: number; processed: number; bridges: number; a2a: number }> {
 	const peers = await fetchPeersWithDiscord(ctx);
 	let processed = 0;
@@ -1024,6 +1375,8 @@ async function runPoll(state: Record<string, any>, ctx: ProgramContext): Promise
 	}
 
 	const a2a = await pollA2AGuild(state, ctx);
+	// Roster heartbeat runs on the same tick but throttled separately.
+	await maybeHeartbeatRoster(state, ctx);
 	return { peers: peers.length, processed, bridges, a2a };
 }
 
@@ -1586,6 +1939,54 @@ const actorDef: ProgramActorDef = {
 		 *  for the tick. */
 		pollA2A: async (ctx: ProgramContext) => {
 			return { processed: await pollA2AGuild(ctx.state, ctx) };
+		},
+
+		/** Idempotently ensure the #roster forum channel exists with the
+		 *  online/offline tags. Returns the forum's id and tag ids. */
+		ensureRosterForum: async (ctx: ProgramContext) => {
+			return await doEnsureRosterForum(ctx.state);
+		},
+
+		/** Create or edit-in-place an agent's roster post (forum starter
+		 *  message). Used by /holdfast bootstrap and the heartbeat tick.
+		 *  Stores the resulting thread_id on the daemon's state so
+		 *  subsequent calls can edit instead of duplicate. */
+		ensureRosterPost: async (ctx: ProgramContext, input: string | EnsureRosterPostInput) => {
+			const args = typeof input === "string" ? JSON.parse(input) : input;
+			return await doEnsureRosterPost(ctx.state, args);
+		},
+
+		/** Rewrite an existing roster post's starter message + tag. */
+		editRosterCard: async (ctx: ProgramContext, input: string | EditRosterCardInput) => {
+			const args = typeof input === "string" ? JSON.parse(input) : input;
+			// Resolve tag set if caller didn't supply one.
+			if (!args.forum_tags) {
+				const forum = await doEnsureRosterForum(ctx.state);
+				args.forum_tags = forum.tags;
+			}
+			return await doEditRosterCard(args);
+		},
+
+		/** Mark an agent offline: flip its tag to ⚫ offline and archive
+		 *  the forum post. Discord auto-archives idle posts on its own
+		 *  (default 24h), so this is for explicit/graceful offline. */
+		archiveRosterPost: async (ctx: ProgramContext, input: string | ArchiveRosterPostInput) => {
+			const args = typeof input === "string" ? JSON.parse(input) : input;
+			return await doArchiveRosterPost(ctx.state, args);
+		},
+
+		/** Enumerate roster forum posts (active by default; include_archived
+		 *  for offline/stale ones too). Returns each post's parsed card. */
+		listRosterPosts: async (ctx: ProgramContext, input: string | { include_archived?: boolean }) => {
+			const args = typeof input === "string" ? JSON.parse(input) : input;
+			return await doListRosterPosts(ctx.state, args ?? {});
+		},
+
+		/** Force a roster heartbeat cycle now (bypasses the throttle). */
+		heartbeatRoster: async (ctx: ProgramContext) => {
+			ctx.state.rosterNextHeartbeatAt = 0;
+			await maybeHeartbeatRoster(ctx.state, ctx);
+			return { ok: true };
 		},
 
 		/** Retrofit existing A2A category + pair channels with private
